@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -73,7 +74,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "response_format must be url or b64_json")
 		return
 	}
-	acc, err := s.resolveAccount(firstNonEmpty(b.AccountID, b.User))
+	acc, err := s.resolveImageAccount(firstNonEmpty(b.AccountID, b.User))
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
@@ -103,6 +104,12 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic", Attachments: b.Attachments, LicenseType: s.settings.get().LicenseType, Scenario: s.settings.get().Scenario, FeatureFlags: s.featureFlags()})
 	if err != nil {
+		// ErrImageLimit classifies as CategoryUpstreamStructured, whose 10s
+		// cooldown is far too short for a daily image quota. Mark the account
+		// image-limited so rotation skips it until tomorrow.
+		if errors.Is(err, chathub.ErrImageLimit) {
+			s.accountPool.MarkImageGenTokensThrottled(acc.ID)
+		}
 		writeUpstreamError(w, err)
 		return
 	}
@@ -120,7 +127,12 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	if len(res.Images) == 0 {
 		refusalText := strings.Join([]string{res.Text, res.RawResult}, "\n")
 		if isImageQuotaRefusal(refusalText) {
-			w.Header().Set("Retry-After", "86400")
+			// Upstream answered 200 with a natural-language refusal, so
+			// chatWithAccount already recorded a success and cleared this
+			// account's cooldown. Mark the image quota now: the write lands
+			// after that MarkSuccess, and later ones preserve it.
+			s.accountPool.MarkImageGenTokensThrottled(acc.ID)
+			w.Header().Set("Retry-After", strconv.Itoa(s.imageRetryAfter(acc.ID)))
 			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "M365 image generation quota is exhausted; try again later or use another account")
 			return
 		}

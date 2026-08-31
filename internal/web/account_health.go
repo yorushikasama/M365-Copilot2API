@@ -503,6 +503,21 @@ func (h *accountHealth) MarkImageLimited(accountID string) {
 	h.cooldown[accountID] = time.Now().Add(24 * time.Hour)
 }
 
+// MarkImageGenExhausted sidelines an account for image generation only, leaving
+// it available for ordinary chat. Use this when the upstream reports an image
+// quota problem: the text capability is metered separately, so cooling the whole
+// account down would waste chat capacity. MarkImageLimited is the stronger form
+// that also blocks chat.
+func (h *accountHealth) MarkImageGenExhausted(accountID string) {
+	if h == nil || accountID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now().UTC()
+	h.imageGenCooldownUntil[accountID] = time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
 func (h *accountHealth) ImageLimited(accountID string) bool {
 	if h == nil {
 		return false
@@ -512,7 +527,6 @@ func (h *accountHealth) ImageLimited(accountID string) bool {
 	if h.imageLimited[accountID] {
 		if until, ok := h.imageLimitUntil[accountID]; ok && time.Now().After(until) {
 			delete(h.imageLimited, accountID)
-			delete(h.imageLimitUntil, accountID)
 			delete(h.imageLimitUntil, accountID)
 		}
 	}
@@ -540,19 +554,50 @@ func (h *accountHealth) MarkImageGenSystemThrottled(accountID string) {
 	h.imageGenSystemCooldown[accountID] = time.Now().Add(30 * time.Minute)
 }
 
+// cleanupExpiredImageGenLocked drops elapsed image-generation cooldowns.
+// cleanupExpiredCooldownLocked cannot be relied on for this because it returns
+// early unless a general cooldown entry exists, and an image-only cooldown has
+// none.
+func (h *accountHealth) cleanupExpiredImageGenLocked(accountID string) {
+	now := time.Now()
+	if t, ok := h.imageGenCooldownUntil[accountID]; ok && now.After(t) {
+		delete(h.imageGenCooldownUntil, accountID)
+	}
+	if t, ok := h.imageGenSystemCooldown[accountID]; ok && now.After(t) {
+		delete(h.imageGenSystemCooldown, accountID)
+	}
+}
+
 func (h *accountHealth) ImageGenAvailable(accountID string) bool {
 	if h == nil {
 		return true
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if t, ok := h.imageGenCooldownUntil[accountID]; ok && time.Now().Before(t) {
+	h.cleanupExpiredImageGenLocked(accountID)
+	if _, ok := h.imageGenCooldownUntil[accountID]; ok {
 		return false
 	}
-	if t, ok := h.imageGenSystemCooldown[accountID]; ok && time.Now().Before(t) {
+	if _, ok := h.imageGenSystemCooldown[accountID]; ok {
 		return false
 	}
 	return true
+}
+
+// ImageGenCooldownUntil reports when the image-generation cooldown for the
+// account lifts, choosing the later of the daily and system-capacity deadlines.
+func (h *accountHealth) ImageGenCooldownUntil(accountID string) (time.Time, bool) {
+	if h == nil {
+		return time.Time{}, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cleanupExpiredImageGenLocked(accountID)
+	until, ok := h.imageGenCooldownUntil[accountID]
+	if t, sysOK := h.imageGenSystemCooldown[accountID]; sysOK && (!ok || t.After(until)) {
+		until, ok = t, true
+	}
+	return until, ok
 }
 
 func (h *accountHealth) UpdateThrottling(accountID string, data any) {

@@ -1122,6 +1122,53 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 	return result, err
 }
 
+// resolveImageAccount picks an account for image generation. Image allowance is
+// metered separately from chat upstream, so an account whose image quota is
+// exhausted must be skipped here while staying usable for chat. An explicit
+// account pin is honoured as-is so the caller still sees the real upstream refusal.
+func (s *Server) resolveImageAccount(accountID string) (auth.AccountToken, error) {
+	if accountID != "" {
+		return s.resolveAccount(accountID)
+	}
+	var throttled error
+	for i := 0; i <= maxAccountProbe; i++ {
+		acc, err := s.resolveAccount("")
+		if err != nil {
+			if throttled != nil {
+				return auth.AccountToken{}, throttled
+			}
+			return auth.AccountToken{}, err
+		}
+		if s.accountPool.ImageGenAvailable(acc.ID) {
+			return acc, nil
+		}
+		if throttled == nil {
+			throttled = &UpstreamHTTPError{Status: 429, RetryAfter: s.imageRetryAfter(acc.ID), Body: "image generation quota is exhausted on all accounts; try again later"}
+		}
+		// Drop the sticky preference so the next probe rotates instead of
+		// handing back this same image-throttled account.
+		s.mu.Lock()
+		if s.lastHealthyAccount == acc.ID {
+			s.lastHealthyAccount = ""
+		}
+		s.mu.Unlock()
+	}
+	return auth.AccountToken{}, throttled
+}
+
+// imageRetryAfter reports how many seconds a caller should wait before retrying
+// image generation on the given account.
+func (s *Server) imageRetryAfter(accountID string) int {
+	retry := 0
+	if until, ok := s.accountPool.ImageGenCooldownUntil(accountID); ok {
+		retry = int(time.Until(until).Seconds())
+	}
+	if retry < 5 {
+		retry = 5
+	}
+	return retry
+}
+
 // nextHealthyAccount returns the next round-robin account that is still
 // healthy, skipping the given id first, and validates its token. Used by the
 // failover path after a rate-limited or auth-failed attempt.
