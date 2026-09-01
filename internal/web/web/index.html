@@ -318,7 +318,7 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
       <button data-page="modeltest" onclick="showPage('modeltest')"><i data-lucide="flask-conical" style="width:16px;height:16px;flex-shrink:0"></i><span>Model Test</span></button>
       <button data-page="settings" onclick="showPage('settings')"><i data-lucide="settings" style="width:16px;height:16px;flex-shrink:0"></i><span>Settings</span></button>
     </nav>
-    <div class="sidebar-foot" id="appVersion">vdev</div>
+    <div class="sidebar-foot" id="appVersion">&mdash;</div>
   </aside>
 
   <main class="main">
@@ -1059,7 +1059,7 @@ $('loginForm')?.addEventListener('submit',async e=>{
     const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({password:$('loginPassword').value})});
     if(d.must_change_password){location.replace('/login');return;}
     $('login').style.display='none';$('app').style.display='flex';
-    showPage('dashboard');loadStats();
+    showPage('dashboard');loadStats();loadAppVersion();
     showNotice('登录成功','success');
   }catch(e){showNotice(e.message,'error');}
 });

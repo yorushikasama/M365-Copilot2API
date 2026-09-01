@@ -23,14 +23,20 @@ func TestFrontendVersionDisplayUsesBackendVersion(t *testing.T) {
 	}
 	page := string(root)
 	for _, needle := range []string{
-		`id="appVersion">vdev</div>`,
+		`id="appVersion">&mdash;</div>`,
 		"async function loadAppVersion()",
 		"fetch('/api/version'",
 		"el.textContent=v==='dev'?'vdev':'v'+v",
+		// The badge must also refresh after an in-page login, otherwise the
+		// placeholder survives until the next full page load.
+		"showPage('dashboard');loadStats();loadAppVersion();",
 	} {
 		if !strings.Contains(page, needle) {
 			t.Fatalf("frontend missing %q", needle)
 		}
+	}
+	if strings.Contains(page, `id="appVersion">vdev</div>`) {
+		t.Fatal("version badge must not default to a fake dev build")
 	}
 	if strings.Contains(page, `sidebar-foot">v0.4.0`) {
 		t.Fatal("frontend still contains hardcoded v0.4.0")
