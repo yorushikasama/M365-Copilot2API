@@ -1621,8 +1621,7 @@ async function addIPRule(){
 async function quickBlockIP(ip){$('ipRulePrefix').value=ip;await addIPRule();}
 async function removeIPRule(id){if(!confirm('确定解封此 IP 规则？'))return;try{await api('/api/admin/ip-management?id='+encodeURIComponent(id),{method:'DELETE'});showNotice('IP 已解封','success');loadIPManagement();}catch(e){showNotice(e.message,'error');}}
 async function resolveIP(ip){try{const d=await api('/api/admin/ip-resolve?ip='+encodeURIComponent(ip));showNotice(d.ip+' · '+d.type+(d.reverseDns?.length?' · '+d.reverseDns.join(', '):''),'success');}catch(e){showNotice(e.message,'error');}}
-
-
+function proxyRow(x){
   const inCooldown=x.cooldownUntil&&new Date(x.cooldownUntil)>new Date();
   const badge=x.health==='reachable'?'<span class="status online"><i></i>Healthy</span>':x.health==='unreachable'?'<span class="status offline"><i></i>Unreachable</span>':x.health==='upstream_error'?'<span class="status warn"><i></i>Upstream error</span>':'<span class="status">Not checked</span>';
   return `<tr>
