@@ -588,7 +588,7 @@ if (response.output_text) {
       <section id="page-ipmanagement" style="display:none">
         <div class="page-head"><div><h2 class="page-title">IP Management</h2><p class="page-sub">View client request volume, resolve addresses, and manage block rules</p></div><button class="btn" onclick="loadIPManagement()">Refresh</button></div>
         <div class="card" style="margin-bottom:16px"><div class="card-head"><span class="card-title">Block IP / CIDR</span></div><div class="card-body"><div style="display:flex;gap:8px;flex-wrap:wrap"><input class="form-input" id="ipRulePrefix" placeholder="203.0.113.10 or 203.0.113.0/24" style="flex:1;min-width:220px"><input class="form-input" id="ipRuleNote" placeholder="Optional note" style="flex:1;min-width:180px"><button class="btn danger" onclick="addIPRule()">Block</button></div></div></div>
-        <div class="card"><div class="card-head"><span class="card-title">Client IP usage</span><select class="form-input" id="ipDays" style="width:110px" onchange="loadIPManagement()"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></div><table class="table"><thead><tr><th>IP address</th><th>Requests</th><th>Tokens</th><th>Last seen</th><th>Resolve</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ipRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table></div>
+        <div class="card"><div class="card-head"><span class="card-title">Client IP usage</span><select class="form-input" id="ipDays" style="width:110px" onchange="loadIPManagement()"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></div><table class="table"><thead><tr><th>IP address</th><th>Requests</th><th>Tokens</th><th>Last seen</th><th>Resolved address</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ipRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table></div>
       </section>
       <!-- Proxy Pool -->
       <section id="page-proxies" style="display:none">
@@ -726,6 +726,13 @@ const localeText={
   'Last seen': {'zh-CN':'最近访问','zh-TW':'最近存取','ja':'最終確認','ko':'최근 확인','es':'Última visita','fr':'Dernière activité','de':'Zuletzt gesehen','pt-BR':'Última visita','ru':'Последний визит','ar':'آخر ظهور'},
   'Blocked': {'zh-CN':'已封禁','zh-TW':'已封鎖','ja':'ブロック済み','ko':'차단됨','es':'Bloqueado','fr':'Bloqué','de':'Blockiert','pt-BR':'Bloqueado','ru':'Заблокирован','ar':'محظور'},
   'Active': {'zh-CN':'正常','zh-TW':'正常','ja':'アクティブ','ko':'활성','es':'Activo','fr':'Activa','de':'Aktiv','pt-BR':'Ativo','ru':'Активен','ar':'نشط'},
+  'Resolved address': {'zh-CN':'解析地址','zh-TW':'解析地址','ja':'解決済みアドレス','ko':'확인된 주소','es':'Dirección resuelta','fr':'Adresse résolue','de':'Aufgelöste Adresse','pt-BR':'Endereço resolvido','ru':'Определённый адрес','ar':'العنوان المحلل'},
+  'Public': {'zh-CN':'公网','zh-TW':'公網','ja':'パブリック','ko':'공용','es':'Pública','fr':'Publique','de':'Öffentlich','pt-BR':'Público','ru':'Публичный','ar':'عام'},
+  'Private': {'zh-CN':'内网','zh-TW':'內網','ja':'プライベート','ko':'비공개','es':'Privada','fr':'Privée','de':'Privat','pt-BR':'Privado','ru':'Приватный','ar':'خاص'},
+  'No reverse DNS': {'zh-CN':'无反向 DNS','zh-TW':'無反向 DNS','ja':'逆引き DNS なし','ko':'역방향 DNS 없음','es':'Sin DNS inverso','fr':'Aucun DNS inverse','de':'Kein Reverse-DNS','pt-BR':'Sem DNS reverso','ru':'Нет обратной DNS-записи','ar':'لا يوجد DNS عكسي'},
+  'Unknown location': {'zh-CN':'位置未知','zh-TW':'位置未知','ja':'場所不明','ko':'위치 불명','es':'Ubicación desconocida','fr':'Localisation inconnue','de':'Standort unbekannt','pt-BR':'Local desconhecido','ru':'Местоположение неизвестно','ar':'موقع غير معروف'},
+  'Local address': {'zh-CN':'本地地址','zh-TW':'本機位址','ja':'ローカルアドレス','ko':'로컬 주소','es':'Dirección local','fr':'Adresse locale','de':'Lokale Adresse','pt-BR':'Endereço local','ru':'Локальный адрес','ar':'عنوان محلي'},
+  'Resolving…': {'zh-CN':'解析中…','zh-TW':'解析中…','ja':'解決中…','ko':'조회 중…','es':'Resolviendo…','fr':'Résolution…','de':'Wird aufgelöst…','pt-BR':'Resolvendo…','ru':'Определение…','ar':'جارٍ الحل…'},
   'No client IP usage records': {'zh-CN':'暂无客户端调用记录','zh-TW':'暫無用戶端用量記錄','ja':'クライアント IP の使用記録はありません','ko':'클라이언트 IP 사용 기록이 없습니다','es':'No hay registros de uso de IP del cliente','fr':'Aucun enregistrement d’utilisation IP client','de':'Keine Client-IP-Nutzungsdaten','pt-BR':'Nenhum registro de uso de IP do cliente','ru':'Нет записей об использовании IP клиентов','ar':'لا توجد سجلات لاستخدام IP العميل'},
   'Optional note': {'zh-CN':'备注（可选）','zh-TW':'備註（選填）','ja':'任意のメモ','ko':'선택 메모','es':'Nota opcional','fr':'Note facultative','de':'Optionale Notiz','pt-BR':'Observação opcional','ru':'Необязательная заметка','ar':'ملاحظة اختيارية'},
   '1 day': {'zh-CN':'1 天','zh-TW':'1 天','ja':'1日','ko':'1일','es':'1 día','fr':'1 jour','de':'1 Tag','pt-BR':'1 dia','ru':'1 день','ar':'يوم واحد'},
@@ -1628,7 +1635,7 @@ async function loadIPManagement(){
     const rows=d.ips||[];
     $('ipRows').innerHTML=rows.length?rows.map(x=>{
       const rule=ruleMap[x.ip];
-      return `<tr><td><code>${esc(x.ip)}</code></td><td>${x.requests||0}</td><td>${x.tokens||0}</td><td>${x.lastSeen?new Date(x.lastSeen).toLocaleString():'-'}</td><td><button class="btn-sm btn" onclick="resolveIP('${esc(x.ip)}')">Resolve</button></td><td>${rule?'<span class="status offline"><i></i>Blocked</span>':'<span class="status online"><i></i>Active</span>'}</td><td>${rule?'<button class="btn-sm btn" onclick="removeIPRule(\''+esc(rule.id)+'\')">Unblock</button>':'<button class="btn-sm btn danger" onclick="quickBlockIP(\''+esc(x.ip)+'\')">Block</button>'}</td></tr>`;
+      return `<tr data-ip-row="${esc(x.ip)}"><td><code>${esc(x.ip)}</code></td><td>${x.requests||0}</td><td>${x.tokens||0}</td><td>${x.lastSeen?new Date(x.lastSeen).toLocaleString():'-'}</td><td id="ip-resolved-${esc(x.ip).replace(/[^a-zA-Z0-9_-]/g,'_')}" style="font-size:12px;color:var(--muted)"><button class="btn-sm btn" onclick="resolveIP('${esc(x.ip)}',this)">Resolve</button></td><td>${rule?'<span class="status offline"><i></i>Blocked</span>':'<span class="status online"><i></i>Active</span>'}</td><td>${rule?'<button class="btn-sm btn" onclick="removeIPRule(\''+esc(rule.id)+'\')">Unblock</button>':'<button class="btn-sm btn danger" onclick="quickBlockIP(\''+esc(x.ip)+'\')">Block</button>'}</td></tr>`;
     }).join(''):'<tr><td colspan="7" class="empty">No client IP usage records</td></tr>';
     applyLocale(currentLocale);
   }catch(e){showNotice(e.message,'error');}
@@ -1639,7 +1646,33 @@ async function addIPRule(){
 }
 async function quickBlockIP(ip){$('ipRulePrefix').value=ip;await addIPRule();}
 async function removeIPRule(id){if(!confirm('确定解封此 IP 规则？'))return;try{await api('/api/admin/ip-management?id='+encodeURIComponent(id),{method:'DELETE'});showNotice('IP 已解封','success');loadIPManagement();}catch(e){showNotice(e.message,'error');}}
-async function resolveIP(ip){try{const d=await api('/api/admin/ip-resolve?ip='+encodeURIComponent(ip));showNotice(d.ip+' · '+d.type+(d.reverseDns?.length?' · '+d.reverseDns.join(', '):''),'success');}catch(e){showNotice(e.message,'error');}}
+function localeSpan(text){const s=document.createElement('span');s.textContent=text;return s;}
+async function resolveIP(ip,button){
+  const cell=button?.closest('td');
+  if(!cell)return;
+  button.disabled=true;button.textContent='Resolving…';
+  try{
+    const d=await api('/api/admin/ip-resolve?ip='+encodeURIComponent(ip));
+    const geo=d.geo||{};
+    const place=[geo.city,geo.region,geo.country].filter(Boolean).join(', ');
+    cell.textContent='';
+    const line=document.createElement('div');
+    if(place)line.textContent=place;
+    else line.appendChild(localeSpan(d.public?'Unknown location':'Local address'));
+    const meta=document.createElement('small');
+    meta.style.cssText='display:block;color:var(--muted);margin-top:3px';
+    const names=(d.reverseDns||[]).join(', ');
+    const parts=[];
+    if(geo.isp)parts.push(document.createTextNode(geo.isp));
+    parts.push(names?document.createTextNode(names):localeSpan('No reverse DNS'));
+    parts.push(localeSpan(d.public?'Public':'Private'));
+    parts.forEach((node,i)=>{if(i)meta.appendChild(document.createTextNode(' · '));meta.appendChild(node);});
+    cell.append(line,meta);
+    applyLocale(currentLocale);
+  }catch(e){
+    button.disabled=false;button.textContent='Resolve';showNotice(e.message,'error');
+  }
+}
 function proxyRow(x){
   const inCooldown=x.cooldownUntil&&new Date(x.cooldownUntil)>new Date();
   const badge=x.health==='reachable'?'<span class="status online"><i></i>Healthy</span>':x.health==='unreachable'?'<span class="status offline"><i></i>Unreachable</span>':x.health==='upstream_error'?'<span class="status warn"><i></i>Upstream error</span>':'<span class="status">Not checked</span>';

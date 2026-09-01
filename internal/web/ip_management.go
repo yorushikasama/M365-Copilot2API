@@ -164,6 +164,7 @@ type IPResolution struct {
 	Type       string   `json:"type"`
 	Public     bool     `json:"public"`
 	ReverseDNS []string `json:"reverseDns,omitempty"`
+	Geo        *IPGeo   `json:"geo,omitempty"`
 }
 
 func resolveIP(ctx context.Context, value string) (IPResolution, error) {
@@ -191,6 +192,9 @@ func resolveIP(ctx context.Context, value string) (IPResolution, error) {
 		names[i] = strings.TrimSuffix(names[i], ".")
 	}
 	res.ReverseDNS = names
+	if res.Public {
+		res.Geo = lookupIPGeo(ctx, a.String())
+	}
 	return res, nil
 }
 

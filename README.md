@@ -345,7 +345,17 @@ python manage.py stop     # 停止服务
 | `M365_CONVERSATION_CACHE` | 本地对话索引（默认 `conversations.json`） |
 | `M365_API_KEYS` | API Key 存储文件 |
 | `M365_USAGE_LOG` | 用量统计日志（默认 `{data_dir}/usage.jsonl`） |
+| `M365_IP_RULES` | IP 封禁规则文件（默认 `{data_dir}/ip-rules.json`） |
 | `M365_DEBUG_LOG` | 调试日志文件（请求 / 响应元数据） |
+
+### IP 管理
+
+| 变量 | 说明 |
+|------|------|
+| `M365_IP_GEO_URL` | IP 归属地查询接口，可含 `{ip}` 占位符；默认 `http://ip-api.com/json/{ip}?...`（免费额度约 45 次/分钟，仅 HTTP）。也可换成 `https://ipinfo.io/`、自建服务或付费 HTTPS 端点 |
+| `M365_IP_GEO_DISABLE` | 设为任意非空值即关闭第三方查询，只保留本地判定（公网/内网/回环等）与反向 DNS |
+
+> 说明：归属地查询会把被解析的公网 IP 发送给上述第三方服务，仅在管理员点击“Resolve”时触发，结果按 IP 缓存 12 小时（失败缓存 5 分钟）；内网、回环等非公网地址永不外发。
 
 ## 使用示例
 
