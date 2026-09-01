@@ -186,6 +186,12 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 
 	data := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
+		// The detail endpoint reads only sessionResolver.ContextHistory.
+		// Do not expose cloud-only rows that will inevitably return 404 there.
+		historyAvailable, _ := row["historyAvailable"].(bool)
+		if !historyAvailable {
+			continue
+		}
 		data = append(data, row)
 	}
 	sort.Slice(data, func(i, j int) bool {

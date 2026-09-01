@@ -108,6 +108,17 @@ func (s *Server) accountClient(accountID string) *chathub.Client {
 	return s.chat
 }
 
+func (s *Server) recordAllowanceConsumption(accountID string, request chathub.Request) {
+	if s == nil || s.accountPool == nil {
+		return
+	}
+	capability := request.Capability
+	if capability == "" {
+		capability = "LLMOnly"
+	}
+	s.accountPool.RecordAllowanceConsumption(accountID, capability)
+}
+
 func (s *Server) chatWithAccount(ctx context.Context, accountID string, account chathub.Account, request chathub.Request) (chathub.Result, error) {
 	release, err := s.accountConcurrency.Acquire(ctx, accountID)
 	if err != nil {
@@ -119,6 +130,9 @@ func (s *Server) chatWithAccount(ctx context.Context, accountID string, account 
 	}
 	result, err := s.accountClient(accountID).Chat(ctx, account, request)
 	s.recordAccountChatResult(accountID, result, err)
+	if err == nil {
+		s.recordAllowanceConsumption(accountID, request)
+	}
 	return result, err
 }
 
@@ -133,6 +147,9 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 	}
 	result, err := s.accountClient(accountID).ChatWithEvents(ctx, account, request, onEvent)
 	s.recordAccountChatResult(accountID, result, err)
+	if err == nil {
+		s.recordAllowanceConsumption(accountID, request)
+	}
 	return result, err
 }
 
@@ -147,5 +164,8 @@ func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string,
 	}
 	result, err := s.accountClient(accountID).ChatWithReasoning(ctx, account, request, onDelta, onReasoning)
 	s.recordAccountChatResult(accountID, result, err)
+	if err == nil {
+		s.recordAllowanceConsumption(accountID, request)
+	}
 	return result, err
 }

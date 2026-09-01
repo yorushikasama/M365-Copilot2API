@@ -94,13 +94,19 @@ func (s *Server) markAccountResult(accountID string, err error) {
 }
 
 func (s *Server) recordAccountChatResult(accountID string, result chathub.Result, err error) {
+	if meteringErr, ok := err.(*chathub.MeteringError); ok {
+		result.Throttling = meteringErr.Throttling
+		result.MeteringInformation = meteringErr.Metering
+	}
 	s.markAccountResult(accountID, err)
-	if err != nil || s == nil || s.accountPool == nil || accountID == "" {
+	if s == nil || s.accountPool == nil || accountID == "" {
 		return
 	}
 	if result.Throttling != nil {
 		s.accountPool.UpdateThrottling(accountID, result.Throttling)
-		s.logThrottlingWarning(accountID, result.Throttling)
+		if err == nil {
+			s.logThrottlingWarning(accountID, result.Throttling)
+		}
 	}
 	meterError := ""
 	hasAccess := true
@@ -110,7 +116,9 @@ func (s *Server) recordAccountChatResult(accountID string, result chathub.Result
 			applyMeteringCooldown(s.accountPool, accountID, meterError)
 		}
 	}
-	s.accountPool.UpdateMetering(accountID, meterError, hasAccess, remainingAllowances(result.Throttling))
+	if result.Throttling != nil || result.MeteringInformation != nil {
+		s.accountPool.UpdateMetering(accountID, meterError, hasAccess, remainingAllowances(result.Throttling))
+	}
 }
 
 // confirmRateLimitNotice verifies a text-channel rate-limit notice with a
@@ -699,6 +707,9 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		TID                string         `json:"tid,omitempty"`
 		ExpiresAt          time.Time      `json:"expiresAt,omitempty"`
 		UpdatedAt          time.Time      `json:"updatedAt,omitempty"`
+		EstimatedAllowance map[string]int `json:"estimatedRemainingAllowance,omitempty"`
+		ConsumedAllowance  map[string]int `json:"consumedAllowance,omitempty"`
+		AllowanceUpdatedAt time.Time      `json:"allowanceUpdatedAt,omitempty"`
 		BoundProxy         string         `json:"boundProxy,omitempty"`
 	}
 	out := make([]view, 0, len(list))
@@ -711,6 +722,9 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		var meterError string
 		var meterHasAccess = true
 		var remainingAllowance map[string]int
+		var estimatedAllowance map[string]int
+		var consumedAllowance map[string]int
+		var allowanceUpdatedAt time.Time
 		var authFailReason string
 		var imageLimited bool
 		if s.accountPool != nil {
@@ -722,6 +736,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			rateLimited = s.accountPool.RateLimited(a.ID)
 			throttling = s.accountPool.GetThrottling(a.ID)
 			meterError, meterHasAccess, remainingAllowance = s.accountPool.GetMetering(a.ID)
+			estimatedAllowance, consumedAllowance, allowanceUpdatedAt = s.accountPool.GetAllowanceSnapshot(a.ID)
 			authFailReason = s.accountPool.AuthFailReason(a.ID)
 			imageLimited = s.accountPool.ImageLimited(a.ID)
 		}
@@ -734,6 +749,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			AuthFailReason: authFailReason,
 			CooldownUntil:  cooldownUntil, Throttling: throttling,
 			MeterError: meterError, MeterHasAccess: meterHasAccess, RemainingAllowance: remainingAllowance,
+			EstimatedAllowance: estimatedAllowance, ConsumedAllowance: consumedAllowance, AllowanceUpdatedAt: allowanceUpdatedAt,
 			Concurrency: concurrency,
 			OID:         a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt, BoundProxy: a.BoundProxy,

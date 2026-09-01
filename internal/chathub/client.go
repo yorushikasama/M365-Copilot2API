@@ -35,6 +35,26 @@ var ErrOffensiveContent = errors.New("upstream content policy flagged as offensi
 
 var ErrMeteringThrottled = errors.New("upstream metering throttle: capability access denied")
 
+type MeteringError struct {
+	Cause      error
+	Throttling any
+	Metering   any
+}
+
+func (e *MeteringError) Error() string {
+	if e == nil || e.Cause == nil {
+		return ErrMeteringThrottled.Error()
+	}
+	return e.Cause.Error()
+}
+
+func (e *MeteringError) Unwrap() error {
+	if e == nil || e.Cause == nil {
+		return ErrMeteringThrottled
+	}
+	return e.Cause
+}
+
 func checkMeteringError(mi any) error {
 	arr, ok := mi.([]any)
 	if !ok {
@@ -241,6 +261,7 @@ type Request struct {
 	TimeZone              string
 	TimeZoneOffset        int
 	DeviceOS              string
+	Capability            string
 }
 
 type FeatureFlags struct {
@@ -1030,7 +1051,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							low := strings.ToLower(rawResult)
 							if strings.Contains(low, "throttl") {
 								returnConn = false
-								return Result{}, ErrMeteringThrottled
+								return Result{}, &MeteringError{Cause: ErrMeteringThrottled, Throttling: throttling, Metering: meteringInformation}
 							}
 							returnConn = false
 							return Result{}, fmt.Errorf("upstream result error: %s", rawResult)
@@ -1040,14 +1061,14 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							if meterErr := checkMeteringError(mi); meterErr != nil {
 								log.Printf("[chathub] meteringError in type:2 frame: %v", meterErr)
 								returnConn = false
-								return Result{}, meterErr
+								return Result{}, &MeteringError{Cause: meterErr, Throttling: throttling, Metering: meteringInformation}
 							}
 						}
 						if msg, ok := res["message"].(string); ok {
 							final = msg
 							if imageLimitDetected(final) {
 								returnConn = false
-								return Result{}, ErrImageLimit
+								return Result{}, &MeteringError{Cause: ErrImageLimit, Throttling: throttling, Metering: meteringInformation}
 							}
 							if rateLimited(final) {
 								returnConn = false
@@ -1102,7 +1123,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				}
 				if imageLimitDetected(text) {
 					returnConn = false
-					return Result{}, ErrImageLimit
+					return Result{}, &MeteringError{Cause: ErrImageLimit, Throttling: throttling, Metering: meteringInformation}
 				}
 				if rateLimited(text) {
 					returnConn = false

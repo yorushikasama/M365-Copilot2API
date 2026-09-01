@@ -415,6 +415,9 @@ type accountHealth struct {
 	lastMeterError         map[string]string
 	lastMeterAccess        map[string]bool
 	remainingAllowance     map[string]map[string]int
+	allowanceEstimated     map[string]map[string]int
+	allowanceConsumed      map[string]map[string]int
+	allowanceUpdatedAt     map[string]time.Time
 	authFailReason         map[string]string
 	quotaAttempts          map[string]int
 }
@@ -434,6 +437,9 @@ func newAccountHealth() *accountHealth {
 		lastMeterError:         map[string]string{},
 		lastMeterAccess:        map[string]bool{},
 		remainingAllowance:     map[string]map[string]int{},
+		allowanceEstimated:     map[string]map[string]int{},
+		allowanceConsumed:      map[string]map[string]int{},
+		allowanceUpdatedAt:     map[string]time.Time{},
 		authFailReason:         map[string]string{},
 		quotaAttempts:          map[string]int{},
 	}
@@ -626,14 +632,69 @@ func (h *accountHealth) UpdateMetering(accountID, meterError string, hasAccess b
 	h.lastMeterError[accountID] = meterError
 	h.lastMeterAccess[accountID] = hasAccess
 	if len(remaining) == 0 {
-		delete(h.remainingAllowance, accountID)
+		// A response without metering is not evidence that the previous
+		// allowance disappeared. Keep the last valid observation.
 		return
+	}
+	if h.allowanceEstimated[accountID] == nil {
+		h.allowanceEstimated[accountID] = map[string]int{}
+	}
+	if h.allowanceConsumed[accountID] == nil {
+		h.allowanceConsumed[accountID] = map[string]int{}
 	}
 	copyRemaining := make(map[string]int, len(remaining))
 	for capability, allowance := range remaining {
 		copyRemaining[capability] = allowance
+		if old, ok := h.allowanceEstimated[accountID][capability]; !ok || allowance < old {
+			h.allowanceEstimated[accountID][capability] = allowance
+			h.allowanceConsumed[accountID][capability] = 0
+		}
+		if _, ok := h.allowanceEstimated[accountID][capability]; !ok {
+			h.allowanceEstimated[accountID][capability] = allowance
+		}
 	}
 	h.remainingAllowance[accountID] = copyRemaining
+	h.allowanceUpdatedAt[accountID] = time.Now()
+}
+
+func (h *accountHealth) RecordAllowanceConsumption(accountID string, capabilities ...string) {
+	if h == nil || accountID == "" || len(capabilities) == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.allowanceEstimated[accountID] == nil {
+		h.allowanceEstimated[accountID] = map[string]int{}
+	}
+	if h.allowanceConsumed[accountID] == nil {
+		h.allowanceConsumed[accountID] = map[string]int{}
+	}
+	for _, capability := range capabilities {
+		if capability == "" {
+			continue
+		}
+		if current, ok := h.allowanceEstimated[accountID][capability]; ok && current > 0 {
+			h.allowanceEstimated[accountID][capability] = current - 1
+		}
+		h.allowanceConsumed[accountID][capability]++
+	}
+	h.allowanceUpdatedAt[accountID] = time.Now()
+}
+
+func (h *accountHealth) GetAllowanceSnapshot(accountID string) (map[string]int, map[string]int, time.Time) {
+	if h == nil {
+		return nil, nil, time.Time{}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	copyMap := func(src map[string]int) map[string]int {
+		out := make(map[string]int, len(src))
+		for k, v := range src {
+			out[k] = v
+		}
+		return out
+	}
+	return copyMap(h.allowanceEstimated[accountID]), copyMap(h.allowanceConsumed[accountID]), h.allowanceUpdatedAt[accountID]
 }
 
 func (h *accountHealth) GetMetering(accountID string) (string, bool, map[string]int) {
@@ -963,6 +1024,23 @@ func (h *accountHealth) Snapshot() map[string]map[string]any {
 			}
 			m["remainingAllowance"] = copied
 		}
+		if estimated := h.allowanceEstimated[id]; len(estimated) > 0 {
+			copied := make(map[string]int, len(estimated))
+			for capability, allowance := range estimated {
+				copied[capability] = allowance
+			}
+			m["estimatedRemainingAllowance"] = copied
+		}
+		if consumed := h.allowanceConsumed[id]; len(consumed) > 0 {
+			copied := make(map[string]int, len(consumed))
+			for capability, count := range consumed {
+				copied[capability] = count
+			}
+			m["consumedAllowance"] = copied
+		}
+		if updated := h.allowanceUpdatedAt[id]; !updated.IsZero() {
+			m["allowanceUpdatedAt"] = updated
+		}
 		if r := h.authFailReason[id]; r != "" {
 			m["authFailReason"] = r
 		}
@@ -995,6 +1073,9 @@ func (h *accountHealth) ClearAllCooldowns() {
 	h.lastMeterError = map[string]string{}
 	h.lastMeterAccess = map[string]bool{}
 	h.remainingAllowance = map[string]map[string]int{}
+	h.allowanceEstimated = map[string]map[string]int{}
+	h.allowanceConsumed = map[string]map[string]int{}
+	h.allowanceUpdatedAt = map[string]time.Time{}
 	h.authFailReason = map[string]string{}
 	h.quotaAttempts = map[string]int{}
 	ResetGlobalCircuit()

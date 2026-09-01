@@ -1066,7 +1066,7 @@ function renderQuotaDashboard(){
   card.style.display='';
   const totals={}; let withData=0;
   list.forEach(x=>{
-    const r=x.remainingAllowance||{};
+    const r=x.estimatedRemainingAllowance||x.remainingAllowance||{};
     if(Object.keys(r).length) withData++;
     Object.entries(r).forEach(([k,v])=>{ totals[k]=(totals[k]||0)+(Number(v)||0); });
   });
@@ -1115,7 +1115,7 @@ async function loadRecentRequests(){
 let _accountsCache=[],_accountFilter='all';
 function setAccountFilter(f){_accountFilter=f;document.querySelectorAll('#accountFilter button').forEach(b=>b.classList.toggle('active',b.dataset.f===f));renderAccounts();}
 function accountQuotaDetails(x){
-  const remaining=x.remainingAllowance||{};
+  const remaining=x.estimatedRemainingAllowance||x.remainingAllowance||{};
   const preferred=['LLMOnly','ImageGeneration','ClaudeOpusQuery','ClaudeOpusQueryDaily','ArtifactGeneration','WXPAgentMode'];
   let order=[...preferred.filter(k=>k in remaining),...Object.keys(remaining).filter(k=>!preferred.includes(k)).sort()];
   order=order.filter(k=> remaining[k]!==0 || ['LLMOnly','ImageGeneration','ClaudeOpusQuery'].includes(k));
