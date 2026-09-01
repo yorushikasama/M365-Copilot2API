@@ -24,6 +24,29 @@ func TestWebIndexDefaultsToChineseUntilLocaleIsSelected(t *testing.T) {
 	}
 }
 
+func TestWebIndexIncludesIPManagementAndAllPages(t *testing.T) {
+	body, err := os.ReadFile("../../web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, needle := range []string{
+		`data-page="ipmanagement"`,
+		`id="page-ipmanagement"`,
+		`id="page-proxies"`,
+		`id="page-modeltest"`,
+		`id="page-settings"`,
+		"function proxyRow(x)",
+		"if(p==='modeltest')loadModelTest();",
+		"if(p==='settings')loadSettings();",
+		"'IP Management':",
+	} {
+		if !strings.Contains(page, needle) {
+			t.Fatalf("web index missing page wiring %q", needle)
+		}
+	}
+}
+
 func TestWebIndexIncludesAccountMonitoringControls(t *testing.T) {
 	body, err := os.ReadFile("../../web/index.html")
 	if err != nil {

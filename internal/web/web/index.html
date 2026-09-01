@@ -586,12 +586,12 @@ if (response.output_text) {
 
       <!-- IP Management -->
       <section id="page-ipmanagement" style="display:none">
-        <div class="page-head"><div><h2 class="page-title">IP Management</h2><p class="page-sub">查看调用量、解析客户端地址并管理封禁规则</p></div><button class="btn" onclick="loadIPManagement()">Refresh</button></div>
-        <div class="card" style="margin-bottom:16px"><div class="card-head"><span class="card-title">封禁 IP / CIDR</span></div><div class="card-body"><div style="display:flex;gap:8px;flex-wrap:wrap"><input class="form-input" id="ipRulePrefix" placeholder="203.0.113.10 或 203.0.113.0/24" style="flex:1;min-width:220px"><input class="form-input" id="ipRuleNote" placeholder="备注（可选）" style="flex:1;min-width:180px"><button class="btn danger" onclick="addIPRule()">封禁</button></div></div></div>
-        <div class="card"><div class="card-head"><span class="card-title">客户端 IP 调用量</span><select class="form-input" id="ipDays" style="width:110px" onchange="loadIPManagement()"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></div><table class="table"><thead><tr><th>IP address</th><th>Requests</th><th>Tokens</th><th>Last seen</th><th>解析</th><th>状态</th><th>操作</th></tr></thead><tbody id="ipRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table></div>
+        <div class="page-head"><div><h2 class="page-title">IP Management</h2><p class="page-sub">View client request volume, resolve addresses, and manage block rules</p></div><button class="btn" onclick="loadIPManagement()">Refresh</button></div>
+        <div class="card" style="margin-bottom:16px"><div class="card-head"><span class="card-title">Block IP / CIDR</span></div><div class="card-body"><div style="display:flex;gap:8px;flex-wrap:wrap"><input class="form-input" id="ipRulePrefix" placeholder="203.0.113.10 or 203.0.113.0/24" style="flex:1;min-width:220px"><input class="form-input" id="ipRuleNote" placeholder="Optional note" style="flex:1;min-width:180px"><button class="btn danger" onclick="addIPRule()">Block</button></div></div></div>
+        <div class="card"><div class="card-head"><span class="card-title">Client IP usage</span><select class="form-input" id="ipDays" style="width:110px" onchange="loadIPManagement()"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></div><table class="table"><thead><tr><th>IP address</th><th>Requests</th><th>Tokens</th><th>Last seen</th><th>Resolve</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ipRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table></div>
       </section>
-
-
+      <!-- Proxy Pool -->
+      <section id="page-proxies" style="display:none">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
           <div><h2 style="font-size:18px;font-weight:700">Proxy pool</h2><p style="font-size:12px;color:var(--muted);margin-top:2px">Configure outbound proxies with http / https / socks5 and automatic failover</p></div>
           <button class="btn" onclick="proxyCheckAll()"><i data-lucide="activity" style="width:14px;height:14px"></i> Check all</button>
@@ -712,6 +712,20 @@ const localeText={
   'Accounts': {'zh-CN':'账号','zh-TW':'帳號','ja':'アカウント','ko':'계정','es':'Cuentas','fr':'Comptes','de':'Konten','pt-BR':'Contas','ru':'Аккаунты','ar':'الحسابات'},
   'API Keys': {'zh-CN':'API Keys','zh-TW':'API Keys','ja':'API キー','ko':'API 키','es':'Claves API','fr':'Clés API','de':'API-Schlüssel','pt-BR':'Chaves API','ru':'API-ключи','ar':'مفاتيح API'},
   'Conversations': {'zh-CN':'对话管理','zh-TW':'對話管理','ja':'会話管理','ko':'대화 관리','es':'Conversaciones','fr':'Conversations','de':'Unterhaltungen','pt-BR':'Conversas','ru':'Разговоры','ar':'المحادثات'},
+  'Client IP usage': {'zh-CN':'客户端 IP 调用量','zh-TW':'用戶端 IP 用量','ja':'クライアント IP 使用量','ko':'클라이언트 IP 사용량','es':'Uso de IP del cliente','fr':'Utilisation IP client','de':'Client-IP-Nutzung','pt-BR':'Uso de IP do cliente','ru':'Использование IP клиента','ar':'استخدام IP للعميل'},
+  'Block IP / CIDR': {'zh-CN':'封禁 IP / CIDR','zh-TW':'封鎖 IP / CIDR','ja':'IP / CIDR をブロック','ko':'IP / CIDR 차단','es':'Bloquear IP / CIDR','fr':'Bloquer IP / CIDR','de':'IP / CIDR blockieren','pt-BR':'Bloquear IP / CIDR','ru':'Заблокировать IP / CIDR','ar':'حظر IP / CIDR'},
+  'View client request volume, resolve addresses, and manage block rules': {'zh-CN':'查看客户端调用量、解析地址并管理封禁规则','zh-TW':'查看用戶端用量、解析地址並管理封鎖規則','ja':'クライアントのリクエスト量を確認し、アドレスを解決してブロックルールを管理','ko':'클라이언트 요청량을 확인하고 주소를 조회하며 차단 규칙을 관리합니다','es':'Vea el volumen de solicitudes, resuelva direcciones y gestione reglas de bloqueo','fr':'Consultez le volume des requêtes, résolvez les adresses et gérez les règles de blocage','de':'Anfragevolumen anzeigen, Adressen auflösen und Sperrregeln verwalten','pt-BR':'Veja o volume de solicitações, resolva endereços e gerencie regras de bloqueio','ru':'Просматривайте запросы клиентов, определяйте адреса и управляйте правилами блокировки','ar':'اعرض حجم طلبات العميل وحل العناوين وأدر قواعد الحظر'},
+  'Refresh': {'zh-CN':'刷新','zh-TW':'重新整理','ja':'更新','ko':'새로 고침','es':'Actualizar','fr':'Actualiser','de':'Aktualisieren','pt-BR':'Atualizar','ru':'Обновить','ar':'تحديث'},
+  'Block': {'zh-CN':'封禁','zh-TW':'封鎖','ja':'ブロック','ko':'차단','es':'Bloquear','fr':'Bloquer','de':'Blockieren','pt-BR':'Bloquear','ru':'Заблокировать','ar':'حظر'},
+  'Resolve': {'zh-CN':'解析','zh-TW':'解析','ja':'解決','ko':'조회','es':'Resolver','fr':'Résoudre','de':'Auflösen','pt-BR':'Resolver','ru':'Определить','ar':'حل'},
+  'Status': {'zh-CN':'状态','zh-TW':'狀態','ja':'ステータス','ko':'상태','es':'Estado','fr':'Statut','de':'Status','pt-BR':'Status','ru':'Статус','ar':'الحالة'},
+  'Actions': {'zh-CN':'操作','zh-TW':'操作','ja':'操作','ko':'작업','es':'Acciones','fr':'Actions','de':'Aktionen','pt-BR':'Ações','ru':'Действия','ar':'الإجراءات'},
+  'IP address': {'zh-CN':'IP 地址','zh-TW':'IP 位址','ja':'IP アドレス','ko':'IP 주소','es':'Dirección IP','fr':'Adresse IP','de':'IP-Adresse','pt-BR':'Endereço IP','ru':'IP-адрес','ar':'عنوان IP'},
+  'Requests': {'zh-CN':'请求数','zh-TW':'要求數','ja':'リクエスト数','ko':'요청 수','es':'Solicitudes','fr':'Requêtes','de':'Anfragen','pt-BR':'Solicitações','ru':'Запросы','ar':'الطلبات'},
+  'Last seen': {'zh-CN':'最近访问','zh-TW':'最近存取','ja':'最終確認','ko':'최근 확인','es':'Última visita','fr':'Dernière activité','de':'Zuletzt gesehen','pt-BR':'Última visita','ru':'Последний визит','ar':'آخر ظهور'},
+  'Blocked': {'zh-CN':'已封禁','zh-TW':'已封鎖','ja':'ブロック済み','ko':'차단됨','es':'Bloqueado','fr':'Bloqué','de':'Blockiert','pt-BR':'Bloqueado','ru':'Заблокирован','ar':'محظور'},
+  'Active': {'zh-CN':'正常','zh-TW':'正常','ja':'アクティブ','ko':'활성','es':'Activo','fr':'Activa','de':'Aktiv','pt-BR':'Ativo','ru':'Активен','ar':'نشط'},
+  'IP Management': {'zh-CN':'IP 管理','zh-TW':'IP 管理','ja':'IP 管理','ko':'IP 관리','es':'Gestión de IP','fr':'Gestion des IP','de':'IP-Verwaltung','pt-BR':'Gerenciamento de IP','ru':'Управление IP','ar':'إدارة IP'},
   'System': {'zh-CN':'系统','zh-TW':'系統','ja':'システム','ko':'시스템','es':'Sistema','fr':'Système','de':'System','pt-BR':'Sistema','ru':'Система','ar':'النظام'},
   'Proxy Pool': {'zh-CN':'代理池','zh-TW':'代理池','ja':'プロキシプール','ko':'프록시 풀','es':'Grupo de proxies','fr':'Pool de proxys','de':'Proxy-Pool','pt-BR':'Pool de proxies','ru':'Пул прокси','ar':'مجموعة البروكسي'},
   'Model Test': {'zh-CN':'模型测试','zh-TW':'模型測試','ja':'モデルテスト','ko':'모델 테스트','es':'Prueba de modelos','fr':'Test de modèles','de':'Modelltest','pt-BR':'Teste de modelos','ru':'Тест моделей','ar':'اختبار النماذج'},
@@ -971,7 +985,8 @@ function showNotice(msg,type='info'){
 
 function showPage(p){
   ['dashboard','usage','accounts','apikeys','conversations','ipmanagement','proxies','modeltest','settings'].forEach(k=>{
-    $('page-'+k).style.display=k===p?'block':'none';
+    const page=$('page-'+k);
+    if(page)page.style.display=k===p?'block':'none';
     document.querySelector('[data-page="'+k+'"]')?.classList.toggle('active',k===p);
   });
   $('pageTitle').textContent=pages[p];
