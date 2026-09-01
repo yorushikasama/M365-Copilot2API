@@ -94,11 +94,23 @@ func (s *Server) markAccountResult(accountID string, err error) {
 }
 
 func (s *Server) recordAccountChatResult(accountID string, result chathub.Result, err error) {
+	s.recordAccountResultForCapability(accountID, result, err, "")
+}
+
+// recordAccountResultForCapability records an upstream outcome, keeping an
+// image-capability throttle out of the account's general health. Image tokens are
+// metered separately from text, so cooling the whole account down on an image
+// throttle would waste chat capacity that is still available.
+func (s *Server) recordAccountResultForCapability(accountID string, result chathub.Result, err error, capability string) {
 	if meteringErr, ok := err.(*chathub.MeteringError); ok {
 		result.Throttling = meteringErr.Throttling
 		result.MeteringInformation = meteringErr.Metering
 	}
-	s.markAccountResult(accountID, err)
+	if capability == "ImageGeneration" && isImageCapabilityThrottle(err) {
+		s.markImageThrottle(accountID, err)
+	} else {
+		s.markAccountResult(accountID, err)
+	}
 	if s == nil || s.accountPool == nil || accountID == "" {
 		return
 	}
@@ -1211,6 +1223,29 @@ func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
 		return s.tokens.EnsureValid(acc.ID)
 	}
 	return auth.AccountToken{}, fmt.Errorf("no healthy account available for failover")
+}
+
+// nextImageAccount returns the next round-robin account that is healthy and not
+// image-throttled, skipping accounts this request already tried. Used by the
+// image failover path.
+func (s *Server) nextImageAccount(tried map[string]bool) (auth.AccountToken, error) {
+	for i := 0; i < maxAccountProbe; i++ {
+		acc, ok := s.tokens.Next()
+		if !ok {
+			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+		}
+		if tried[acc.ID] {
+			continue
+		}
+		if !s.accountAvailable(acc.ID) {
+			continue
+		}
+		if !s.accountPool.ImageGenAvailable(acc.ID) {
+			continue
+		}
+		return s.tokens.EnsureValid(acc.ID)
+	}
+	return auth.AccountToken{}, fmt.Errorf("no healthy account available for image failover")
 }
 
 type chatBody struct {

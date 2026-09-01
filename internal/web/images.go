@@ -27,7 +27,69 @@ const (
 	maxImageEditRequestBytes = maxGeneratedImageBytes + (2 << 20)
 	generatedImageTTL        = 15 * time.Minute
 	maxGeneratedImages       = 128
+	// imageAccountAttempts bounds how many accounts one image request may try
+	// before the throttle is reported to the caller.
+	imageAccountAttempts = 3
 )
+
+// errImageQuotaRefused marks an upstream 200 whose text is a natural-language
+// refusal about the image quota, so the failover loop can treat it like a
+// throttle without turning it into an upstream error.
+var errImageQuotaRefused = errors.New("upstream refused image generation: quota exhausted")
+
+// imageFailoverWorthwhile reports whether another account has a chance of
+// succeeding. Only quota and throttling errors qualify; a content-policy block
+// or a malformed request would fail the same way everywhere.
+func imageFailoverWorthwhile(err error) bool {
+	return IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, chathub.ErrImageLimit)
+}
+
+// isImageCapabilityThrottle reports whether the error is an image-metering
+// throttle, i.e. one that says nothing about the account's chat capacity.
+func isImageCapabilityThrottle(err error) bool {
+	return errors.Is(err, chathub.ErrImageLimit) || errors.Is(err, chathub.ErrMeteringThrottled)
+}
+
+// markImageThrottle applies an image-only cooldown so rotation skips this
+// account for image generation while leaving its chat capacity alone. The daily
+// token quota lasts until tomorrow; a system-capacity throttle is transient.
+func (s *Server) markImageThrottle(accountID string, err error) {
+	if s == nil || s.accountPool == nil || accountID == "" {
+		return
+	}
+	switch {
+	case errors.Is(err, chathub.ErrImageLimit):
+		s.accountPool.MarkImageGenTokensThrottled(accountID)
+	case errors.Is(err, chathub.ErrMeteringThrottled):
+		s.accountPool.MarkImageGenSystemThrottled(accountID)
+	}
+}
+
+// imageURLsFromResult collects the generated image URLs, falling back to the raw
+// result and answer text when the upstream omits the structured field.
+func imageURLsFromResult(res chathub.Result) []string {
+	if len(res.Images) > 0 {
+		return res.Images
+	}
+	if urls := extractImageURLs(res.RawResult); len(urls) > 0 {
+		return urls
+	}
+	return extractImageURLs(res.Text)
+}
+
+func logImageGenDebug(res chathub.Result) {
+	textPreview := res.Text
+	if len(textPreview) > 500 {
+		textPreview = textPreview[:500]
+	}
+	rawPreview := res.RawResult
+	if len(rawPreview) > 500 {
+		rawPreview = rawPreview[:500]
+	}
+	debug := map[string]any{"text": textPreview, "raw_len": len(res.RawResult), "events": len(res.Events), "images": res.Images, "raw_preview": rawPreview}
+	encoded, _ := json.Marshal(debug)
+	log.Printf("[image-gen-debug] %s", string(encoded))
+}
 
 type generatedImage struct {
 	Data        []byte
@@ -86,8 +148,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, 400, "invalid_request_error", "account missing oid/tid — re-login with PKCE")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ImageTimeoutSeconds)*time.Second)
-	defer cancel()
+	imageTimeout := time.Duration(s.settings.get().ImageTimeoutSeconds) * time.Second
 	size := b.Size
 	if size == "" {
 		size = "1024x1024"
@@ -102,58 +163,69 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		endpoint = "/v1/images/edits"
 		prompt = fmt.Sprintf("Edit the first attached image with GPT Image 2. Size: %s. Instructions: %s. Preserve everything not requested to change. Return the edited image URL directly.", size, b.Prompt)
 	}
-	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic", Attachments: b.Attachments, LicenseType: s.settings.get().LicenseType, Scenario: s.settings.get().Scenario, FeatureFlags: s.featureFlags(), Capability: "ImageGeneration"})
-	if err != nil {
-		// ErrImageLimit classifies as CategoryUpstreamStructured, whose 10s
-		// cooldown is far too short for a daily image quota. Mark the account
-		// image-limited so rotation skips it until tomorrow.
-		if errors.Is(err, chathub.ErrImageLimit) {
-			s.accountPool.MarkImageGenTokensThrottled(acc.ID)
-		}
-		writeUpstreamError(w, err)
-		return
-	}
-	log.Printf("[image-gen] conversation=%s images=%d text_len=%d events=%d raw_len=%d", res.ConversationID, len(res.Images), len(res.Text), len(res.Events), len(res.RawResult))
-	if len(res.Images) == 0 {
-		if urls := extractImageURLs(res.RawResult); len(urls) > 0 {
-			res.Images = urls
-		}
-	}
-	if len(res.Images) == 0 {
-		if urls := extractImageURLs(res.Text); len(urls) > 0 {
-			res.Images = urls
-		}
-	}
-	if len(res.Images) == 0 {
-		refusalText := strings.Join([]string{res.Text, res.RawResult}, "\n")
-		if isImageQuotaRefusal(refusalText) {
+
+	// A throttled account must not become the caller's 429: rotate onto another
+	// account the way the chat path does, and only report the throttle once no
+	// candidate is left.
+	var (
+		res     chathub.Result
+		images  []string
+		lastErr error
+	)
+	pinned := firstNonEmpty(b.AccountID, b.User) != ""
+	tried := map[string]bool{}
+	for attempt := 1; ; attempt++ {
+		tried[acc.ID] = true
+		attemptCtx, cancel := context.WithTimeout(r.Context(), imageTimeout)
+		res, lastErr = s.chatWithAccount(attemptCtx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic", Attachments: b.Attachments, LicenseType: s.settings.get().LicenseType, Scenario: s.settings.get().Scenario, FeatureFlags: s.featureFlags(), Capability: "ImageGeneration"})
+		cancel()
+		if lastErr == nil {
+			log.Printf("[image-gen] conversation=%s images=%d text_len=%d events=%d raw_len=%d", res.ConversationID, len(res.Images), len(res.Text), len(res.Events), len(res.RawResult))
+			images = imageURLsFromResult(res)
+			if len(images) > 0 {
+				break
+			}
+			if !isImageQuotaRefusal(strings.Join([]string{res.Text, res.RawResult}, "\n")) {
+				logImageGenDebug(res)
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no image resource")
+				return
+			}
 			// Upstream answered 200 with a natural-language refusal, so
 			// chatWithAccount already recorded a success and cleared this
 			// account's cooldown. Mark the image quota now: the write lands
 			// after that MarkSuccess, and later ones preserve it.
 			s.accountPool.MarkImageGenTokensThrottled(acc.ID)
+			lastErr = errImageQuotaRefused
+		} else {
+			s.markImageThrottle(acc.ID, lastErr)
+		}
+		if pinned || attempt >= imageAccountAttempts || !imageFailoverWorthwhile(lastErr) {
+			break
+		}
+		next, nerr := s.nextImageAccount(tried)
+		if nerr != nil {
+			break
+		}
+		if next.OID == "" || next.TID == "" {
+			next.OID, next.TID = extractOIDTID(next.AccessToken)
+		}
+		if next.OID == "" || next.TID == "" {
+			break
+		}
+		log.Printf("[image-gen] account=%s throttled (%v), failing over to account=%s", acc.ID, lastErr, next.ID)
+		acc = next
+	}
+	if lastErr != nil {
+		if errors.Is(lastErr, errImageQuotaRefused) {
 			w.Header().Set("Retry-After", strconv.Itoa(s.imageRetryAfter(acc.ID)))
 			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "M365 image generation quota is exhausted; try again later or use another account")
 			return
 		}
-		textPreview := res.Text
-		if len(textPreview) > 500 {
-			textPreview = textPreview[:500]
-		}
-		rawPreview := ""
-		if len(res.RawResult) > 0 {
-			rawPreview = res.RawResult
-			if len(rawPreview) > 500 {
-				rawPreview = rawPreview[:500]
-			}
-		}
-		debug := map[string]any{"text": textPreview, "raw_len": len(res.RawResult), "events": len(res.Events), "images": res.Images, "raw_preview": rawPreview}
-		b, _ := json.Marshal(debug)
-		log.Printf("[image-gen-debug] %s", string(b))
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no image resource")
+		writeUpstreamError(w, lastErr)
 		return
 	}
-	images := res.Images
+	ctx, cancel := context.WithTimeout(r.Context(), imageTimeout)
+	defer cancel()
 	if len(images) > b.N {
 		images = images[:b.N]
 	}
