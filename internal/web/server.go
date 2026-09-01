@@ -180,6 +180,7 @@ type Server struct {
 	responseMu           sync.Mutex
 	responseMessages     map[string]map[string]*RespNode
 	usage                *usageLog
+	ipManager            *ipManager
 	generatedImages      map[string]generatedImage
 	convCache            *conversationCache
 	lastHealthyAccount   string
@@ -276,6 +277,7 @@ func New() (*Server, error) {
 		settings:             openSettingsStore(),
 		responseMessages:     map[string]map[string]*RespNode{},
 		usage:                openUsageLog(),
+		ipManager:            openIPManager(),
 		generatedImages:      map[string]generatedImage{},
 		convCache:            newConversationCache(),
 	}, nil
@@ -367,6 +369,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/deployment/check", s.deploymentCheck)
 	m.HandleFunc("/api/admin/debug/logs", s.debugList)
 	m.HandleFunc("/api/admin/debug/detail", s.debugDetail)
+	m.HandleFunc("/api/admin/ip-management", s.ipManagement)
+	m.HandleFunc("/api/admin/ip-resolve", s.ipResolve)
 	m.HandleFunc("/api/health", s.health)
 	m.HandleFunc("/api/version", s.version)
 	m.HandleFunc("/api/update", s.update)
@@ -427,6 +431,10 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			if s.ipBlocked(r) {
+				writeOpenAIError(w, http.StatusForbidden, "access_denied", "client IP is blocked")
+				return
+			}
 			if !s.validAPIKey(r) {
 				writeOpenAIError(w, http.StatusUnauthorized, "auth_error", "valid API key required")
 				return
@@ -2800,6 +2808,7 @@ func (s *Server) writePublicIdentityChatResponse(w http.ResponseWriter, r *http.
 		s.usage.record(UsageRecord{
 			Time:         time.Now(),
 			APIKeyPrefix: extractAPIKey(r),
+			ClientIP:     clientIP(r),
 			Model:        model,
 			Endpoint:     "/v1/chat/completions",
 			InputTokens:  inputTokens,
@@ -2889,6 +2898,7 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: apiKey,
+		ClientIP:     clientIP(r),
 		AccountEmail: acc.Email,
 		Model:        firstNonEmpty(body.Model, "m365-copilot"),
 		Endpoint:     "/v1/chat/completions",

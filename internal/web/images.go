@@ -206,6 +206,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: extractAPIKey(r),
+		ClientIP:     clientIP(r),
 		AccountEmail: acc.Email,
 		Model:        firstNonEmpty(b.Model, "gpt-image-2"),
 		Endpoint:     endpoint,

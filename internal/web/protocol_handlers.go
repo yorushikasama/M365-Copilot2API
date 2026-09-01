@@ -441,6 +441,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: extractAPIKey(r),
+		ClientIP:     clientIP(r),
 		Model:        firstNonEmpty(body.Model, "m365-copilot"),
 		Endpoint:     "/v1/responses",
 		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
@@ -541,6 +542,7 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: extractAPIKey(r),
+		ClientIP:     clientIP(r),
 		Model:        firstNonEmpty(body.Model, "m365-copilot"),
 		Endpoint:     "/v1/messages",
 		InputTokens:  int64(estimate.Values["input_tokens"].(int)),

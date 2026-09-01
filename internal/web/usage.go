@@ -15,6 +15,7 @@ import (
 type UsageRecord struct {
 	Time         time.Time `json:"time"`
 	APIKeyPrefix string    `json:"api_key_prefix"`
+	ClientIP     string    `json:"client_ip,omitempty"`
 	AccountEmail string    `json:"account_email"`
 	Model        string    `json:"model"`
 	Endpoint     string    `json:"endpoint"`
@@ -234,6 +235,42 @@ func (s *usageLog) snapshot(days int) map[string]any {
 		"keys":      keys,
 		"trend":     trend,
 	}
+}
+
+func (s *usageLog) ipSnapshot(days int) []map[string]any {
+	s.mu.Lock()
+	recs := append([]UsageRecord(nil), s.records...)
+	s.mu.Unlock()
+	if days <= 0 {
+		days = 30
+	}
+	cutoff := time.Now().AddDate(0, 0, -days)
+	type stat struct {
+		Requests, Tokens int64
+		Last             time.Time
+	}
+	counts := map[string]*stat{}
+	for _, rec := range recs {
+		if rec.ClientIP == "" || rec.Time.Before(cutoff) {
+			continue
+		}
+		v := counts[rec.ClientIP]
+		if v == nil {
+			v = &stat{}
+			counts[rec.ClientIP] = v
+		}
+		v.Requests++
+		v.Tokens += rec.InputTokens + rec.OutputTokens + rec.CacheTokens
+		if rec.Time.After(v.Last) {
+			v.Last = rec.Time
+		}
+	}
+	out := make([]map[string]any, 0, len(counts))
+	for ip, v := range counts {
+		out = append(out, map[string]any{"ip": ip, "requests": v.Requests, "tokens": v.Tokens, "lastSeen": v.Last})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["requests"].(int64) > out[j]["requests"].(int64) })
+	return out
 }
 
 func (s *usageLog) logs(limit, offset int) map[string]any {

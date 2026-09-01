@@ -310,6 +310,7 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
       <button data-page="accounts" onclick="showPage('accounts')"><i data-lucide="users" style="width:16px;height:16px;flex-shrink:0"></i><span>Accounts</span></button>
       <button data-page="apikeys" onclick="showPage('apikeys')"><i data-lucide="key-round" style="width:16px;height:16px;flex-shrink:0"></i><span>API Keys</span></button>
       <button data-page="conversations" onclick="showPage('conversations')"><i data-lucide="message-square" style="width:16px;height:16px;flex-shrink:0"></i><span>Conversations</span></button>
+      <button data-page="ipmanagement" onclick="showPage('ipmanagement')"><i data-lucide="shield" style="width:16px;height:16px;flex-shrink:0"></i><span>IP Management</span></button>
     </nav>
     <div class="nav-label">System</div>
     <nav class="nav">
@@ -317,7 +318,7 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
       <button data-page="modeltest" onclick="showPage('modeltest')"><i data-lucide="flask-conical" style="width:16px;height:16px;flex-shrink:0"></i><span>Model Test</span></button>
       <button data-page="settings" onclick="showPage('settings')"><i data-lucide="settings" style="width:16px;height:16px;flex-shrink:0"></i><span>Settings</span></button>
     </nav>
-    <div class="sidebar-foot">v0.4.0</div>
+    <div class="sidebar-foot" id="appVersion">vdev</div>
   </aside>
 
   <main class="main">
@@ -583,8 +584,14 @@ if (response.output_text) {
         </div>
       </section>
 
-      <!-- Proxies -->
-      <section id="page-proxies" style="display:none">
+      <!-- IP Management -->
+      <section id="page-ipmanagement" style="display:none">
+        <div class="page-head"><div><h2 class="page-title">IP Management</h2><p class="page-sub">查看调用量、解析客户端地址并管理封禁规则</p></div><button class="btn" onclick="loadIPManagement()">Refresh</button></div>
+        <div class="card" style="margin-bottom:16px"><div class="card-head"><span class="card-title">封禁 IP / CIDR</span></div><div class="card-body"><div style="display:flex;gap:8px;flex-wrap:wrap"><input class="form-input" id="ipRulePrefix" placeholder="203.0.113.10 或 203.0.113.0/24" style="flex:1;min-width:220px"><input class="form-input" id="ipRuleNote" placeholder="备注（可选）" style="flex:1;min-width:180px"><button class="btn danger" onclick="addIPRule()">封禁</button></div></div></div>
+        <div class="card"><div class="card-head"><span class="card-title">客户端 IP 调用量</span><select class="form-input" id="ipDays" style="width:110px" onchange="loadIPManagement()"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></div><table class="table"><thead><tr><th>IP address</th><th>Requests</th><th>Tokens</th><th>Last seen</th><th>解析</th><th>状态</th><th>操作</th></tr></thead><tbody id="ipRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table></div>
+      </section>
+
+
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
           <div><h2 style="font-size:18px;font-weight:700">Proxy pool</h2><p style="font-size:12px;color:var(--muted);margin-top:2px">Configure outbound proxies with http / https / socks5 and automatic failover</p></div>
           <button class="btn" onclick="proxyCheckAll()"><i data-lucide="activity" style="width:14px;height:14px"></i> Check all</button>
@@ -689,7 +696,7 @@ if (response.output_text) {
 
 <script>
 const $=id=>document.getElementById(id);
-const pages={dashboard:'Dashboard',usage:'Usage',accounts:'Accounts',apikeys:'API Keys',conversations:'Conversations',proxies:'Proxy Pool',modeltest:'Model Test',settings:'Settings'};
+const pages={dashboard:'Dashboard',usage:'Usage',accounts:'Accounts',apikeys:'API Keys',conversations:'Conversations',ipmanagement:'IP Management',proxies:'Proxy Pool',modeltest:'Model Test',settings:'Settings'};
 const localeStorageKey='m365_locale';
 const localeSelectionKey='m365_locale_selected';
 const SUPPORTED_LOCALES=['en','zh-CN','zh-TW','ja','ko','es','fr','de','pt-BR','ru','ar'];
@@ -963,7 +970,7 @@ function showNotice(msg,type='info'){
 }
 
 function showPage(p){
-  ['dashboard','usage','accounts','apikeys','conversations','proxies','modeltest','settings'].forEach(k=>{
+  ['dashboard','usage','accounts','apikeys','conversations','ipmanagement','proxies','modeltest','settings'].forEach(k=>{
     $('page-'+k).style.display=k===p?'block':'none';
     document.querySelector('[data-page="'+k+'"]')?.classList.toggle('active',k===p);
   });
@@ -973,6 +980,7 @@ function showPage(p){
   if(p==='accounts')loadAccounts();
   if(p==='apikeys')loadKeys();
   if(p==='conversations')loadConversations();
+  if(p==='ipmanagement')loadIPManagement();
   if(p==='proxies')loadProxies();
   if(p==='modeltest')loadModelTest();
   if(p==='settings')loadSettings();
@@ -1594,7 +1602,27 @@ async function cleanupAll(){
   showNotice('清理完成','success');loadConversations();
 }
 
-function proxyRow(x){
+async function loadIPManagement(){
+  try{
+    const days=$('ipDays').value||30;
+    const d=await api('/api/admin/ip-management?days='+encodeURIComponent(days));
+    const rules=d.rules||[], ruleMap={}; rules.forEach(x=>ruleMap[x.prefix]=x);
+    const rows=d.ips||[];
+    $('ipRows').innerHTML=rows.length?rows.map(x=>{
+      const rule=ruleMap[x.ip];
+      return `<tr><td><code>${esc(x.ip)}</code></td><td>${x.requests||0}</td><td>${x.tokens||0}</td><td>${x.lastSeen?new Date(x.lastSeen).toLocaleString():'-'}</td><td><button class="btn-sm btn" onclick="resolveIP('${esc(x.ip)}')">解析</button></td><td>${rule?'<span class="status offline"><i></i>Blocked</span>':'<span class="status online"><i></i>Active</span>'}</td><td>${rule?'<button class="btn-sm btn" onclick="removeIPRule(\''+esc(rule.id)+'\')">解封</button>':'<button class="btn-sm btn danger" onclick="quickBlockIP(\''+esc(x.ip)+'\')">封禁</button>'}</td></tr>`;
+    }).join(''):'<tr><td colspan="7" class="empty">暂无客户端调用记录</td></tr>';
+  }catch(e){showNotice(e.message,'error');}
+}
+async function addIPRule(){
+  const prefix=$('ipRulePrefix').value.trim(); if(!prefix)return showNotice('请输入 IP 或 CIDR','error');
+  try{await api('/api/admin/ip-management',{method:'POST',body:JSON.stringify({prefix,note:$('ipRuleNote').value.trim()})});$('ipRulePrefix').value='';$('ipRuleNote').value='';showNotice('IP 已封禁','success');loadIPManagement();}catch(e){showNotice(e.message,'error');}
+}
+async function quickBlockIP(ip){$('ipRulePrefix').value=ip;await addIPRule();}
+async function removeIPRule(id){if(!confirm('确定解封此 IP 规则？'))return;try{await api('/api/admin/ip-management?id='+encodeURIComponent(id),{method:'DELETE'});showNotice('IP 已解封','success');loadIPManagement();}catch(e){showNotice(e.message,'error');}}
+async function resolveIP(ip){try{const d=await api('/api/admin/ip-resolve?ip='+encodeURIComponent(ip));showNotice(d.ip+' · '+d.type+(d.reverseDns?.length?' · '+d.reverseDns.join(', '):''),'success');}catch(e){showNotice(e.message,'error');}}
+
+
   const inCooldown=x.cooldownUntil&&new Date(x.cooldownUntil)>new Date();
   const badge=x.health==='reachable'?'<span class="status online"><i></i>Healthy</span>':x.health==='unreachable'?'<span class="status offline"><i></i>Unreachable</span>':x.health==='upstream_error'?'<span class="status warn"><i></i>Upstream error</span>':'<span class="status">Not checked</span>';
   return `<tr>
@@ -1720,11 +1748,23 @@ async function saveSettings(){
 
 setInterval(()=>{if($('page-accounts').style.display!=='none')loadAccounts();},15000);
 
+async function loadAppVersion(){
+  const el=$('appVersion');
+  if(!el)return;
+  try{
+    const r=await fetch('/api/version',{credentials:'same-origin',cache:'no-store'});
+    if(!r.ok)return;
+    const d=await r.json();
+    const v=String(d.version||'').trim();
+    if(v)el.textContent=v==='dev'?'vdev':'v'+v;
+  }catch(e){}
+}
+
 // Init
 try{lucide.createIcons();}catch(e){}
 fetch('/api/admin/session').then(r=>r.json()).then(d=>{
   if(d.authenticated&&d.must_change_password){location.replace('/login');}
-  else if(d.authenticated){$('login').style.display='none';$('app').style.display='flex';showPage('dashboard');loadStats();loadOnboarding();}
+  else if(d.authenticated){$('login').style.display='none';$('app').style.display='flex';showPage('dashboard');loadStats();loadOnboarding();loadAppVersion();}
   else{$('login').style.display='grid';}
 }).catch(()=>{$('login').style.display='grid';});
 </script>
