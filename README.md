@@ -322,7 +322,7 @@ python manage.py stop     # 停止服务
 | `M365_MAX_TOOL_ROUNDS` | `16` | 单次请求最大工具轮次 |
 | `M365_CONTEXT_WINDOW` | `128000` | 上下文窗口 |
 | `M365_MAX_OUTPUT_TOKENS` | `16384` | 最大输出 Token |
-| `M365_CHAT_TIMEOUT_SECONDS` | `120` | 聊天超时（秒） |
+| `M365_CHAT_TIMEOUT_SECONDS` | `300` | 聊天超时（秒）；工具密集与大附件请求在 120 秒内常常跑不完 |
 | `M365_IMAGE_TIMEOUT_SECONDS` | `150` | 图片处理超时（秒） |
 
 ### 代理池与认证

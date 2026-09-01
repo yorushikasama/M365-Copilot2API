@@ -1782,7 +1782,7 @@ async function loadSettings(){
     const d=await api('/api/admin/settings');
     const v=d.settings||{};
     $('setListen').value=v.listenAddress||'';
-    $('setTimeout').value=v.chatTimeoutSeconds||120;
+    $('setTimeout').value=v.chatTimeoutSeconds||300;
   }catch(e){showNotice(e.message,'error');}
 }
 async function saveSettings(){

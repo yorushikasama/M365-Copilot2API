@@ -58,8 +58,6 @@ func (s *Server) featureFlags() chathub.FeatureFlags {
 
 const maxAccountProbe = 16
 
-const rateLimitProbePrompt = "Reply with exactly: OK"
-
 func (s *Server) logThrottlingWarning(accountID string, throttling any) {
 	maxMsgs := s.settings.get().MaxConversationMessages
 	if maxMsgs <= 0 {
@@ -131,42 +129,6 @@ func (s *Server) recordAccountResultForCapability(accountID string, result chath
 	if result.Throttling != nil || result.MeteringInformation != nil {
 		s.accountPool.UpdateMetering(accountID, meterError, hasAccess, remainingAllowances(result.Throttling))
 	}
-}
-
-// confirmRateLimitNotice verifies a text-channel rate-limit notice with a
-// separate, fresh ChatHub conversation. A single notice is not enough to cool
-// down an account because the upstream can occasionally emit a false positive.
-func (s *Server) confirmRateLimitNotice(ctx context.Context, acc auth.AccountToken, noticeErr error) (bool, error) {
-	if !errors.Is(noticeErr, chathub.ErrRateLimitNotice) {
-		return IsRateLimited(noticeErr), noticeErr
-	}
-
-	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	probeSettings := s.settings.get()
-	_, probeErr := s.chatWithAccount(probeCtx, acc.ID, chathub.Account{
-		AccessToken: acc.AccessToken,
-		OID:         acc.OID,
-		TID:         acc.TID,
-	}, chathub.Request{
-		Text:         rateLimitProbePrompt,
-		Tone:         "magic",
-		Started:      true,
-		LicenseType:  probeSettings.LicenseType,
-		Scenario:     probeSettings.Scenario,
-		FeatureFlags: s.featureFlags(),
-	})
-	if probeErr == nil {
-		return false, nil
-	}
-	if errors.Is(probeErr, chathub.ErrRateLimitNotice) || IsRateLimited(probeErr) {
-		return true, &UpstreamHTTPError{
-			Status:     http.StatusTooManyRequests,
-			RetryAfter: int(s.getRateLimitCooldown().Seconds()),
-		}
-	}
-	return false, probeErr
 }
 
 type Server struct {
@@ -1544,7 +1506,7 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	})
 	ms := time.Since(start).Milliseconds()
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "m365_error", upstreamError(err))
+		writeUpstreamErrorWithAccount(w, err, acc.ID)
 		return
 	}
 	jsonOut(w, map[string]any{"ok": true, "model": b.Model, "reply": sanitizePublicAssistantTextForModel(res.Text, b.Model), "latency_ms": ms})
@@ -2005,12 +1967,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if routeErr != nil {
-				if IsRateLimited(routeErr) {
-					writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
-				} else {
-					log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
-					writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "tool router: "+routeErr.Error())
-				}
+				log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
+				writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
 				return
 			}
 		}
@@ -2301,22 +2259,18 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 					defer cancel2()
 					if res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}); err2 == nil {
-						routeRes, routeErr = res2, nil
-						acc = next
-						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-					} else {
+							routeRes, routeErr = res2, nil
+							acc = next
+							account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+						}
 					}
 				}
-			}
-			if routeErr != nil {
-				msg := upstreamError(routeErr)
-				if IsRateLimited(routeErr) {
-					msg = "upstream is rate limiting; try again shortly"
+				if routeErr != nil {
+					log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
+					writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
+					return
 				}
-				writeOpenAIError(w, http.StatusBadGateway, "tool_router_error", msg)
-				return
 			}
-		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
@@ -2325,6 +2279,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 			}
 			if !parsed {
+				// An upstream failure during repair is not a malformed decision;
+				// report its real category so clients can back off correctly.
+				if repairErr != nil {
+					log.Printf("[tool-repair] account=%s failed: %v", acc.ID, repairErr)
+					writeUpstreamErrorWithAccount(w, repairErr, acc.ID)
+					return
+				}
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "model returned an invalid tool routing decision")
 				return
 			}
@@ -2365,6 +2326,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, body.shouldSendStreamUsage(), calls, retryRes)
 					return
 				}
+			}
+			if retryErr != nil {
+				log.Printf("[tool-required-retry] account=%s failed: %v", acc.ID, retryErr)
+				writeUpstreamErrorWithAccount(w, retryErr, acc.ID)
+				return
 			}
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "model did not select a required tool after constrained retry")
 			return
