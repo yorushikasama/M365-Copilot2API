@@ -1392,14 +1392,16 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{
-					Text:                  text,
-					Tone:                  body.Tone,
-					ConversationID:        body.ConversationID,
-					SessionID:             body.SessionID,
+					Text: text,
+					Tone: body.Tone,
+					// A conversation belongs to the account that created it, so the
+					// replacement account has to start a fresh one.
+					ConversationID:        "",
+					SessionID:             "",
 					Attachments:           body.Attachments,
 					LicenseType:           chatSettings.LicenseType,
 					Scenario:              chatSettings.Scenario,
-					ConversationSignature: body.ConversationSignature,
+					ConversationSignature: "",
 					PreviousMessages:      body.PreviousMessages,
 					ConnectedFederatedIDs: body.ConnectedFederatedIDs,
 					FeatureFlags:          s.featureFlags(),
@@ -1986,9 +1988,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if routeErr != nil {
-			if IsRateLimited(routeErr) && body.AccountID == "" {
+			if (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && body.AccountID == "" {
 				if next, nerr := s.nextHealthyAccount(acc.ID); nerr == nil {
-					s.accountPool.MarkFailure(acc.ID, routeErr, s.getRateLimitCooldown())
+					// chatWithAccount already recorded this failure; marking it
+					// again here would advance the quota backoff twice per request.
 					routeRes2, routeErr2 := s.chatWithAccount(ctx, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 					if routeErr2 == nil {
 						routeRes = routeRes2
@@ -1996,7 +1999,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
 						routeErr = nil
 					} else {
-						s.accountPool.MarkFailure(next.ID, routeErr2, s.getRateLimitCooldown())
 						writeUpstreamErrorWithAccount(w, routeErr2, next.ID)
 						return
 					}
@@ -2006,6 +2008,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				if IsRateLimited(routeErr) {
 					writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
 				} else {
+					log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
 					writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "tool router: "+routeErr.Error())
 				}
 				return

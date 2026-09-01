@@ -112,6 +112,7 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
 	}
 	status := upstreamStatus(err)
+	logUpstreamFailure(accountID, status, err)
 	if status == http.StatusTooManyRequests {
 		if w.Header().Get("Retry-After") == "" {
 			w.Header().Set("Retry-After", "30")
@@ -171,6 +172,19 @@ func ClassifyErrorCode(code string) ErrorCategory {
 	}
 }
 
+// logUpstreamFailure records why a request is being failed. Without it the
+// journal holds only the status code, which leaves a 429 or 502 impossible to
+// diagnose after the fact.
+func logUpstreamFailure(accountID string, status int, err error) {
+	if err == nil {
+		return
+	}
+	if accountID == "" {
+		accountID = "-"
+	}
+	log.Printf("[upstream-fail] account=%s status=%d category=%s err=%v", accountID, status, ClassifyError(err), err)
+}
+
 // writeUpstreamError renders a failed upstream call as an HTTP response,
 // surfacing the Retry-After hint for rate limits so clients can back off.
 func writeUpstreamError(w http.ResponseWriter, err error) {
@@ -179,6 +193,7 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
 	}
 	status := upstreamStatus(err)
+	logUpstreamFailure("", status, err)
 	if status == http.StatusTooManyRequests {
 		if w.Header().Get("Retry-After") == "" {
 			w.Header().Set("Retry-After", "30")

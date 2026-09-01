@@ -37,11 +37,16 @@ const (
 // throttle without turning it into an upstream error.
 var errImageQuotaRefused = errors.New("upstream refused image generation: quota exhausted")
 
+// errImageServiceUnavailable marks an upstream 200 that reports the image
+// service itself as unavailable or overloaded — transient, and worth trying on
+// another account before giving up.
+var errImageServiceUnavailable = errors.New("upstream image generation service is unavailable")
+
 // imageFailoverWorthwhile reports whether another account has a chance of
 // succeeding. Only quota and throttling errors qualify; a content-policy block
 // or a malformed request would fail the same way everywhere.
 func imageFailoverWorthwhile(err error) bool {
-	return IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, chathub.ErrImageLimit)
+	return IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit)
 }
 
 // isImageCapabilityThrottle reports whether the error is an image-metering
@@ -185,17 +190,31 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 			if len(images) > 0 {
 				break
 			}
-			if !isImageQuotaRefusal(strings.Join([]string{res.Text, res.RawResult}, "\n")) {
+			switch classifyImageRefusal(strings.Join([]string{res.Text, res.RawResult}, "\n")) {
+			case imageRefusalQuota:
+				// Upstream answered 200 with a natural-language refusal, so
+				// chatWithAccount already recorded a success and cleared this
+				// account's cooldown. Mark the image quota now: the write lands
+				// after that MarkSuccess, and later ones preserve it.
+				s.accountPool.MarkImageGenTokensThrottled(acc.ID)
+				lastErr = errImageQuotaRefused
+			case imageRefusalCapacity:
+				// The upstream image service itself is down or overloaded rather
+				// than this account being out of quota, so hold the account back
+				// briefly and let another one try.
+				s.accountPool.MarkImageGenSystemThrottled(acc.ID)
+				lastErr = errImageServiceUnavailable
+			case imageRefusalPolicy:
+				// Every account would refuse the same prompt; report it as the
+				// client's problem so it does not retry and burn more quota.
+				logImageGenDebug(res)
+				writeOpenAIError(w, http.StatusBadRequest, "content_policy_violation", firstNonEmpty(strings.TrimSpace(res.Text), "upstream refused to generate this image"))
+				return
+			default:
 				logImageGenDebug(res)
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no image resource")
 				return
 			}
-			// Upstream answered 200 with a natural-language refusal, so
-			// chatWithAccount already recorded a success and cleared this
-			// account's cooldown. Mark the image quota now: the write lands
-			// after that MarkSuccess, and later ones preserve it.
-			s.accountPool.MarkImageGenTokensThrottled(acc.ID)
-			lastErr = errImageQuotaRefused
 		} else {
 			s.markImageThrottle(acc.ID, lastErr)
 		}
@@ -216,12 +235,17 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		acc = next
 	}
 	if lastErr != nil {
-		if errors.Is(lastErr, errImageQuotaRefused) {
+		switch {
+		case errors.Is(lastErr, errImageQuotaRefused):
 			w.Header().Set("Retry-After", strconv.Itoa(s.imageRetryAfter(acc.ID)))
 			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "M365 image generation quota is exhausted; try again later or use another account")
-			return
+		case errors.Is(lastErr, errImageServiceUnavailable):
+			w.Header().Set("Retry-After", strconv.Itoa(s.imageRetryAfter(acc.ID)))
+			writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_unavailable", "M365 image generation is temporarily unavailable upstream; retry shortly")
+		default:
+			log.Printf("[image-gen] endpoint=%s account=%s failed: %v", endpoint, acc.ID, lastErr)
+			writeUpstreamError(w, lastErr)
 		}
-		writeUpstreamError(w, lastErr)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), imageTimeout)
@@ -515,7 +539,30 @@ func (s *Server) generatedImageFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func isImageQuotaRefusal(text string) bool {
+	return classifyImageRefusal(text) == imageRefusalQuota
+}
+
+// imageRefusalKind tells apart the reasons an upstream 200 can carry no image.
+// The distinction decides both the status code the caller sees and whether
+// another account is worth trying.
+type imageRefusalKind int
+
+const (
+	// imageRefusalUnknown covers a missing image with no recognizable reason.
+	imageRefusalUnknown imageRefusalKind = iota
+	// imageRefusalQuota is this account's image allowance being spent.
+	imageRefusalQuota
+	// imageRefusalCapacity is a transient upstream outage or overload.
+	imageRefusalCapacity
+	// imageRefusalPolicy is a content decision that every account would repeat.
+	imageRefusalPolicy
+)
+
+func classifyImageRefusal(text string) imageRefusalKind {
 	low := strings.ToLower(strings.TrimSpace(text))
+	if low == "" {
+		return imageRefusalUnknown
+	}
 	for _, phrase := range []string{
 		"generate any more images",
 		"image generation quota",
@@ -525,10 +572,33 @@ func isImageQuotaRefusal(text string) bool {
 		"请明天再试",
 	} {
 		if strings.Contains(low, phrase) {
-			return true
+			return imageRefusalQuota
 		}
 	}
-	return false
+	for _, phrase := range []string{
+		"image generation service is currently unavailable",
+		"image generation service is currently experiencing",
+		"image generation is temporarily unavailable",
+		"图片生成服务暂时不可用",
+	} {
+		if strings.Contains(low, phrase) {
+			return imageRefusalCapacity
+		}
+	}
+	for _, phrase := range []string{
+		"can’t generate that image",
+		"can't generate that image",
+		"can’t generate images",
+		"can't generate images",
+		"copyrighted character",
+		"against our content policy",
+		"违反内容政策",
+	} {
+		if strings.Contains(low, phrase) {
+			return imageRefusalPolicy
+		}
+	}
+	return imageRefusalUnknown
 }
 
 // extractImageURLs finds image URLs in a raw JSON string by searching for URL patterns.

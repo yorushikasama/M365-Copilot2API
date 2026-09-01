@@ -420,10 +420,12 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		log.Printf("[responses] adapter failed: %v", err)
 		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "upstream protocol error: "+err.Error())
 		return
 	}
 	if !responsesOutputHasContent(out) {
+		log.Printf("[responses] upstream produced no content (status=%d)", status)
 		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "ChatHub returned an empty response; no reusable message was created")
 		return
 	}
@@ -535,6 +537,7 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		log.Printf("[messages] adapter failed: %v", err)
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream protocol error: "+err.Error())
 		return
 	}

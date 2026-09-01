@@ -498,6 +498,16 @@ func (h *accountHealth) RateLimited(accountID string) bool {
 	return h.limited[accountID]
 }
 
+// nextUTCMidnight is when the upstream daily image allowance resets.
+func nextUTCMidnight() time.Time {
+	now := time.Now().UTC()
+	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
+// MarkImageLimited records that the upstream refused image generation for this
+// account. Image tokens are metered separately from text, so this cools down
+// image generation only and leaves the account serving chat; it also feeds the
+// imageLimited badge the dashboard shows.
 func (h *accountHealth) MarkImageLimited(accountID string) {
 	if h == nil || accountID == "" {
 		return
@@ -506,7 +516,7 @@ func (h *accountHealth) MarkImageLimited(accountID string) {
 	defer h.mu.Unlock()
 	h.imageLimited[accountID] = true
 	h.imageLimitUntil[accountID] = time.Now().Add(24 * time.Hour)
-	h.cooldown[accountID] = time.Now().Add(24 * time.Hour)
+	h.imageGenCooldownUntil[accountID] = nextUTCMidnight()
 }
 
 // MarkImageGenExhausted sidelines an account for image generation only, leaving
@@ -546,9 +556,7 @@ func (h *accountHealth) MarkImageGenTokensThrottled(accountID string) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	now := time.Now().UTC()
-	tomorrow := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
-	h.imageGenCooldownUntil[accountID] = tomorrow
+	h.imageGenCooldownUntil[accountID] = nextUTCMidnight()
 }
 
 func (h *accountHealth) MarkImageGenSystemThrottled(accountID string) {
@@ -785,12 +793,18 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		}
 		return
 	case CategoryForbidden403:
+		// A tenant that disables Designer refuses image generation only, so the
+		// account keeps serving chat. Record an image-side cooldown anyway:
+		// returning without a mark left rotation picking this account for every
+		// following image request, which failed the same way each time.
 		var httpErr403 *UpstreamHTTPError
 		if errors.As(err, &httpErr403) && httpErr403.ErrorCode == "ErrorDisallowedAADUser" {
+			h.imageGenCooldownUntil[accountID] = nextUTCMidnight()
 			return
 		}
 		var dialErr403 *chathub.DialError
 		if errors.As(err, &dialErr403) && dialErr403.Kind == "DESIGNER_DISABLED" {
+			h.imageGenCooldownUntil[accountID] = nextUTCMidnight()
 			return
 		}
 		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
@@ -804,6 +818,15 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 				h.authFailReason[accountID] = fmt.Sprintf("%d", dialErr403.Status)
 			}
 		}
+		return
+	case CategoryDesignerDisabled:
+		// The tenant disabled Designer, so only image generation is unavailable.
+		// Keep the account serving chat, but stop selecting it for images until
+		// the daily reset; recording nothing left rotation picking it for every
+		// image request, which then failed the same way.
+		delete(h.authFail, accountID)
+		delete(h.authFailReason, accountID)
+		h.imageGenCooldownUntil[accountID] = nextUTCMidnight()
 		return
 	case CategoryQuota429:
 		delete(h.authFail, accountID)
@@ -882,7 +905,6 @@ func (h *accountHealth) MarkSuccess(accountID string) {
 	if imageLimited && time.Now().Before(imageLimitUntil) {
 		h.imageLimited[accountID] = true
 		h.imageLimitUntil[accountID] = imageLimitUntil
-		h.cooldown[accountID] = imageLimitUntil
 	} else {
 		delete(h.imageLimited, accountID)
 		delete(h.imageLimitUntil, accountID)

@@ -2,6 +2,7 @@ package web
 
 import (
 	"testing"
+	"time"
 
 	"m365-copilot2api/internal/chathub"
 )
@@ -56,7 +57,7 @@ func TestMarkImageThrottleSeparatesDailyQuotaFromCapacity(t *testing.T) {
 }
 
 func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
-	for _, err := range []error{chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice, errImageQuotaRefused} {
+	for _, err := range []error{chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice, errImageQuotaRefused, errImageServiceUnavailable} {
 		if !imageFailoverWorthwhile(err) {
 			t.Fatalf("expected failover for %v", err)
 		}
@@ -65,6 +66,65 @@ func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
 		if imageFailoverWorthwhile(err) {
 			t.Fatalf("unexpected failover for %v", err)
 		}
+	}
+}
+
+func TestClassifyImageRefusalSeparatesQuotaCapacityAndPolicy(t *testing.T) {
+	cases := map[string]imageRefusalKind{
+		"Sorry, I can't generate any more images today. Try again tomorrow.":                imageRefusalQuota,
+		"今日额度已用完，无法再生成图片":                                                                   imageRefusalQuota,
+		"Sorry, the image generation service is currently unavailable. Please try again.":   imageRefusalCapacity,
+		"Sorry, the image generation service is currently experiencing unusual demand.":     imageRefusalCapacity,
+		"Sorry, I can’t generate images featuring that copyrighted character.":              imageRefusalPolicy,
+		"Sorry, I can't generate that image as requested. Try a fully original alternative": imageRefusalPolicy,
+		"Sorry, I wasn't able to respond to that. Is there something else I can help with?": imageRefusalUnknown,
+		"":                                                                                 imageRefusalUnknown,
+	}
+	for text, want := range cases {
+		if got := classifyImageRefusal(text); got != want {
+			t.Fatalf("classify(%q)=%d want %d", text, got, want)
+		}
+	}
+	// The old helper must keep meaning "quota" and nothing else.
+	if !isImageQuotaRefusal("no more images today; try again tomorrow") {
+		t.Fatal("quota refusal no longer detected")
+	}
+	if isImageQuotaRefusal("the image generation service is currently unavailable") {
+		t.Fatal("capacity outage misreported as a quota refusal")
+	}
+}
+
+func TestMarkImageLimitedLeavesChatAvailable(t *testing.T) {
+	h := newAccountHealth()
+	h.MarkImageLimited("account-a")
+	if h.ImageGenAvailable("account-a") {
+		t.Fatal("image limit did not cool down image generation")
+	}
+	if !h.Available("account-a") {
+		t.Fatal("image limit sidelined the account for chat")
+	}
+	if !h.ImageLimited("account-a") {
+		t.Fatal("dashboard flag not set")
+	}
+	// A later success must not restore a general cooldown for the image limit.
+	h.MarkSuccess("account-a")
+	if !h.Available("account-a") {
+		t.Fatal("success re-applied a general cooldown for an image limit")
+	}
+	if h.ImageGenAvailable("account-a") {
+		t.Fatal("success cleared the image cooldown that is still in force")
+	}
+}
+
+func TestDesignerDisabledCoolsImageGenerationOnly(t *testing.T) {
+	h := newAccountHealth()
+	err := &UpstreamHTTPError{Status: 403, ErrorCode: "ErrorDisallowedAADUser"}
+	h.MarkFailure("account-a", err, 60*time.Second)
+	if h.ImageGenAvailable("account-a") {
+		t.Fatal("Designer-disabled account is still selected for image generation")
+	}
+	if !h.Available("account-a") {
+		t.Fatal("Designer-disabled account lost its chat capacity")
 	}
 }
 
