@@ -712,6 +712,7 @@ const localeText={
   'Accounts': {'zh-CN':'账号','zh-TW':'帳號','ja':'アカウント','ko':'계정','es':'Cuentas','fr':'Comptes','de':'Konten','pt-BR':'Contas','ru':'Аккаунты','ar':'الحسابات'},
   'API Keys': {'zh-CN':'API Keys','zh-TW':'API Keys','ja':'API キー','ko':'API 키','es':'Claves API','fr':'Clés API','de':'API-Schlüssel','pt-BR':'Chaves API','ru':'API-ключи','ar':'مفاتيح API'},
   'Conversations': {'zh-CN':'对话管理','zh-TW':'對話管理','ja':'会話管理','ko':'대화 관리','es':'Conversaciones','fr':'Conversations','de':'Unterhaltungen','pt-BR':'Conversas','ru':'Разговоры','ar':'المحادثات'},
+  'IP Management': {'zh-CN':'IP 管理','zh-TW':'IP 管理','ja':'IP 管理','ko':'IP 관리','es':'Gestión de IP','fr':'Gestion des IP','de':'IP-Verwaltung','pt-BR':'Gerenciamento de IP','ru':'Управление IP','ar':'إدارة IP'},
   'Client IP usage': {'zh-CN':'客户端 IP 调用量','zh-TW':'用戶端 IP 用量','ja':'クライアント IP 使用量','ko':'클라이언트 IP 사용량','es':'Uso de IP del cliente','fr':'Utilisation IP client','de':'Client-IP-Nutzung','pt-BR':'Uso de IP do cliente','ru':'Использование IP клиента','ar':'استخدام IP للعميل'},
   'Block IP / CIDR': {'zh-CN':'封禁 IP / CIDR','zh-TW':'封鎖 IP / CIDR','ja':'IP / CIDR をブロック','ko':'IP / CIDR 차단','es':'Bloquear IP / CIDR','fr':'Bloquer IP / CIDR','de':'IP / CIDR blockieren','pt-BR':'Bloquear IP / CIDR','ru':'Заблокировать IP / CIDR','ar':'حظر IP / CIDR'},
   'View client request volume, resolve addresses, and manage block rules': {'zh-CN':'查看客户端调用量、解析地址并管理封禁规则','zh-TW':'查看用戶端用量、解析地址並管理封鎖規則','ja':'クライアントのリクエスト量を確認し、アドレスを解決してブロックルールを管理','ko':'클라이언트 요청량을 확인하고 주소를 조회하며 차단 규칙을 관리합니다','es':'Vea el volumen de solicitudes, resuelva direcciones y gestione reglas de bloqueo','fr':'Consultez le volume des requêtes, résolvez les adresses et gérez les règles de blocage','de':'Anfragevolumen anzeigen, Adressen auflösen und Sperrregeln verwalten','pt-BR':'Veja o volume de solicitações, resolva endereços e gerencie regras de bloqueio','ru':'Просматривайте запросы клиентов, определяйте адреса и управляйте правилами блокировки','ar':'اعرض حجم طلبات العميل وحل العناوين وأدر قواعد الحظر'},
@@ -725,7 +726,9 @@ const localeText={
   'Last seen': {'zh-CN':'最近访问','zh-TW':'最近存取','ja':'最終確認','ko':'최근 확인','es':'Última visita','fr':'Dernière activité','de':'Zuletzt gesehen','pt-BR':'Última visita','ru':'Последний визит','ar':'آخر ظهور'},
   'Blocked': {'zh-CN':'已封禁','zh-TW':'已封鎖','ja':'ブロック済み','ko':'차단됨','es':'Bloqueado','fr':'Bloqué','de':'Blockiert','pt-BR':'Bloqueado','ru':'Заблокирован','ar':'محظور'},
   'Active': {'zh-CN':'正常','zh-TW':'正常','ja':'アクティブ','ko':'활성','es':'Activo','fr':'Activa','de':'Aktiv','pt-BR':'Ativo','ru':'Активен','ar':'نشط'},
-  'IP Management': {'zh-CN':'IP 管理','zh-TW':'IP 管理','ja':'IP 管理','ko':'IP 관리','es':'Gestión de IP','fr':'Gestion des IP','de':'IP-Verwaltung','pt-BR':'Gerenciamento de IP','ru':'Управление IP','ar':'إدارة IP'},
+  'No client IP usage records': {'zh-CN':'暂无客户端调用记录','zh-TW':'暫無用戶端用量記錄','ja':'クライアント IP の使用記録はありません','ko':'클라이언트 IP 사용 기록이 없습니다','es':'No hay registros de uso de IP del cliente','fr':'Aucun enregistrement d’utilisation IP client','de':'Keine Client-IP-Nutzungsdaten','pt-BR':'Nenhum registro de uso de IP do cliente','ru':'Нет записей об использовании IP клиентов','ar':'لا توجد سجلات لاستخدام IP العميل'},
+  'Optional note': {'zh-CN':'备注（可选）','zh-TW':'備註（選填）','ja':'任意のメモ','ko':'선택 메모','es':'Nota opcional','fr':'Note facultative','de':'Optionale Notiz','pt-BR':'Observação opcional','ru':'Необязательная заметка','ar':'ملاحظة اختيارية'},
+  '1 day': {'zh-CN':'1 天','zh-TW':'1 天','ja':'1日','ko':'1일','es':'1 día','fr':'1 jour','de':'1 Tag','pt-BR':'1 dia','ru':'1 день','ar':'يوم واحد'},
   'System': {'zh-CN':'系统','zh-TW':'系統','ja':'システム','ko':'시스템','es':'Sistema','fr':'Système','de':'System','pt-BR':'Sistema','ru':'Система','ar':'النظام'},
   'Proxy Pool': {'zh-CN':'代理池','zh-TW':'代理池','ja':'プロキシプール','ko':'프록시 풀','es':'Grupo de proxies','fr':'Pool de proxys','de':'Proxy-Pool','pt-BR':'Pool de proxies','ru':'Пул прокси','ar':'مجموعة البروكسي'},
   'Model Test': {'zh-CN':'模型测试','zh-TW':'模型測試','ja':'モデルテスト','ko':'모델 테스트','es':'Prueba de modelos','fr':'Test de modèles','de':'Modelltest','pt-BR':'Teste de modelos','ru':'Тест моделей','ar':'اختبار النماذج'},
@@ -1625,8 +1628,9 @@ async function loadIPManagement(){
     const rows=d.ips||[];
     $('ipRows').innerHTML=rows.length?rows.map(x=>{
       const rule=ruleMap[x.ip];
-      return `<tr><td><code>${esc(x.ip)}</code></td><td>${x.requests||0}</td><td>${x.tokens||0}</td><td>${x.lastSeen?new Date(x.lastSeen).toLocaleString():'-'}</td><td><button class="btn-sm btn" onclick="resolveIP('${esc(x.ip)}')">解析</button></td><td>${rule?'<span class="status offline"><i></i>Blocked</span>':'<span class="status online"><i></i>Active</span>'}</td><td>${rule?'<button class="btn-sm btn" onclick="removeIPRule(\''+esc(rule.id)+'\')">解封</button>':'<button class="btn-sm btn danger" onclick="quickBlockIP(\''+esc(x.ip)+'\')">封禁</button>'}</td></tr>`;
-    }).join(''):'<tr><td colspan="7" class="empty">暂无客户端调用记录</td></tr>';
+      return `<tr><td><code>${esc(x.ip)}</code></td><td>${x.requests||0}</td><td>${x.tokens||0}</td><td>${x.lastSeen?new Date(x.lastSeen).toLocaleString():'-'}</td><td><button class="btn-sm btn" onclick="resolveIP('${esc(x.ip)}')">Resolve</button></td><td>${rule?'<span class="status offline"><i></i>Blocked</span>':'<span class="status online"><i></i>Active</span>'}</td><td>${rule?'<button class="btn-sm btn" onclick="removeIPRule(\''+esc(rule.id)+'\')">Unblock</button>':'<button class="btn-sm btn danger" onclick="quickBlockIP(\''+esc(x.ip)+'\')">Block</button>'}</td></tr>`;
+    }).join(''):'<tr><td colspan="7" class="empty">No client IP usage records</td></tr>';
+    applyLocale(currentLocale);
   }catch(e){showNotice(e.message,'error');}
 }
 async function addIPRule(){
