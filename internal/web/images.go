@@ -43,10 +43,13 @@ var errImageQuotaRefused = errors.New("upstream refused image generation: quota 
 var errImageServiceUnavailable = errors.New("upstream image generation service is unavailable")
 
 // imageFailoverWorthwhile reports whether another account has a chance of
-// succeeding. Only quota and throttling errors qualify; a content-policy block
-// or a malformed request would fail the same way everywhere.
+// succeeding. Quota and throttling errors qualify, and so does an empty
+// completion: it is a transient upstream miss that a fresh conversation
+// usually clears (live-checked 2026-09-02, an immediate retry succeeded). A
+// content-policy block, a refused attachment or a malformed request would fail
+// the same way everywhere.
 func imageFailoverWorthwhile(err error) bool {
-	return IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit)
+	return IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit) || errors.Is(err, chathub.ErrEmptyCompletion)
 }
 
 // isImageCapabilityThrottle reports whether the error is an image-metering

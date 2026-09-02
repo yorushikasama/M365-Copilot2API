@@ -57,12 +57,16 @@ func TestMarkImageThrottleSeparatesDailyQuotaFromCapacity(t *testing.T) {
 }
 
 func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
-	for _, err := range []error{chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice, errImageQuotaRefused, errImageServiceUnavailable} {
+	// ErrEmptyCompletion belongs here: the upstream produced nothing at all and a
+	// retry on a fresh conversation clears it (live-checked 2026-09-02).
+	for _, err := range []error{chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice, errImageQuotaRefused, errImageServiceUnavailable, chathub.ErrEmptyCompletion} {
 		if !imageFailoverWorthwhile(err) {
 			t.Fatalf("expected failover for %v", err)
 		}
 	}
-	for _, err := range []error{nil, chathub.ErrOffensiveContent, chathub.ErrEmptyCompletion} {
+	// A refused attachment and a content-policy block fail identically on every
+	// account, so retrying only burns quota.
+	for _, err := range []error{nil, chathub.ErrOffensiveContent, chathub.ErrAttachmentRejected} {
 		if imageFailoverWorthwhile(err) {
 			t.Fatalf("unexpected failover for %v", err)
 		}
