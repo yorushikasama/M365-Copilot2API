@@ -32,6 +32,7 @@ const (
 	CategoryWSReadTimeout      ErrorCategory = "WS_READ_TIMEOUT"
 	CategoryUpstreamStructured ErrorCategory = "UPSTREAM_STRUCTURED"
 	CategoryClientCanceled     ErrorCategory = "CLIENT_CANCELED"
+	CategoryAttachmentRejected ErrorCategory = "ATTACHMENT_REJECTED"
 	CategoryGlobalUnavailable  ErrorCategory = "GLOBAL_UNAVAILABLE"
 	CategoryUnknown            ErrorCategory = "UNKNOWN"
 )
@@ -53,6 +54,9 @@ func ClassifyError(err error) ErrorCategory {
 	}
 	if errors.Is(err, context.Canceled) {
 		return CategoryClientCanceled
+	}
+	if errors.Is(err, chathub.ErrAttachmentRejected) {
+		return CategoryAttachmentRejected
 	}
 	if errors.Is(err, chathub.ErrRateLimitNotice) || errors.Is(err, chathub.ErrMeteringThrottled) {
 		return CategoryQuota429
@@ -758,6 +762,12 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		window = 60 * time.Second
 	}
 	cat := ClassifyError(err)
+	if cat == CategoryAttachmentRejected {
+		// The upstream refused the caller's image, not this account. Cooling
+		// the account down or tripping the global circuit would punish the
+		// pool for a client-side payload problem.
+		return
+	}
 	GlobalCircuitRecord(err)
 	if cat == CategoryClientCanceled {
 		return

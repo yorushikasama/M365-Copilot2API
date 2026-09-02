@@ -35,6 +35,15 @@ var ErrOffensiveContent = errors.New("upstream content policy flagged as offensi
 
 var ErrMeteringThrottled = errors.New("upstream metering throttle: capability access denied")
 
+// ErrAttachmentRejected reports that the upstream image sanitizer refused an
+// attachment. The bytes themselves are the problem, so neither a retry nor a
+// different account will help.
+var ErrAttachmentRejected = errors.New("upstream rejected the attached image")
+
+// ErrAttachmentUploadFailed reports a transient attachment upload failure such
+// as a network error or an upstream 5xx.
+var ErrAttachmentUploadFailed = errors.New("attachment upload failed")
+
 type MeteringError struct {
 	Cause      error
 	Throttling any
@@ -1318,87 +1327,143 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 		if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
 			return fmt.Errorf("decode image: %w", err)
 		}
-		form := url.Values{}
-		form.Set("scenario", "UploadImage")
-		form.Set("conversationId", conversationID)
-		// The browser sends the complete data URL in FileBase64, including the
-		// media-type prefix. UploadFile accepts this form and returns docId.
-		// Live-verified 2026-08-08: UploadFile rejects multipart bodies
-		// (HTTP 400 InvalidRequest); it requires x-www-form-urlencoded like
-		// PyRIT's httpx client sends.
-		form.Set("FileBase64", imageData)
-		if c.Trace != nil {
-			c.Trace(map[string]any{"stage": "upload_start", "index": i, "conversation_id": conversationID, "mime_type": a.MimeType, "base64_length": len(encoded), "token_present": acc.AccessToken != ""})
-		}
-		form.Add("optionsSets", "cwcgptvsan")
-		form.Add("optionsSets", "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch")
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://substrate.office.com/m365Copilot/UploadFile", strings.NewReader(form.Encode()))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		if acc.AccessToken != "" {
-			req.Header.Set("Authorization", "Bearer "+acc.AccessToken)
-		}
-		req.Header.Set("Accept", "application/json")
-		// Required by the enterprise Copilot UploadFile image-input path.
-		// This feature gate is documented in the prior reverse-proxy research
-		// and mirrors the PyRIT request flow.
-		req.Header.Set("X-Variants", "feature.EnableImageSupportInUploadFile")
-		req.Header.Set("X-Scenario", "OfficeWebIncludedCopilot")
-		req.Header.Set("Referer", "https://m365.cloud.microsoft/")
-		for k, vv := range c.HTTPHeader {
-			for _, v := range vv {
-				if k != "Origin" || v != "" {
-					req.Header.Add(k, v)
-				}
+		doc, upErr := c.uploadOneImage(ctx, acc, conversationID, i, a.MimeType, imageData)
+		if errors.Is(upErr, ErrAttachmentRejected) {
+			// The sanitizer refuses some otherwise-valid files; a clean
+			// re-encode drops the metadata it may be choking on.
+			if clean, ok := reencodeImageDataURL(imageData); ok {
+				log.Printf("[upload] attachment %d rejected by the sanitizer; retrying with a re-encoded copy", i)
+				doc, upErr = c.uploadOneImage(ctx, acc, conversationID, i, "image/jpeg", clean)
 			}
 		}
-		resp, err := c.HTTPClient.Do(req)
-		if err != nil {
-			log.Printf("[upload] http error: %v", err)
-			continue
+		if upErr != nil {
+			return fmt.Errorf("attachment %d: %w", i, upErr)
 		}
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-		resp.Body.Close()
-		if readErr != nil {
-			log.Printf("[upload] read error: %v", readErr)
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Printf("[upload] status %s: %s", resp.Status, strings.TrimSpace(string(data[:minInt(len(data), 500)])))
-			continue
-		}
-		var out struct {
-			DocID    string `json:"docId"`
-			FileName string `json:"fileName"`
-			FileType string `json:"fileType"`
-			Result   struct {
-				Value string `json:"value"`
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(data, &out); err != nil {
-			log.Printf("[upload] json error: %v", err)
-			continue
-		}
-		if out.Result.Value != "Success" || out.DocID == "" {
-			log.Printf("[upload] failed: %s", strings.TrimSpace(string(data)))
-			continue
-		}
-		a.DocID = out.DocID
-		a.FileType = strings.TrimPrefix(strings.ToLower(out.FileType), ".")
+		a.DocID = doc.DocID
+		a.FileType = strings.TrimPrefix(strings.ToLower(doc.FileType), ".")
 		// ChatHub's ImageFile annotation uses jpg for JPEG uploads.
 		if a.FileType == "jpeg" {
 			a.FileType = "jpg"
 		}
 		if a.Name == "" {
-			a.Name = out.FileName
+			a.Name = doc.FileName
 		}
 		if c.Trace != nil {
 			c.Trace(map[string]any{"stage": "upload_success", "doc_id": a.DocID, "file_name": a.Name, "file_type": a.FileType})
 		}
 	}
 	return nil
+}
+
+type uploadedDoc struct {
+	DocID    string
+	FileName string
+	FileType string
+}
+
+// uploadOneImage posts a single image to UploadFile. A refusal from the image
+// sanitizer is reported as ErrAttachmentRejected so callers stop instead of
+// silently continuing without the image, which used to make the model answer
+// "please upload the image" and surface as an opaque gateway error.
+func (c *Client) uploadOneImage(ctx context.Context, acc Account, conversationID string, index int, mimeType, imageData string) (uploadedDoc, error) {
+	encodedLen := len(imageData)
+	if comma := strings.IndexByte(imageData, ','); comma >= 0 {
+		encodedLen = len(imageData) - comma - 1
+	}
+	form := url.Values{}
+	form.Set("scenario", "UploadImage")
+	form.Set("conversationId", conversationID)
+	// The browser sends the complete data URL in FileBase64, including the
+	// media-type prefix. UploadFile accepts this form and returns docId.
+	// Live-verified 2026-08-08: UploadFile rejects multipart bodies
+	// (HTTP 400 InvalidRequest); it requires x-www-form-urlencoded like
+	// PyRIT's httpx client sends.
+	form.Set("FileBase64", imageData)
+	if c.Trace != nil {
+		c.Trace(map[string]any{"stage": "upload_start", "index": index, "conversation_id": conversationID, "mime_type": mimeType, "base64_length": encodedLen, "token_present": acc.AccessToken != ""})
+	}
+	form.Add("optionsSets", "cwcgptvsan")
+	form.Add("optionsSets", "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://substrate.office.com/m365Copilot/UploadFile", strings.NewReader(form.Encode()))
+	if err != nil {
+		return uploadedDoc{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if acc.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+acc.AccessToken)
+	}
+	req.Header.Set("Accept", "application/json")
+	// Required by the enterprise Copilot UploadFile image-input path.
+	// This feature gate is documented in the prior reverse-proxy research
+	// and mirrors the PyRIT request flow.
+	req.Header.Set("X-Variants", "feature.EnableImageSupportInUploadFile")
+	req.Header.Set("X-Scenario", "OfficeWebIncludedCopilot")
+	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+	for k, vv := range c.HTTPHeader {
+		for _, v := range vv {
+			if k != "Origin" || v != "" {
+				req.Header.Add(k, v)
+			}
+		}
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		log.Printf("[upload] http error: %v", err)
+		return uploadedDoc{}, fmt.Errorf("%w: %v", ErrAttachmentUploadFailed, err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	resp.Body.Close()
+	if readErr != nil {
+		log.Printf("[upload] read error: %v", readErr)
+		return uploadedDoc{}, fmt.Errorf("%w: read body: %v", ErrAttachmentUploadFailed, readErr)
+	}
+	body := strings.TrimSpace(string(data))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[upload] status %s: %s", resp.Status, body[:minInt(len(body), 500)])
+		return uploadedDoc{}, classifyUploadFailure(resp.StatusCode, body)
+	}
+	var out struct {
+		DocID    string `json:"docId"`
+		FileName string `json:"fileName"`
+		FileType string `json:"fileType"`
+		Result   struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		log.Printf("[upload] json error: %v", err)
+		return uploadedDoc{}, fmt.Errorf("%w: malformed upstream response", ErrAttachmentUploadFailed)
+	}
+	if out.Result.Value != "Success" || out.DocID == "" {
+		log.Printf("[upload] failed: %s", body)
+		return uploadedDoc{}, classifyUploadFailure(resp.StatusCode, body)
+	}
+	return uploadedDoc{DocID: out.DocID, FileName: out.FileName, FileType: out.FileType}, nil
+}
+
+// classifyUploadFailure separates a refusal of the image itself, which no retry
+// can fix, from a transient upstream failure worth retrying.
+func classifyUploadFailure(status int, body string) error {
+	lower := strings.ToLower(body)
+	switch {
+	case strings.Contains(lower, "sanitiz"), strings.Contains(lower, "unsupportedfile"), strings.Contains(lower, "invalidimage"), strings.Contains(lower, "filetoolarge"):
+		return fmt.Errorf("%w (upstream said %s)", ErrAttachmentRejected, uploadResultValue(body))
+	case status >= 400 && status < 500 && status != http.StatusRequestTimeout && status != http.StatusTooManyRequests:
+		return fmt.Errorf("%w (upstream http %d)", ErrAttachmentRejected, status)
+	}
+	return fmt.Errorf("%w: upstream http %d", ErrAttachmentUploadFailed, status)
+}
+
+func uploadResultValue(body string) string {
+	var out struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(body), &out); err == nil && out.Result.Value != "" {
+		return out.Result.Value
+	}
+	return "an unspecified error"
 }
 
 func chatPayload(req Request, requestID string, firstTurn bool) string {

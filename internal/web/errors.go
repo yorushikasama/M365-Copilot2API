@@ -36,6 +36,9 @@ func upstreamError(err error) string {
 // rate limits stay 429 (with Retry-After when known), auth failures become 401,
 // everything else is 502. Unknown upstream failures must never leak internals.
 func upstreamStatus(err error) int {
+	if errors.Is(err, chathub.ErrAttachmentRejected) {
+		return http.StatusBadRequest
+	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {
 		return http.StatusServiceUnavailable
 	}
@@ -131,6 +134,10 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned empty completion; the requested model may be unavailable for this tenant")
 		return
 	}
+	if errors.Is(err, chathub.ErrAttachmentRejected) {
+		writeOpenAIError(w, status, "invalid_image", "the upstream image sanitizer rejected the attached image; re-export it as a plain JPEG or PNG, or try another image")
+		return
+	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
 		return
@@ -210,6 +217,10 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 	}
 	if IsEmptyCompletion(err) {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned empty completion; the requested model may be unavailable for this tenant")
+		return
+	}
+	if errors.Is(err, chathub.ErrAttachmentRejected) {
+		writeOpenAIError(w, status, "invalid_image", "the upstream image sanitizer rejected the attached image; re-export it as a plain JPEG or PNG, or try another image")
 		return
 	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {
