@@ -2149,15 +2149,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if convReused {
 				s.invalidateConvCache(acc.ID, convCacheModel)
 			}
-			msg := upstreamError(err)
-			if IsRateLimited(err) {
-				msg = "upstream is rate limiting; try again shortly"
-			}
-			if errors.Is(err, chathub.ErrOffensiveContent) {
-				msg = "M365 content policy flagged this request as offensive"
-			}
-			msg = sanitizePublicInternalText(msg)
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			ev := streamErrorEvent(requestID, err)
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(ev)+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
 		}
@@ -2476,24 +2469,16 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
 			}
-		} else {
-			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
-				s.accountPool.MarkImageLimited(acc.ID)
+			} else {
+				log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
+				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(acc.ID)
+				}
+				if convReused {
+					s.invalidateConvCache(acc.ID, convCacheModel)
+				}
+				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(streamErrorEvent(requestID, err))+"\n\n")
 			}
-			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
-			}
-			msg := upstreamError(err)
-			if IsRateLimited(err) {
-				msg = "upstream is rate limiting; try again shortly"
-			}
-			if errors.Is(err, chathub.ErrOffensiveContent) {
-				msg = "M365 content policy flagged this request as offensive"
-			}
-			msg = sanitizePublicInternalText(msg)
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
-		}
 		pt := EstimateTokens(prompt)
 		ct := EstimateTokens(res.Text)
 		log.Printf("[usage] stream id=%s pt=%d ct=%d res.Text=%d", id, pt, ct, len(res.Text))

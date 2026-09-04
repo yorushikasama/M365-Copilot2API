@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -143,6 +144,50 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 		return
 	}
 	writeOpenAIError(w, status, "upstream_error", upstreamError(err))
+}
+
+// streamErrorCode maps an upstream failure category to a stable SSE error code
+// the caller can branch on. Category and request id ride alongside so the
+// client can distinguish a silent upstream (upstream_timeout) from a quota
+// limit (rate_limit_error) instead of a blanket rate_limit.
+func streamErrorCode(cat ErrorCategory) string {
+	switch cat {
+	case CategoryQuota429:
+		return "rate_limit_error"
+	case CategoryAuthExpired401:
+		return "authentication_error"
+	case CategoryForbidden403:
+		return "permission_error"
+	case CategoryWSReadTimeout:
+		return "upstream_timeout"
+	case CategoryAttachmentRejected:
+		return "invalid_image"
+	default:
+		return "upstream_error"
+	}
+}
+
+// streamErrorEvent renders a mid-stream failure as an SSE error payload with
+// the message sanitized and the diagnosable bits (code, category, request id)
+// attached.
+func streamErrorEvent(requestID string, err error) map[string]any {
+	cat := ClassifyError(err)
+	msg := upstreamError(err)
+	if IsRateLimited(err) {
+		msg = "upstream is rate limiting; try again shortly"
+	}
+	if errors.Is(err, chathub.ErrOffensiveContent) {
+		msg = "M365 content policy flagged this request as offensive"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || cat == CategoryWSReadTimeout {
+		msg = "the upstream took too long to respond and the stream was cut off; try again in a moment"
+	}
+	return map[string]any{"error": map[string]any{
+		"message":    sanitizePublicInternalText(msg),
+		"code":       streamErrorCode(cat),
+		"category":   string(cat),
+		"request_id": requestID,
+	}}
 }
 
 func IsRetryable(err error) bool {

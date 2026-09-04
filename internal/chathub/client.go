@@ -367,6 +367,29 @@ type Client struct {
 	Dialer     *websocket.Dialer
 	Pool       *ConnPool
 	Trace      func(map[string]any)
+
+	// ReadFrameTimeout bounds how long a single upstream frame may take to
+	// arrive between frames. Long tool-heavy prompts routinely take 70-100s
+	// before the first delta; the historical hardcoded 90s cut those streams
+	// off mid-answer.
+	ReadFrameTimeout time.Duration
+	// ResponseDeadline bounds the whole exchange on one WebSocket, as a
+	// backstop against a silently dead upstream.
+	ResponseDeadline time.Duration
+}
+
+const (
+	defaultFrameReadTimeout = 150 * time.Second
+	defaultResponseDeadline = 5 * time.Minute
+)
+
+func envSecondsDuration(key string, def time.Duration) time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return def
 }
 
 func NewClient() *Client {
@@ -375,10 +398,26 @@ func NewClient() *Client {
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	d := outbound.WebSocketDialer()
 	return &Client{
-		HTTPHeader: h,
-		HTTPClient: outbound.HTTPClient(),
-		Dialer:     d,
+		HTTPHeader:       h,
+		HTTPClient:       outbound.HTTPClient(),
+		Dialer:           d,
+		ReadFrameTimeout: envSecondsDuration("M365_CHATHUB_READ_TIMEOUT_SECONDS", defaultFrameReadTimeout),
+		ResponseDeadline: envSecondsDuration("M365_CHATHUB_RESPONSE_DEADLINE_SECONDS", defaultResponseDeadline),
 	}
+}
+
+func (c *Client) readFrameTimeout() time.Duration {
+	if c != nil && c.ReadFrameTimeout > 0 {
+		return c.ReadFrameTimeout
+	}
+	return defaultFrameReadTimeout
+}
+
+func (c *Client) responseDeadline() time.Duration {
+	if c != nil && c.ResponseDeadline > 0 {
+		return c.ResponseDeadline
+	}
+	return defaultResponseDeadline
 }
 
 func (c *Client) Chat(ctx context.Context, acc Account, req Request) (Result, error) {
@@ -709,7 +748,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	references := make(map[string]Reference)
 	var firstServiceResponse bool
 
-	deadline := time.Now().Add(5 * time.Minute)
+	deadline := time.Now().Add(c.responseDeadline())
 	type wsRead struct {
 		msg []byte
 		err error
@@ -753,7 +792,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				}
 				continue
 			}
-			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			_ = conn.SetReadDeadline(time.Now().Add(c.readFrameTimeout()))
 			_, msg, err := conn.ReadMessage()
 			select {
 			case readCh <- wsRead{msg: msg, err: err}:
