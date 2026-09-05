@@ -24,18 +24,21 @@ type ToolCallQueue struct {
 	mu      sync.Mutex
 	pending []*PendingToolCall
 	nextID  int64
+	// notify is signaled (non-blocking, buffer 1) whenever a call is enqueued,
+	// so Dequeue waits on it instead of polling on a timer. A timer poll added
+	// up to 50ms of latency to every tool dispatch and burned CPU while idle.
+	notify chan struct{}
 }
 
 // NewToolCallQueue creates a new tool call queue.
 func NewToolCallQueue() *ToolCallQueue {
-	return &ToolCallQueue{}
+	return &ToolCallQueue{notify: make(chan struct{}, 1)}
 }
 
 // Enqueue adds a tool call to the queue and returns a channel that will receive the result.
 // The caller should block on either ResultCh or ErrCh.
 func (q *ToolCallQueue) Enqueue(name string, arguments map[string]any) *PendingToolCall {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.nextID++
 	call := &PendingToolCall{
 		ID:        fmt.Sprintf("mcp-tool-%d", q.nextID),
@@ -46,6 +49,11 @@ func (q *ToolCallQueue) Enqueue(name string, arguments map[string]any) *PendingT
 		CreatedAt: time.Now(),
 	}
 	q.pending = append(q.pending, call)
+	q.mu.Unlock()
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
 	return call
 }
 
@@ -64,7 +72,7 @@ func (q *ToolCallQueue) Dequeue(ctx context.Context) *PendingToolCall {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(50 * time.Millisecond):
+		case <-q.notify:
 		}
 	}
 }

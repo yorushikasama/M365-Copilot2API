@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,12 +30,49 @@ type UsageRecord struct {
 
 const maxUsageRecords = 50000
 
+// usageSnapshotTTL bounds how long an aggregated snapshot is reused. The console
+// polls these endpoints continuously; without a cache every poll copied the whole
+// record set under the same mutex the request hot path uses to append.
+const usageSnapshotTTL = 3 * time.Second
+
+// defaultUsageMaxFileBytes caps usage.jsonl. Only the last maxUsageRecords rows
+// are ever served, so anything beyond this is dead weight that also slows every
+// restart down.
+const defaultUsageMaxFileBytes = 32 << 20
+
+// usageRotateSlack lets the file run this many times past the retained record
+// count before it is rewritten, keeping rotation amortized.
+const usageRotateSlack = 2
+
+func usageMaxFileBytes() int64 {
+	if raw := strings.TrimSpace(os.Getenv("M365_USAGE_LOG_MAX_BYTES")); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultUsageMaxFileBytes
+}
+
+type usageSnapshotCache struct {
+	at    time.Time
+	days  int
+	stats map[string]any
+	ips   []map[string]any
+}
+
 type usageLog struct {
 	mu      sync.Mutex
 	Path    string
 	records []UsageRecord
 	pending []UsageRecord
 	persist *persistStore
+	// fileRecords tracks how many rows currently sit on disk so rotation can
+	// tell whether a rewrite would actually reclaim anything.
+	fileRecords int
+	rotations   int
+
+	cacheMu sync.Mutex
+	cache   usageSnapshotCache
 }
 
 var globalUsage = &usageLog{}
@@ -58,6 +96,9 @@ func openUsageLog() *usageLog {
 	return s
 }
 
+// load reads the log through a ring buffer. Appending everything and trimming
+// afterwards made peak memory scale with the entire retained history rather than
+// with maxUsageRecords.
 func (s *usageLog) load() {
 	f, err := os.Open(s.Path)
 	if err != nil {
@@ -66,13 +107,30 @@ func (s *usageLog) load() {
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	ring := make([]UsageRecord, maxUsageRecords)
+	count, next, lines := 0, 0, 0
 	for scanner.Scan() {
+		lines++
 		var rec UsageRecord
-		if json.Unmarshal(scanner.Bytes(), &rec) == nil {
-			s.records = append(s.records, rec)
+		if json.Unmarshal(scanner.Bytes(), &rec) != nil {
+			continue
 		}
+		ring[next] = rec
+		next = (next + 1) % maxUsageRecords
+		count++
 	}
-	s.trim()
+	// Count every physical row, not just the parseable ones: unparseable lines
+	// are dropped by a rewrite too, so they count as reclaimable space.
+	s.fileRecords = lines
+	if count == 0 {
+		return
+	}
+	if count < maxUsageRecords {
+		s.records = append(s.records, ring[:count]...)
+		return
+	}
+	s.records = append(s.records, ring[next:]...)
+	s.records = append(s.records, ring[:next]...)
 }
 
 func (s *usageLog) trim() {
@@ -87,7 +145,14 @@ func (s *usageLog) record(rec UsageRecord) {
 	s.trim()
 	s.pending = append(s.pending, rec)
 	s.mu.Unlock()
+	s.invalidateSnapshot()
 	s.persist.markDirty()
+}
+
+func (s *usageLog) invalidateSnapshot() {
+	s.cacheMu.Lock()
+	s.cache = usageSnapshotCache{}
+	s.cacheMu.Unlock()
 }
 
 // flush 批量追加本次累积的记录，锁外写盘。
@@ -96,6 +161,15 @@ func (s *usageLog) flush() error {
 	pending := s.pending
 	s.pending = nil
 	s.mu.Unlock()
+	// appendRecords must fully return (and close its handle) before rotation:
+	// Windows refuses to rename over a file that is still open.
+	if err := s.appendRecords(pending); err != nil {
+		return err
+	}
+	return s.rotateIfNeeded()
+}
+
+func (s *usageLog) appendRecords(pending []UsageRecord) error {
 	if len(pending) == 0 {
 		return nil
 	}
@@ -111,17 +185,127 @@ func (s *usageLog) flush() error {
 		return err
 	}
 	defer f.Close()
-	_, err = f.Write(buf)
-	if err != nil {
+	n, werr := f.Write(buf)
+	if werr != nil {
+		// Only re-queue records whose whole line did not reach disk. Re-queuing the
+		// whole batch would re-write the rows that already persisted, duplicating
+		// them in the usage log on the next flush.
 		s.mu.Lock()
-		s.pending = append(pending, s.pending...)
+		s.pending = append(recountPending(pending, n), s.pending...)
 		s.mu.Unlock()
-		return err
+		return werr
 	}
+	s.mu.Lock()
+	s.fileRecords += len(pending)
+	s.mu.Unlock()
 	return f.Sync()
 }
 
+// recountPending returns the tail of pending whose marshalled bytes were not
+// fully written in the first n bytes. Records are newline-terminated, so counting
+// the complete newlines inside the first n bytes tells exactly how many leading
+// records landed on disk and must not be re-queued.
+func recountPending(pending []UsageRecord, n int) []UsageRecord {
+	pos := 0
+	written := 0
+	for i, rec := range pending {
+		b, err := json.Marshal(rec)
+		if err != nil {
+			continue
+		}
+		pos += len(b) + 1
+		if pos <= n {
+			written = i + 1
+		} else {
+			break
+		}
+	}
+	return pending[written:]
+}
+
+// rotateIfNeeded rewrites the log with just the retained records once a rewrite
+// would actually reclaim space. Triggering on file size alone was wrong: a log
+// that merely sits above the byte cap while the retained set already accounts for
+// every row on disk would be rewritten byte-for-byte on every flush. The decision
+// is therefore based on reclaimable rows, and the byte cap only brings the
+// rewrite forward.
+//
+// It runs after pending rows were appended and clears pending in the same
+// critical section as the snapshot it writes, so no row is persisted twice and
+// none is lost.
+func (s *usageLog) rotateIfNeeded() error {
+	fi, err := os.Stat(s.Path)
+	if err != nil {
+		return nil
+	}
+	overBytes := fi.Size() > usageMaxFileBytes()
+
+	s.mu.Lock()
+	onDisk, retained := s.fileRecords, len(s.records)
+	reclaimable := onDisk - retained
+	// A rewrite can never shrink the file below the retained set, so require a
+	// meaningful share of it to be reclaimable before paying for the rewrite.
+	minReclaim := retained / usageRotateSlack
+	if minReclaim < 1 {
+		minReclaim = 1
+	}
+	overCount := onDisk > retained*usageRotateSlack
+	if retained == 0 || reclaimable < minReclaim || !(overBytes || overCount) {
+		s.mu.Unlock()
+		return nil
+	}
+	recs := append([]UsageRecord(nil), s.records...)
+	// Everything in recs is about to hit disk, so queued duplicates must go.
+	requeue := s.pending
+	s.pending = nil
+	s.fileRecords = len(recs)
+	s.rotations++
+	s.mu.Unlock()
+
+	var buf []byte
+	for _, rec := range recs {
+		if b, err := json.Marshal(rec); err == nil {
+			buf = append(buf, b...)
+			buf = append(buf, '\n')
+		}
+	}
+	if err := writeFileAtomic(s.Path, buf, 0600); err != nil {
+		// The file is untouched, so restore the bookkeeping and put the rows we
+		// claimed back on the queue instead of dropping them.
+		s.mu.Lock()
+		s.fileRecords = onDisk
+		s.rotations--
+		s.pending = append(requeue, s.pending...)
+		s.mu.Unlock()
+		return err
+	}
+	log.Printf("[usage] rotated log: %d -> %d bytes, %d records retained, %d reclaimed", fi.Size(), len(buf), len(recs), reclaimable)
+	return nil
+}
+
 func (s *usageLog) snapshot(days int) map[string]any {
+	s.cacheMu.Lock()
+	if s.cache.stats != nil && s.cache.days == days && time.Since(s.cache.at) < usageSnapshotTTL {
+		cached := s.cache.stats
+		s.cacheMu.Unlock()
+		return cached
+	}
+	s.cacheMu.Unlock()
+
+	stats := s.computeSnapshot(days)
+
+	s.cacheMu.Lock()
+	if s.cache.days != days {
+		s.cache.ips = nil
+	}
+	s.cache.days = days
+	s.cache.stats = stats
+	s.cache.at = time.Now()
+	s.cacheMu.Unlock()
+	return stats
+}
+
+func (s *usageLog) computeSnapshot(days int) map[string]any {
 	s.mu.Lock()
 	recs := append([]UsageRecord(nil), s.records...)
 	s.mu.Unlock()
@@ -238,12 +422,34 @@ func (s *usageLog) snapshot(days int) map[string]any {
 }
 
 func (s *usageLog) ipSnapshot(days int) []map[string]any {
-	s.mu.Lock()
-	recs := append([]UsageRecord(nil), s.records...)
-	s.mu.Unlock()
 	if days <= 0 {
 		days = 30
 	}
+	s.cacheMu.Lock()
+	if s.cache.ips != nil && s.cache.days == days && time.Since(s.cache.at) < usageSnapshotTTL {
+		cached := s.cache.ips
+		s.cacheMu.Unlock()
+		return cached
+	}
+	s.cacheMu.Unlock()
+
+	out := s.computeIPSnapshot(days)
+
+	s.cacheMu.Lock()
+	if s.cache.days != days {
+		s.cache.stats = nil
+		s.cache.days = days
+		s.cache.at = time.Now()
+	}
+	s.cache.ips = out
+	s.cacheMu.Unlock()
+	return out
+}
+
+func (s *usageLog) computeIPSnapshot(days int) []map[string]any {
+	s.mu.Lock()
+	recs := append([]UsageRecord(nil), s.records...)
+	s.mu.Unlock()
 	cutoff := time.Now().AddDate(0, 0, -days)
 	type stat struct {
 		Requests, Tokens int64
@@ -273,12 +479,11 @@ func (s *usageLog) ipSnapshot(days int) []map[string]any {
 	return out
 }
 
+// logs returns one page. It used to copy every retained record just to slice a
+// handful out, holding the same mutex the request hot path appends under.
 func (s *usageLog) logs(limit, offset int) map[string]any {
 	s.mu.Lock()
-	recs := append([]UsageRecord(nil), s.records...)
-	s.mu.Unlock()
-
-	total := len(recs)
+	total := len(s.records)
 	if offset > total {
 		offset = total
 	}
@@ -291,12 +496,13 @@ func (s *usageLog) logs(limit, offset int) map[string]any {
 		end = 0
 	}
 	if start >= end {
+		s.mu.Unlock()
 		return map[string]any{"logs": []UsageRecord{}, "total": total}
 	}
-	out := make([]UsageRecord, 0, end-start)
-	for i := start; i < end; i++ {
-		out = append(out, recs[i])
-	}
+	out := make([]UsageRecord, end-start)
+	copy(out, s.records[start:end])
+	s.mu.Unlock()
+
 	sort.Slice(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
 	return map[string]any{"logs": out, "total": total}
 }

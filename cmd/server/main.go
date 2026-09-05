@@ -32,6 +32,9 @@ func main() {
 	s.StartAutoCleanup()
 	s.StartConvCacheGC()
 	s.RefreshExpiredTokens()
+	// Warm the WebSocket pool so the first requests skip dial+handshake; the
+	// pool keeps itself warm afterwards via Return and re-warm on hits.
+	s.PreheatPool()
 	listen := "127.0.0.1:4141"
 	if v := os.Getenv("M365_LISTEN"); v != "" {
 		listen = v

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"m365-copilot2api/internal/atomicfile"
 )
 
 type AccountToken struct {
@@ -161,73 +163,11 @@ func decryptRefreshToken(enc string) (string, error) {
 	return string(pt), nil
 }
 
-func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
-func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
-	if path == "" {
-		return nil
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	cleanupStaleTmp(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		tmp.Close()
-		os.Remove(tmpName)
-	}()
-	if err := tmp.Chmod(perm); err != nil {
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	_ = fsyncDir(dir)
-	return nil
-}
-
-func cleanupStaleTmp(path string) {
-	if path == "" {
-		return
-	}
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	for _, pat := range []string{filepath.Join(dir, "."+base+".tmp.*"), filepath.Join(dir, base+".tmp.*")} {
-		if matches, _ := filepath.Glob(pat); matches != nil {
-			for _, m := range matches {
-				_ = os.Remove(m)
-			}
-		}
-	}
-	_ = os.Remove(path + ".tmp")
-}
-
 func OpenStore(path string) (*Store, error) {
 	if path == "" {
 		path = CachePath()
 	}
-	cleanupStaleTmp(path)
+	atomicfile.CleanupStaleTmp(path)
 	s := &Store{path: path, data: Cache{Accounts: []AccountToken{}}}
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -259,10 +199,9 @@ func OpenStore(path string) (*Store, error) {
 func (s *Store) Path() string { return s.path }
 
 func (s *Store) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		if filepath.Dir(s.path) != "/" && filepath.Dir(s.path) != "." {
-		}
-	}
+	// The directory is created by atomicfile.Write, which — unlike the empty
+	// if-block that used to sit here — actually reports a failure instead of
+	// silently discarding it.
 	encData := Cache{Accounts: make([]AccountToken, len(s.data.Accounts))}
 	for i, a := range s.data.Accounts {
 		encData.Accounts[i] = a
@@ -278,11 +217,7 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.path, b, 0o600)
-}
-
-func atomicWrite(path string, b []byte, perm os.FileMode) error {
-	return writeFileAtomic(path, b, perm)
+	return atomicfile.Write(s.path, b, 0o600)
 }
 
 func (s *Store) List() []AccountToken {

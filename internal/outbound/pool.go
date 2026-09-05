@@ -1,10 +1,12 @@
 package outbound
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -155,35 +157,82 @@ func (p *Pool) HTTPClient() *http.Client {
 func (p *Pool) WebSocketDialer() *websocket.Dialer {
 	base := directClients().WebSocket
 	baseDialer := &net.Dialer{}
-	var mu sync.Mutex
-	var sticky *poolEntry
 	base.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		mu.Lock()
-		e := sticky
-		if e == nil {
-			e = p.pick()
-			sticky = e
-		}
-		mu.Unlock()
+		// One pick per dial: NetDialContext runs once per WebSocket connection,
+		// so a connection still never switches proxies mid-flight, but successive
+		// connections must rotate through the pool and respect cooldowns. The
+		// previous sticky selection pinned every connection to the first healthy
+		// proxy for the whole process lifetime and ignored cooldowns marked by
+		// HTTP traffic on the same entries.
+		e := p.pick()
 		if e == nil {
 			return baseDialer.DialContext(ctx, network, address)
 		}
-		dial := e.clients.WebSocket.NetDialContext
-		if dial == nil {
-			dial = baseDialer.DialContext
-		}
-		conn, err := dial(ctx, network, address)
-		p.mark(e.raw, err)
-		if err != nil {
-			mu.Lock()
-			if sticky == e {
-				sticky = nil
+		var conn net.Conn
+		var err error
+		if proxyFn := e.clients.WebSocket.Proxy; proxyFn != nil {
+			// http:// entries carry their proxy in WebSocket.Proxy while their
+			// NetDialContext stays the direct dialer, so using NetDialContext
+			// would silently bypass the proxy. Tunnel via CONNECT instead.
+			var pu *url.URL
+			pu, err = proxyFn(&http.Request{URL: &url.URL{}})
+			if err == nil && pu != nil {
+				conn, err = httpProxyTunnel(ctx, pu, address)
+			} else if err == nil {
+				conn, err = baseDialer.DialContext(ctx, network, address)
 			}
-			mu.Unlock()
+		} else {
+			dial := e.clients.WebSocket.NetDialContext
+			if dial == nil {
+				dial = baseDialer.DialContext
+			}
+			conn, err = dial(ctx, network, address)
 		}
+		p.mark(e.raw, err)
 		return conn, err
 	}
 	return base
+}
+
+// httpProxyTunnel dials address through an HTTP proxy with CONNECT, so
+// WebSocket traffic over http:// pool entries is actually proxied instead of
+// falling back to a direct connection.
+func httpProxyTunnel(ctx context.Context, proxyURL *url.URL, address string) (net.Conn, error) {
+	host := proxyURL.Host
+	if proxyURL.Port() == "" {
+		host = net.JoinHostPort(proxyURL.Hostname(), "80")
+	}
+	var d net.Dialer
+	raw, err := d.DialContext(ctx, "tcp", host)
+	if err != nil {
+		return nil, err
+	}
+	q := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: address},
+		Host:   address,
+		Header: make(http.Header),
+	}
+	if proxyURL.User != nil {
+		pw, _ := proxyURL.User.Password()
+		q.SetBasicAuth(proxyURL.User.Username(), pw)
+	}
+	if err := q.Write(raw); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	rd := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(rd, q)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		raw.Close()
+		return nil, fmt.Errorf("HTTP proxy CONNECT %s: %s", address, resp.Status)
+	}
+	return &bufferedConn{Conn: raw, reader: rd}, nil
 }
 func (p *Pool) List() []map[string]any {
 	p.mu.Lock()
@@ -194,15 +243,44 @@ func (p *Pool) List() []map[string]any {
 	}
 	return out
 }
-func (p *Pool) Remove(raw string) {
+
+// Add appends a proxy to the pool in place. A full rebuild would forget the
+// cooldowns and failure counts of existing entries, re-enabling a proxy that
+// was cooling down the moment an unrelated one is added.
+func (p *Pool) Add(raw string) error {
+	c, err := New(raw)
+	if err != nil {
+		return fmt.Errorf("proxy %q: %w", raw, err)
+	}
+	normalized := normalizeProxyURL(raw)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.entries {
+		if normalizeProxyURL(e.raw) == normalized {
+			return nil
+		}
+	}
+	p.entries = append(p.entries, &poolEntry{raw: raw, clients: c})
+	return nil
+}
+
+func (p *Pool) Remove(raw string) bool {
+	normalized := normalizeProxyURL(raw)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i, e := range p.entries {
-		if e.raw == raw {
+		if normalizeProxyURL(e.raw) == normalized {
 			p.entries = append(p.entries[:i], p.entries[i+1:]...)
-			return
+			return true
 		}
 	}
+	return false
+}
+
+// normalizeProxyURL is the comparison form used by the admin add/remove paths:
+// trailing slashes are cosmetic and must not defeat an exact-match remove.
+func normalizeProxyURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
 }
 
 type poolRoundTripper struct {

@@ -12,30 +12,77 @@ import (
 
 const defaultAccountConcurrency = 8
 
+// accountConcurrencyEnvVars lists the accepted env vars in precedence order.
+// M365_ACCOUNT_DEFAULT_CONCURRENCY is the documented name;
+// M365_ACCOUNT_CONCURRENCY_LIMIT is a legacy alias kept for compatibility.
+var accountConcurrencyEnvVars = []string{"M365_ACCOUNT_DEFAULT_CONCURRENCY", "M365_ACCOUNT_CONCURRENCY_LIMIT"}
+
 type accountConcurrency struct {
 	mu       sync.Mutex
 	limit    int
 	inflight map[string]int
 	changed  chan struct{}
+
+	// envLocked marks an explicit env override, which always wins over values
+	// persisted from the web console. limitFn is bound once during server
+	// construction, before any request is served.
+	envLocked bool
+	limitFn   func() int
+}
+
+func accountConcurrencyFromEnv() (int, bool) {
+	for _, name := range accountConcurrencyEnvVars {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			continue
+		}
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			return parsed, true
+		}
+	}
+	return defaultAccountConcurrency, false
 }
 
 func newAccountConcurrency() *accountConcurrency {
-	limit := defaultAccountConcurrency
-	if raw := strings.TrimSpace(os.Getenv("M365_ACCOUNT_DEFAULT_CONCURRENCY")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
-			limit = parsed
+	limit, locked := accountConcurrencyFromEnv()
+	return &accountConcurrency{limit: limit, envLocked: locked, inflight: map[string]int{}, changed: make(chan struct{})}
+}
+
+// bindLimitProvider wires runtime settings into the gate so that changing the
+// account concurrency in the web console takes effect without a restart. It must
+// be called during construction, before the server starts serving traffic.
+func (c *accountConcurrency) bindLimitProvider(fn func() int) {
+	if c == nil || c.envLocked {
+		return
+	}
+	c.limitFn = fn
+}
+
+// currentLimit resolves the effective per-account ceiling. It must be called
+// without holding c.mu.
+func (c *accountConcurrency) currentLimit() int {
+	if c == nil {
+		return defaultAccountConcurrency
+	}
+	if c.limitFn != nil {
+		if n := c.limitFn(); n > 0 {
+			return n
 		}
 	}
-	return &accountConcurrency{limit: limit, inflight: map[string]int{}, changed: make(chan struct{})}
+	if c.limit > 0 {
+		return c.limit
+	}
+	return defaultAccountConcurrency
 }
 
 func (c *accountConcurrency) Available(accountID string) bool {
 	if c == nil || accountID == "" {
 		return true
 	}
+	limit := c.currentLimit()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.inflight[accountID] < c.limit
+	return c.inflight[accountID] < limit
 }
 
 func (c *accountConcurrency) Acquire(ctx context.Context, accountID string) (func(), error) {
@@ -43,8 +90,9 @@ func (c *accountConcurrency) Acquire(ctx context.Context, accountID string) (fun
 		return func() {}, nil
 	}
 	for {
+		limit := c.currentLimit()
 		c.mu.Lock()
-		if c.inflight[accountID] < c.limit {
+		if c.inflight[accountID] < limit {
 			c.inflight[accountID]++
 			c.mu.Unlock()
 			var once sync.Once
@@ -76,13 +124,14 @@ func (c *accountConcurrency) Snapshot() map[string]any {
 	if c == nil {
 		return map[string]any{"limit": defaultAccountConcurrency, "inflight": map[string]int{}}
 	}
+	limit := c.currentLimit()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	inflight := make(map[string]int, len(c.inflight))
 	for accountID, count := range c.inflight {
 		inflight[accountID] = count
 	}
-	return map[string]any{"limit": c.limit, "inflight": inflight}
+	return map[string]any{"limit": limit, "inflight": inflight}
 }
 
 func (c *accountConcurrency) Inflight(accountID string) int {

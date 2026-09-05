@@ -10,8 +10,16 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: gofmt -l .
+      - name: gofmt
         shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
       - run: go test ./...
       - run: go vet ./...
       - run: go build ./...

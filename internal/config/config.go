@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"m365-copilot2api/internal/atomicfile"
 )
 
 type Account struct {
@@ -38,51 +40,6 @@ func Load() (Store, error) {
 	return s, e
 }
 
-func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
-func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
-	if path == "" {
-		return nil
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		tmp.Close()
-		os.Remove(tmpName)
-	}()
-	if err := tmp.Chmod(perm); err != nil {
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	_ = fsyncDir(dir)
-	return nil
-}
-
 func Save(s Store) error {
 	p := Path()
 	if e := os.MkdirAll(filepath.Dir(p), 0o700); e != nil {
@@ -92,5 +49,5 @@ func Save(s Store) error {
 	if e != nil {
 		return e
 	}
-	return writeFileAtomic(p, b, 0o600)
+	return atomicfile.Write(p, b, 0o600)
 }

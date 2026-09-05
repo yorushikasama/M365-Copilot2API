@@ -90,6 +90,17 @@ func envInt(name string, fallback int) int {
 	}
 	return fallback
 }
+
+// envIntAny returns the first positive integer found among names, so a canonical
+// env var and its legacy alias can coexist without silently diverging.
+func envIntAny(fallback int, names ...string) int {
+	for _, name := range names {
+		if n, e := strconv.Atoi(strings.TrimSpace(os.Getenv(name))); e == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
 func defaultRuntimeSettings() runtimeSettings {
 	return runtimeSettings{
 		MaxToolCallsPerTurn: envInt("M365_MAX_TOOL_CALLS_PER_TURN", 32), MaxToolRounds: envInt("M365_MAX_TOOL_ROUNDS", 512),
@@ -104,7 +115,7 @@ func defaultRuntimeSettings() runtimeSettings {
 		Scenario:                   firstNonEmptySetting(os.Getenv("M365_SCENARIO"), "OfficeWebIncludedCopilot"),
 		MaxConversationMessages:    envInt("M365_MAX_CONVERSATION_MESSAGES", 600),
 		LicenseType:                firstNonEmptySetting(os.Getenv("M365_LICENSE_TYPE"), "Starter"),
-		AccountConcurrencyLimit:    envInt("M365_ACCOUNT_CONCURRENCY_LIMIT", 8),
+		AccountConcurrencyLimit:    envIntAny(defaultAccountConcurrency, accountConcurrencyEnvVars...),
 		EnableMemoryV2:             os.Getenv("M365_ENABLE_MEMORY_V2") == "true",
 		EnableDeepWork:             os.Getenv("M365_ENABLE_DEEP_WORK") == "true",
 		EnableComputerUse:          os.Getenv("M365_ENABLE_COMPUTER_USE") == "true",
@@ -129,10 +140,16 @@ func settingsPath() string {
 var openSettingsStore = sync.OnceValue(func() *settingsStore {
 	s := &settingsStore{path: settingsPath(), v: defaultRuntimeSettings()}
 	if b, e := os.ReadFile(s.path); e == nil {
-		_ = json.Unmarshal(b, &s.v)
-	}
-	if e := validateSettings(s.v); e != nil {
-		log.Printf("[settings] invalid persisted settings: %v", e)
+		if err := json.Unmarshal(b, &s.v); err != nil {
+			log.Printf("[settings] unreadable persisted settings (%v), using defaults", err)
+		} else if e := validateSettings(s.v); e != nil {
+			// A malformed or hand-edited settings file must not push a zero timeout
+			// (or any other invalid value) into live requests: context.WithTimeout
+			// with 0 yields an already-cancelled context, failing every request.
+			// Fall back to defaults instead of running on the broken values.
+			log.Printf("[settings] invalid persisted settings (%v), using defaults", e)
+			s.v = defaultRuntimeSettings()
+		}
 	}
 	return s
 })

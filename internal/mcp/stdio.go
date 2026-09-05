@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"sync"
 )
@@ -12,12 +13,16 @@ import (
 // StdioClient 通过子进程 stdin/stdout 交换 JSON-RPC 消息，用于测试与轻量桥接。
 type StdioClient struct {
 	cmd     *exec.Cmd
-	stdin   interface{ Write([]byte) (int, error) }
+	stdin   io.WriteCloser
 	stdout  *bufio.Scanner
 	mu      sync.Mutex
 	pending map[int64]chan json.RawMessage
 	nextID  int64
 	done    chan struct{}
+	// closeOnce guards the kill/reap sequence: cmd.Wait must run exactly once,
+	// and a caller's Close racing the context watchdog must not double-kill.
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // StartStdio 启动一个子进程作为 MCP JSON-RPC 服务器并返回客户端。
@@ -35,14 +40,27 @@ func StartStdio(ctx context.Context, command string, args []string, opts any) (*
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), sseMaxLineBytes)
 	c := &StdioClient{
 		cmd:     cmd,
 		stdin:   stdin,
-		stdout:  bufio.NewScanner(stdout),
+		stdout:  scanner,
 		pending: map[int64]chan json.RawMessage{},
 		done:    make(chan struct{}),
 	}
 	go c.readLoop()
+	// Reap watchdog: exec.CommandContext kills on ctx cancel but does not Wait,
+	// and a child that exits on its own also needs a Wait. Either event must
+	// release the process entry, even if the caller never calls Close. Close is
+	// idempotent, so an explicit caller Close simply joins this path.
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-c.done:
+		}
+		_ = c.Close()
+	}()
 	return c, nil
 }
 
@@ -61,13 +79,13 @@ func (c *StdioClient) readLoop() {
 		}
 		c.mu.Lock()
 		ch := c.pending[*meta.ID]
-		c.mu.Unlock()
 		if ch != nil {
 			select {
 			case ch <- append(json.RawMessage(nil), line...):
 			default:
 			}
 		}
+		c.mu.Unlock()
 	}
 }
 
@@ -93,10 +111,25 @@ func (c *StdioClient) call(ctx context.Context, method string, id int64, params 
 		c.mu.Unlock()
 	}()
 	select {
-	case raw := <-ch:
+	case raw, ok := <-ch:
+		if !ok {
+			return nil, fmt.Errorf("stdio client closed while waiting for %s response", method)
+		}
 		return raw, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-c.done:
+		// The child exiting and the final response landing are simultaneous for
+		// one-shot servers; drain a buffered response before declaring failure.
+		select {
+		case raw, ok := <-ch:
+			if !ok {
+				return nil, fmt.Errorf("stdio client closed while waiting for %s response", method)
+			}
+			return raw, nil
+		default:
+		}
+		return nil, fmt.Errorf("stdio process exited while waiting for %s response", method)
 	}
 }
 
@@ -159,10 +192,20 @@ func (c *StdioClient) CallTool(ctx context.Context, name string, arguments map[s
 	return result, nil
 }
 
-// Close 终止子进程。
+// Close terminates the child process and reaps it. Safe to call more than once
+// and safe to race the context watchdog installed by StartStdio.
 func (c *StdioClient) Close() error {
-	if c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-	}
-	return c.cmd.Wait()
+	c.closeOnce.Do(func() {
+		// Close stdin first so a well-behaved child sees EOF and exits by
+		// itself; kill is the backstop for the rest.
+		_ = c.stdin.Close()
+		if c.cmd.Process != nil {
+			_ = c.cmd.Process.Kill()
+		}
+		// Wait for the read loop to finish before Wait: reading from the pipe
+		// after Wait has closed it loses data, and the loop is the only reader.
+		<-c.done
+		c.closeErr = c.cmd.Wait()
+	})
+	return c.closeErr
 }

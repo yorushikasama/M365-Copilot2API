@@ -227,7 +227,7 @@ func New() (*Server, error) {
 			sessionTTL = d
 		}
 	}
-	return &Server{
+	srv := &Server{
 		tokens:             store,
 		accountPool:        newAccountHealth(),
 		accountConcurrency: newAccountConcurrency(),
@@ -254,7 +254,11 @@ func New() (*Server, error) {
 		ipManager:            openIPManager(),
 		generatedImages:      map[string]generatedImage{},
 		convCache:            newConversationCache(),
-	}, nil
+	}
+	// Let the persisted/console-editable account concurrency drive the gate;
+	// an explicit env override still wins (see bindLimitProvider).
+	srv.accountConcurrency.bindLimitProvider(func() int { return srv.settings.get().AccountConcurrencyLimit })
+	return srv, nil
 }
 
 func (s *Server) StartConvCacheGC() {
@@ -1086,7 +1090,7 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		// No preferred account or it's unavailable; fall back to round-robin
 		acc, ok := s.tokens.Next()
 		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+			return auth.AccountToken{}, fmt.Errorf("%w: none is signed in", errNoAccounts)
 		}
 		accountID = acc.ID
 		for i := 0; !s.accountAvailable(accountID) && i < maxAccountProbe; i++ {
@@ -1097,7 +1101,7 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			accountID = acc.ID
 		}
 		if !s.tokens.ScheduleEnabled(accountID) {
-			return auth.AccountToken{}, fmt.Errorf("no accounts enabled for scheduling")
+			return auth.AccountToken{}, fmt.Errorf("%w: none is enabled for scheduling", errNoAccounts)
 		}
 		if !s.accountPool.Available(accountID) {
 			until := s.accountPool.EarliestRecovery()
@@ -1174,7 +1178,7 @@ func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
 	for i := 0; i < maxAccountProbe; i++ {
 		acc, ok := s.tokens.Next()
 		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+			return auth.AccountToken{}, fmt.Errorf("%w: none is signed in", errNoAccounts)
 		}
 		if avoidID != "" && acc.ID == avoidID {
 			continue
@@ -1184,7 +1188,7 @@ func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
 		}
 		return s.tokens.EnsureValid(acc.ID)
 	}
-	return auth.AccountToken{}, fmt.Errorf("no healthy account available for failover")
+	return auth.AccountToken{}, fmt.Errorf("%w: none is healthy for failover", errNoAccounts)
 }
 
 // nextImageAccount returns the next round-robin account that is healthy and not
@@ -1194,7 +1198,7 @@ func (s *Server) nextImageAccount(tried map[string]bool) (auth.AccountToken, err
 	for i := 0; i < maxAccountProbe; i++ {
 		acc, ok := s.tokens.Next()
 		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+			return auth.AccountToken{}, fmt.Errorf("%w: none is signed in", errNoAccounts)
 		}
 		if tried[acc.ID] {
 			continue
@@ -1207,7 +1211,7 @@ func (s *Server) nextImageAccount(tried map[string]bool) (auth.AccountToken, err
 		}
 		return s.tokens.EnsureValid(acc.ID)
 	}
-	return auth.AccountToken{}, fmt.Errorf("no healthy account available for image failover")
+	return auth.AccountToken{}, fmt.Errorf("%w: none is healthy for image failover", errNoAccounts)
 }
 
 type chatBody struct {
@@ -1874,7 +1878,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.ConversationID == "" && len(body.Messages) > 1 &&
 		(body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		sysHash := systemPromptHash(body.Messages)
-		if cached := s.convCache.Lookup(acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
+		if cached := s.convCache.Lookup(acc.ID, convCacheModel, body.Messages); cached != nil && cached.SystemPrompt == sysHash {
 			if len(body.Messages) > cached.MessageCount {
 				incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
 				incPrompt = strings.TrimSpace(incPrompt)
@@ -2017,24 +2021,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sw := newSSEWriter(w, flusher)
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		keepaliveDone := make(chan struct{})
-		defer close(keepaliveDone)
-		go func() {
-			for {
-				select {
-				case <-keepaliveDone:
-					return
-				case <-r.Context().Done():
-					return
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					_ = sw.raw(": keepalive\n\n")
-				}
-			}
-		}()
+		ka := startSSEKeepalive(sw, ctx)
+		defer ka.stop()
 		var text strings.Builder
 		var streamedTools []detectedToolCall
 		first := true
@@ -2141,6 +2129,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		// The upstream turn (and any failover retry) is done, so no more deltas
+		// will flow. The tail below writes through sseRaw and writeToolResponse,
+		// which bypass the sseWriter mutex — stop the keepalive goroutine and wait
+		// for it, or its next 15s tick could interleave a comment mid-frame.
+		ka.stop()
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
@@ -2160,7 +2153,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if isContentPolicyBlock(res.Text) {
 			log.Printf("[content-policy] M365 blocked the request (streaming), sending error")
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "M365 content policy blocked this request; try again or switch account", "code": "upstream_content_blocked"}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": contentPolicyMessage(res.Text), "code": contentPolicyErrorCode}})+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
 		}
@@ -2252,18 +2245,18 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 					defer cancel2()
 					if res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}); err2 == nil {
-							routeRes, routeErr = res2, nil
-							acc = next
-							account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-						}
+						routeRes, routeErr = res2, nil
+						acc = next
+						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
 					}
 				}
-				if routeErr != nil {
-					log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
-					writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
-					return
-				}
 			}
+			if routeErr != nil {
+				log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
+				writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
+				return
+			}
+		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
@@ -2346,6 +2339,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		model := firstNonEmpty(body.Model, "m365-copilot")
 		firstDelta := true
 		sw2 := newSSEWriter(w, flusher)
+		ka2 := startSSEKeepalive(sw2, ctx)
+		defer ka2.stop()
 		writeChunk := func(delta map[string]any) error {
 			if err := r.Context().Err(); err != nil {
 				return err
@@ -2380,24 +2375,6 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
 			return
 		}
-		ticker2 := time.NewTicker(15 * time.Second)
-		defer ticker2.Stop()
-		keepaliveDone2 := make(chan struct{})
-		defer close(keepaliveDone2)
-		go func() {
-			for {
-				select {
-				case <-keepaliveDone2:
-					return
-				case <-r.Context().Done():
-					return
-				case <-ctx.Done():
-					return
-				case <-ticker2.C:
-					_ = sw2.raw(": keepalive\n\n")
-				}
-			}
-		}()
 		streamedReasoningLen := 0
 		onDeltaWrapped := func(content string) error {
 			if content != "" {
@@ -2441,6 +2418,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 			}
 		}
+		// The upstream turn (and any failover retry) is done; the tail below writes
+		// through sseRaw and writeToolResponse, which bypass the sseWriter mutex.
+		// Stop the keepalive goroutine and wait, or its next tick could interleave
+		// a comment mid-frame.
+		ka2.stop()
 		if err == nil {
 			if content := contentFilter.Flush(); content != "" {
 				if writeErr := writeChunk(map[string]any{"content": content}); writeErr != nil {
@@ -2460,7 +2442,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			if isContentPolicyBlock(res.Text) {
 				log.Printf("[content-policy] M365 blocked the request (reasoning stream), sending error")
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "M365 content policy blocked this request; try again or switch account", "code": "upstream_content_blocked"}})+"\n\n")
+				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": contentPolicyMessage(res.Text), "code": contentPolicyErrorCode}})+"\n\n")
 				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 				return
 			}
@@ -2469,16 +2451,16 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
 			}
-			} else {
-				log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
-					s.accountPool.MarkImageLimited(acc.ID)
-				}
-				if convReused {
-					s.invalidateConvCache(acc.ID, convCacheModel)
-				}
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(streamErrorEvent(requestID, err))+"\n\n")
+		} else {
+			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
+			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+				s.accountPool.MarkImageLimited(acc.ID)
 			}
+			if convReused {
+				s.invalidateConvCache(acc.ID, convCacheModel)
+			}
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(streamErrorEvent(requestID, err))+"\n\n")
+		}
 		pt := EstimateTokens(prompt)
 		ct := EstimateTokens(res.Text)
 		log.Printf("[usage] stream id=%s pt=%d ct=%d res.Text=%d", id, pt, ct, len(res.Text))
@@ -2512,7 +2494,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				err = nil
 			}
 		}
-		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		// A slow or half-open upstream is retryable but used to reach no failover
+		// at all, so the very first WS_READ_TIMEOUT surfaced as a hard 502.
+		retryBudget, transportRetry := shouldFailoverTransport(ctx, err)
+		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err) || transportRetry) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			originalErr := err
 			// Failover only when nothing pins the request to a conversation or
 			// account; a fresh chat can safely retry on the next healthy account.
@@ -2523,7 +2508,19 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					failoverReq.ConversationID = ""
 					failoverReq.SessionID = ""
 				}
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				failoverTimeout := time.Duration(s.settings.get().ChatTimeoutSeconds) * time.Second
+				// A transport failover is a second run at the same request, so it
+				// inherits what is left of the original budget rather than silently
+				// granting the caller a second full timeout. Quota and auth
+				// failovers keep their existing full-budget behaviour: those fail
+				// during the handshake, so nothing has been spent yet.
+				if transportRetry && !IsRateLimited(err) && !IsAuthFailure(err) {
+					if retryBudget > 0 && retryBudget < failoverTimeout {
+						failoverTimeout = retryBudget
+					}
+					log.Printf("[transport-failover] account=%s next=%s budget=%s err=%v", acc.ID, next.ID, failoverTimeout.Round(time.Second), originalErr)
+				}
+				ctx2, cancel2 := context.WithTimeout(r.Context(), failoverTimeout)
 				defer cancel2()
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
 				if err2 == nil {
@@ -2658,8 +2655,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	if isContentPolicyBlock(res.Text) {
-		log.Printf("[content-policy] M365 blocked the request, returning 503")
-		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
+		log.Printf("[content-policy] M365 blocked the request, returning %d", contentPolicyStatus)
+		writeContentPolicyBlocked(w, res.Text)
 		return
 	}
 	if isImageLimitNotice(res.Text) {

@@ -110,22 +110,18 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sw := newSSEWriter(w, flusher)
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	keepaliveDone := make(chan struct{})
-	defer close(keepaliveDone)
-	go func() {
-		for {
-			select {
-			case <-keepaliveDone:
-				return
-			case <-r.Context().Done():
-				return
-			case <-ticker.C:
-				_ = sw.raw(": keepalive\n\n")
-			}
+	ka := startSSEKeepalive(sw, ctx)
+	defer ka.stop()
+	// writeSSE writes to w directly and would bypass the sseWriter mutex, racing
+	// the keepalive goroutine (net/http writers are not goroutine-safe). Route
+	// every frame through sw instead so all writers serialize on one lock.
+	writeEvent := func(name string, value any) error {
+		if err := r.Context().Err(); err != nil {
+			return err
 		}
-	}()
+		b, _ := json.Marshal(value)
+		return sw.raw(fmt.Sprintf("event: %s\ndata: %s\n\n", name, b))
+	}
 	for i, event := range res.Normalized {
 		payload := map[string]any{
 			"index":          i,
@@ -135,16 +131,16 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 			"sessionId":      res.SessionID,
 			"requestId":      res.RequestID,
 		}
-		if err := writeSSE(r, w, flusher, "event", payload); err != nil {
+		if err := writeEvent("event", payload); err != nil {
 			return
 		}
 	}
 	for i, event := range chathub.SemanticEvents(res.Events) {
-		if err := writeSSE(r, w, flusher, "semantic", map[string]any{"index": i, "type": "m365.semantic", "event": event}); err != nil {
+		if err := writeEvent("semantic", map[string]any{"index": i, "type": "m365.semantic", "event": event}); err != nil {
 			return
 		}
 	}
-	if err := writeSSE(r, w, flusher, "done", map[string]any{
+	if err := writeEvent("done", map[string]any{
 		"type": "done", "text": res.Text,
 		"conversationId": res.ConversationID, "sessionId": res.SessionID, "requestId": res.RequestID,
 		"throttling": res.Throttling, "suggestedResponses": res.SuggestedResponses,

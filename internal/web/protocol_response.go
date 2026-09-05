@@ -1,15 +1,124 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// defaultSSEKeepaliveInterval matches the cadence already used by the OpenAI
+// streaming path in server.go.
+const defaultSSEKeepaliveInterval = 15 * time.Second
+
+// sseKeepaliveInterval allows tightening the cadence for clients whose idle
+// tolerance is shorter than Claude CLI's ~125s.
+func sseKeepaliveInterval() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("M365_SSE_KEEPALIVE_SECONDS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return defaultSSEKeepaliveInterval
+}
+
+// anthropicStreamKeepalive commits an SSE response before the upstream turn is
+// known, then keeps it visibly alive until the real frames are ready.
+//
+// /v1/messages assembles the entire turn through runOpenAIAdapter, which forces
+// Stream=false into an in-memory recorder and only replays it as SSE afterwards.
+// A streaming caller therefore received zero bytes for the whole upstream
+// latency, and Claude CLI reads that silence as a dead connection: it hangs up at
+// roughly 125s even though M365_CHAT_TIMEOUT_SECONDS allows 300. Flushing the
+// headers immediately and dripping bytes while we wait stops the client's idle
+// timer from firing.
+//
+// The filler is an SSE comment rather than an Anthropic `ping` event on purpose:
+// the protocol documents that a stream *begins* with message_start, and comments
+// are discarded by every spec-compliant parser, so they cannot disturb a client
+// state machine that has not seen message_start yet.
+type anthropicStreamKeepalive struct {
+	done    chan struct{}
+	stopped chan struct{}
+}
+
+func startAnthropicStreamKeepalive(w http.ResponseWriter, r *http.Request) *anthropicStreamKeepalive {
+	f, ok := w.(http.Flusher)
+	if !ok {
+		// Without a flusher nothing reaches the wire early anyway, so committing
+		// the headers would only cost us the ability to report a real status.
+		return nil
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ka := &anthropicStreamKeepalive{done: make(chan struct{}), stopped: make(chan struct{})}
+	if err := sseRaw(r.Context(), w, f, ": connected\n\n"); err != nil {
+		// The response may already be partially committed, so report it as
+		// started: an in-band error beats a superfluous WriteHeader.
+		close(ka.done)
+		close(ka.stopped)
+		return ka
+	}
+	go func() {
+		defer close(ka.stopped)
+		t := time.NewTicker(sseKeepaliveInterval())
+		defer t.Stop()
+		for {
+			select {
+			case <-ka.done:
+				return
+			case <-r.Context().Done():
+				return
+			case <-t.C:
+				if err := sseRaw(r.Context(), w, f, ": keepalive\n\n"); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	return ka
+}
+
+// stop halts the keepalive and waits for its goroutine to exit, handing the
+// caller exclusive ownership of the ResponseWriter back before any real frame is
+// written. net/http writers are not goroutine-safe, so overlapping the keepalive
+// with message_start would risk interleaved half-frames.
+func (k *anthropicStreamKeepalive) stop() {
+	if k == nil {
+		return
+	}
+	select {
+	case <-k.done:
+	default:
+		close(k.done)
+	}
+	<-k.stopped
+}
+
+// writeAnthropicFailure reports an error for /v1/messages. Once the stream has
+// been committed the status line is already on the wire as 200, so the failure
+// has to travel in-band as an SSE error event instead.
+func writeAnthropicFailure(w http.ResponseWriter, committed bool, status int, typ, msg string) {
+	if !committed {
+		writeAnthropicError(w, status, typ, msg)
+		return
+	}
+	f, _ := w.(http.Flusher)
+	_ = sseWriteFrame(w, f, "error", map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": typ, "message": msg},
+	})
+}
 
 func openAIChoice(v map[string]any) (map[string]any, string) {
 	choices, _ := v["choices"].([]any)
@@ -217,4 +326,52 @@ func (s *sseWriter) raw(payload string) error {
 
 func (s *sseWriter) data(data string) error {
 	return s.raw("data: " + data + "\n\n")
+}
+
+// sseKeepalive is the OpenAI-path twin of anthropicStreamKeepalive: it drips SSE
+// comments while the upstream turn is in flight. stop() halts the goroutine and
+// waits for it to exit, handing exclusive ownership of the ResponseWriter back
+// before any direct (unlocked) tail write — sseRaw, writeSSE and
+// writeToolResponse all bypass sseWriter's mutex, so they may only run once the
+// keepalive goroutine is provably gone.
+type sseKeepalive struct {
+	done    chan struct{}
+	stopped chan struct{}
+}
+
+// startSSEKeepalive begins the comment ticker for a stream whose writer is sw.
+// The goroutine ends on stop(), when ctx is done, or when the ticker fires into
+// a dead writer.
+func startSSEKeepalive(sw *sseWriter, ctx context.Context) *sseKeepalive {
+	ka := &sseKeepalive{done: make(chan struct{}), stopped: make(chan struct{})}
+	go func() {
+		defer close(ka.stopped)
+		t := time.NewTicker(sseKeepaliveInterval())
+		defer t.Stop()
+		for {
+			select {
+			case <-ka.done:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				_ = sw.raw(": keepalive\n\n")
+			}
+		}
+	}()
+	return ka
+}
+
+// stop is idempotent and safe to defer: the first call closes done and waits for
+// the goroutine to finish any in-flight write.
+func (k *sseKeepalive) stop() {
+	if k == nil {
+		return
+	}
+	select {
+	case <-k.done:
+	default:
+		close(k.done)
+	}
+	<-k.stopped
 }

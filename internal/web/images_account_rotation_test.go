@@ -89,6 +89,51 @@ func TestMarkSuccessPreservesImageGenCooldown(t *testing.T) {
 	}
 }
 
+// markImageRefusalCooldown is the single place an upstream 200-with-refusal
+// turns into an image cooldown. The upstream call itself was a success, so
+// chatWithAccount records one either before or after this mark; the invariant
+// that makes both orders safe is that MarkSuccess preserves an unexpired image
+// cooldown. Pin it through the real entry point, for both refusal kinds.
+func TestImageRefusalCooldownSurvivesSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		refusal  imageRefusalKind
+		sentinel error
+	}{
+		{"quota", imageRefusalQuota, errImageQuotaRefused},
+		{"capacity", imageRefusalCapacity, errImageServiceUnavailable},
+	} {
+		t.Run(tc.name+"/mark-then-success", func(t *testing.T) {
+			s := &Server{accountPool: newAccountHealth()}
+			const id = "u-1"
+			if err := s.markImageRefusalCooldown(id, tc.refusal); !errors.Is(err, tc.sentinel) {
+				t.Fatalf("markImageRefusalCooldown error = %v, want %v", err, tc.sentinel)
+			}
+			s.accountPool.MarkSuccess(id)
+			if s.accountPool.ImageGenAvailable(id) {
+				t.Fatal("image cooldown must survive a MarkSuccess recorded after the mark")
+			}
+			if !s.accountPool.Available(id) {
+				t.Fatal("account must remain in chat rotation")
+			}
+		})
+		t.Run(tc.name+"/success-then-mark", func(t *testing.T) {
+			s := &Server{accountPool: newAccountHealth()}
+			const id = "u-1"
+			s.accountPool.MarkSuccess(id)
+			if err := s.markImageRefusalCooldown(id, tc.refusal); !errors.Is(err, tc.sentinel) {
+				t.Fatalf("markImageRefusalCooldown error = %v, want %v", err, tc.sentinel)
+			}
+			if s.accountPool.ImageGenAvailable(id) {
+				t.Fatal("image cooldown must survive a MarkSuccess recorded before the mark")
+			}
+			if !s.accountPool.Available(id) {
+				t.Fatal("account must remain in chat rotation")
+			}
+		})
+	}
+}
+
 // resolveImageAccount must rotate past image-throttled accounts while
 // resolveAccount still hands them out for chat.
 func TestResolveImageAccountSkipsImageThrottled(t *testing.T) {

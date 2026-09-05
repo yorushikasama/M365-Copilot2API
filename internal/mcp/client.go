@@ -17,6 +17,11 @@ import (
 // It implements the MCP client protocol: discover tools, invoke tools.
 var nextRequestID int64
 
+// sseMaxLineBytes caps one line of JSON-RPC transport (SSE data line or stdio
+// newline-delimited message). Tool catalogs and large call results arrive as
+// single lines; bufio.Scanner's 64KB default silently kills the scan.
+const sseMaxLineBytes = 8 << 20
+
 type Client struct {
 	serverURL  string
 	httpClient *http.Client
@@ -27,6 +32,10 @@ type Client struct {
 	done       chan struct{}
 	sseCancel  context.CancelFunc
 	sseBody    io.Closer
+	// connectMu serializes Connect: the connected flag alone cannot guard the
+	// dial-and-handshake sequence, and two racing Connect calls would leak an
+	// SSE body and overwrite each other's cancel func.
+	connectMu sync.Mutex
 }
 
 // NewClient creates a new MCP client that connects to the given server URL.
@@ -53,6 +62,8 @@ func (c *Client) setConnected(v bool) {
 
 // Connect establishes the SSE connection to the MCP server and initializes the session.
 func (c *Client) Connect(ctx context.Context) error {
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
 	c.mu.Lock()
 	if c.connected {
 		c.mu.Unlock()
@@ -80,6 +91,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	// Tool catalogs arrive as single SSE data lines; the 64KB default would
+	// silently truncate them and stall discovery.
+	scanner.Buffer(make([]byte, 0, 64*1024), sseMaxLineBytes)
 	var sessionID string
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -104,7 +118,9 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("no session ID received from MCP server")
 	}
 
-	sseCtx, cancel := context.WithCancel(ctx)
+	// The SSE stream must outlive the request that established it; deriving
+	// from the caller's ctx would tear it down the moment that request ends.
+	sseCtx, cancel := context.WithCancel(context.Background())
 
 	c.mu.Lock()
 	c.sessionID = sessionID
@@ -125,7 +141,14 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("initialize: %w", err)
 	}
 	select {
-	case <-initCh:
+	case _, ok := <-initCh:
+		if !ok {
+			c.Close()
+			return fmt.Errorf("connection closed while waiting for initialize response")
+		}
+	case <-ctx.Done():
+		c.Close()
+		return ctx.Err()
 	case <-time.After(10 * time.Second):
 		c.Close()
 		return fmt.Errorf("timeout waiting for initialize response")
@@ -141,6 +164,7 @@ func (c *Client) readSSE(body io.ReadCloser) {
 	defer c.setConnected(false)
 
 	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), sseMaxLineBytes)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data: ") {
@@ -149,15 +173,20 @@ func (c *Client) readSSE(body io.ReadCloser) {
 				ID *int64 `json:"id"`
 			}
 			if json.Unmarshal([]byte(data), &meta) == nil && meta.ID != nil {
+				// Send while holding the lock: Close closes pending channels
+				// under the same lock, so a channel fetched here can never be
+				// closed behind our back (send on closed channel panics). The
+				// send is non-blocking and each ID has one response, so this
+				// cannot hold the lock for long.
 				c.mu.Lock()
 				ch := c.pending[*meta.ID]
-				c.mu.Unlock()
 				if ch != nil {
 					select {
 					case ch <- json.RawMessage(data):
 					default:
 					}
 				}
+				c.mu.Unlock()
 			}
 		}
 	}
@@ -178,7 +207,10 @@ func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 		c.mu.Unlock()
 	}()
 	select {
-	case msg := <-ch:
+	case msg, ok := <-ch:
+		if !ok {
+			return nil, fmt.Errorf("mcp connection closed while waiting for tools/list response")
+		}
 		var resp struct {
 			Result json.RawMessage `json:"result"`
 		}
@@ -212,7 +244,10 @@ func (c *Client) CallTool(ctx context.Context, name string, arguments map[string
 		c.mu.Unlock()
 	}()
 	select {
-	case msg := <-ch:
+	case msg, ok := <-ch:
+		if !ok {
+			return result, fmt.Errorf("mcp connection closed while waiting for tools/call response")
+		}
 		var resp struct {
 			Result json.RawMessage `json:"result"`
 		}
@@ -244,10 +279,11 @@ func (c *Client) sendRequest(ctx context.Context, method string, params any) (in
 
 	ch := make(chan json.RawMessage, 1)
 	c.mu.Lock()
+	sessionID := c.sessionID
 	c.pending[id] = ch
 	c.mu.Unlock()
 
-	messageURL := fmt.Sprintf("%s/message?sessionId=%s", strings.TrimRight(strings.Split(c.serverURL, "/sse")[0], "/"), c.sessionID)
+	messageURL := fmt.Sprintf("%s/message?sessionId=%s", strings.TrimRight(strings.Split(c.serverURL, "/sse")[0], "/"), sessionID)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, messageURL, strings.NewReader(string(body)))
 	if err != nil {
@@ -285,7 +321,10 @@ func (c *Client) sendNotification(method string, params any) error {
 	}
 	body, _ := json.Marshal(req)
 
-	messageURL := fmt.Sprintf("%s/message?sessionId=%s", strings.TrimRight(strings.Split(c.serverURL, "/sse")[0], "/"), c.sessionID)
+	c.mu.Lock()
+	sessionID := c.sessionID
+	c.mu.Unlock()
+	messageURL := fmt.Sprintf("%s/message?sessionId=%s", strings.TrimRight(strings.Split(c.serverURL, "/sse")[0], "/"), sessionID)
 
 	httpReq, err := http.NewRequest(http.MethodPost, messageURL, strings.NewReader(string(body)))
 	if err != nil {

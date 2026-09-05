@@ -34,8 +34,16 @@ const (
 	CategoryClientCanceled     ErrorCategory = "CLIENT_CANCELED"
 	CategoryAttachmentRejected ErrorCategory = "ATTACHMENT_REJECTED"
 	CategoryGlobalUnavailable  ErrorCategory = "GLOBAL_UNAVAILABLE"
+	CategoryNoAccount          ErrorCategory = "NO_ACCOUNT"
 	CategoryUnknown            ErrorCategory = "UNKNOWN"
 )
+
+// errNoAccounts marks a request that could not even be attempted because the
+// gateway has no account it is allowed to use. That is a local configuration
+// state, not an upstream verdict: reporting it as 502 blamed Microsoft for an
+// empty accounts.json and told the client to retry something only an operator
+// can fix.
+var errNoAccounts = errors.New("no usable M365 account")
 
 type UpstreamHTTPError struct {
 	Status     int
@@ -54,6 +62,12 @@ func ClassifyError(err error) ErrorCategory {
 	}
 	if errors.Is(err, context.Canceled) {
 		return CategoryClientCanceled
+	}
+	// Checked before the global-circuit probe below: having no account is a
+	// distinct condition from the upstream being shunned, and it stays true
+	// whether or not the circuit happens to be open.
+	if errors.Is(err, errNoAccounts) {
+		return CategoryNoAccount
 	}
 	if errors.Is(err, chathub.ErrAttachmentRejected) {
 		return CategoryAttachmentRejected

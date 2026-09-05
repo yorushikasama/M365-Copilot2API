@@ -59,7 +59,9 @@ func TestMarkImageThrottleSeparatesDailyQuotaFromCapacity(t *testing.T) {
 func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
 	// ErrEmptyCompletion belongs here: the upstream produced nothing at all and a
 	// retry on a fresh conversation clears it (live-checked 2026-09-02).
-	for _, err := range []error{chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice, errImageQuotaRefused, errImageServiceUnavailable, chathub.ErrEmptyCompletion} {
+	// errImageNoResource is the same miss wearing prose instead of silence, so it
+	// must not be the one case that fails on the first attempt.
+	for _, err := range []error{chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice, errImageQuotaRefused, errImageServiceUnavailable, chathub.ErrEmptyCompletion, errImageNoResource} {
 		if !imageFailoverWorthwhile(err) {
 			t.Fatalf("expected failover for %v", err)
 		}
@@ -82,7 +84,7 @@ func TestClassifyImageRefusalSeparatesQuotaCapacityAndPolicy(t *testing.T) {
 		"Sorry, I can’t generate images featuring that copyrighted character.":              imageRefusalPolicy,
 		"Sorry, I can't generate that image as requested. Try a fully original alternative": imageRefusalPolicy,
 		"Sorry, I wasn't able to respond to that. Is there something else I can help with?": imageRefusalUnknown,
-		"":                                                                                 imageRefusalUnknown,
+		"": imageRefusalUnknown,
 	}
 	for text, want := range cases {
 		if got := classifyImageRefusal(text); got != want {

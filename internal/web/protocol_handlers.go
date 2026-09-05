@@ -531,27 +531,41 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
+	model := firstNonEmpty(body.Model, "m365-copilot")
+
+	// runOpenAIAdapter buffers the whole turn, so a streaming caller would hear
+	// nothing until the upstream finishes. Open the stream now and keep it alive
+	// while we wait, otherwise Claude CLI abandons the request at ~125s.
+	var keepalive *anthropicStreamKeepalive
+	if body.Stream {
+		keepalive = startAnthropicStreamKeepalive(w, r)
+	}
+	committed := keepalive != nil
+
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
+	// Must complete before any real frame is written: it returns the
+	// ResponseWriter to this goroutine's exclusive use.
+	keepalive.stop()
 	if status >= 400 {
-		writeAnthropicError(w, status, "api_error", errorMessage(raw, "upstream protocol error"))
+		writeAnthropicFailure(w, committed, status, "api_error", errorMessage(raw, "upstream protocol error"))
 		return
 	}
 	if err != nil {
 		log.Printf("[messages] adapter failed: %v", err)
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream protocol error: "+err.Error())
+		writeAnthropicFailure(w, committed, http.StatusBadGateway, "api_error", "upstream protocol error: "+err.Error())
 		return
 	}
-	estimate := estimateResponsesUsage(firstNonEmpty(body.Model, "m365-copilot"), o.Messages, o.Tools, o.ToolChoice, "")
+	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, "")
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: extractAPIKey(r),
 		ClientIP:     clientIP(r),
-		Model:        firstNonEmpty(body.Model, "m365-copilot"),
+		Model:        model,
 		Endpoint:     "/v1/messages",
 		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
 		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
 		DurationMs:   time.Since(startedAt).Milliseconds(),
 		Status:       200,
 	})
-	writeAnthropicResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
+	writeAnthropicResult(w, model, body.Stream, out)
 }

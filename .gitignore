@@ -56,3 +56,6 @@ _wip_backup_*
 *.dll
 tmp_lab/
 tmp_dump/
+
+# Local agent scratch space (stale binaries, script snapshots)
+.zcode/

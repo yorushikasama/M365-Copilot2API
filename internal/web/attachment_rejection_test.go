@@ -60,13 +60,18 @@ func TestAttachmentRejectionDoesNotSidelineTheAccount(t *testing.T) {
 }
 
 // TestAttachmentUploadOutageStaysRetryable keeps a transient upload failure on
-// the retryable path so it is not misreported as a bad request.
+// the retryable path so it is not misreported as a bad request, and pins the
+// status at 503: it used to fall through to a blanket 502, which told the client
+// the gateway was broken rather than that the upload should simply be retried.
 func TestAttachmentUploadOutageStaysRetryable(t *testing.T) {
 	err := fmt.Errorf("upload attachment: %w: upstream http 500", chathub.ErrAttachmentUploadFailed)
 	if errors.Is(err, chathub.ErrAttachmentRejected) {
 		t.Fatal("a transient upload failure must not read as a refusal")
 	}
-	if got := upstreamStatus(err); got != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d", got, http.StatusBadGateway)
+	if got := upstreamStatus(err); got != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if !imageFailoverWorthwhile(err) {
+		t.Fatal("a transient upload failure must rotate onto another account")
 	}
 }

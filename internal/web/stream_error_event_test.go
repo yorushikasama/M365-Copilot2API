@@ -54,8 +54,11 @@ func TestStreamErrorEventRateLimitStaysRateLimit(t *testing.T) {
 func TestStreamErrorEventOffensiveContentStaysContentBlock(t *testing.T) {
 	ev := streamErrorEvent("req-cp", chathub.ErrOffensiveContent)
 	em := errMap(t, ev)
-	if em["code"] != "upstream_error" {
-		t.Fatalf("code = %v, want upstream_error", em["code"])
+	if em["code"] != contentPolicyErrorCode {
+		t.Fatalf("code = %v, want %v", em["code"], contentPolicyErrorCode)
+	}
+	if em["category"] != string(CategoryUpstreamStructured) {
+		t.Fatalf("category = %v, want %v", em["category"], CategoryUpstreamStructured)
 	}
 	msg, _ := em["message"].(string)
 	if !strings.Contains(msg, "content policy") {

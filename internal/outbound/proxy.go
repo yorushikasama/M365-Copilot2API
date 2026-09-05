@@ -97,20 +97,19 @@ func ProxyPoolStatus() []map[string]any {
 }
 
 func AddProxy(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
 	clientsMu.RLock()
 	p := proxyPool
 	clientsMu.RUnlock()
 	if p == nil {
 		return ConfigurePool([]string{raw})
 	}
-	items := make([]string, 0)
-	for _, item := range p.List() {
-		if v, ok := item["url"].(string); ok {
-			items = append(items, v)
-		}
-	}
-	items = append(items, raw)
-	return ConfigurePool(items)
+	// In-place add keeps the cooldown/failure state of existing entries; a
+	// rebuild would silently re-enable a proxy that was cooling down.
+	return p.Add(raw)
 }
 
 func RemoveProxy(raw string) error {
@@ -121,21 +120,10 @@ func RemoveProxy(raw string) error {
 	if p == nil {
 		return nil
 	}
-	items := make([]string, 0)
-	found := false
-	for _, item := range p.List() {
-		if v, ok := item["url"].(string); ok {
-			if strings.TrimRight(strings.TrimSpace(v), "/") == raw {
-				found = true
-				continue
-			}
-			items = append(items, v)
-		}
-	}
-	if !found {
+	if !p.Remove(raw) {
 		return fmt.Errorf("proxy not found: %s", raw)
 	}
-	return ConfigurePool(items)
+	return nil
 }
 func HTTPClient() *http.Client {
 	clientsMu.RLock()

@@ -258,7 +258,16 @@ python manage.py stop     # 停止服务
 
 ### Docker 部署
 
-> 官方不提供 Dockerfile。如需容器化部署，可自行基于预编译二进制或源码构建镜像，或在 Discussions 交流社区方案。
+仓库根目录已提供 `Dockerfile`（多阶段构建，产物为 `alpine` 上的非 root 静态二进制）和 `docker-compose.yml`。
+
+```bash
+# 准备数据目录与管理员初始密码
+mkdir -p data secrets && printf 'your-strong-password' > secrets/m365_admin_password
+
+docker compose up -d --build
+```
+
+容器默认监听 `0.0.0.0:4141`，compose 只把端口映射到宿主机 `127.0.0.1:4141`；所有状态写入挂载卷 `./data`。
 
 ### 初始化与第一次调用
 
@@ -293,7 +302,7 @@ python manage.py stop     # 停止服务
 | `M365_CONTEXT_TTL_MINUTES` | `120` | 上下文指纹复用窗口（分钟） |
 | `M365_CONTEXT_SIMILARITY` | `0.6` | 上下文相似度复用阈值（0~1，Jaccard 相似度） |
 | `M365_LOG_LEVEL` | `info` | 日志级别 |
-| `M365_ACCOUNT_DEFAULT_CONCURRENCY` | `8` | 每个账号同时进行的上游调用上限；其余账号仍可继续接收请求 |
+| `M365_ACCOUNT_DEFAULT_CONCURRENCY` | `8` | 每个账号同时进行的上游调用上限；其余账号仍可继续接收请求。亦可用旧名 `M365_ACCOUNT_CONCURRENCY_LIMIT`。设置任一环境变量后，控制台上的该项将变为只读（显式环境变量优先） |
 | `M365_PUBLIC_IDENTITY_POLICY` | `false` | 公开身份策略总开关；仅在微软反代渠道显式设为 `true` 时启用身份预设及正文、推理、引用和流式清洗 |
 
 ### 自动清理
@@ -318,12 +327,16 @@ python manage.py stop     # 停止服务
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `M365_TOOL_PLANNING_MODE` | `router` | 工具规划模式：`router`（网关路由规划）/ `native`（云端原生规划） |
-| `M365_MAX_TOOL_CALLS_PER_TURN` | `1` | 单轮最多并行工具调用数（有副作用操作自动降为串行） |
-| `M365_MAX_TOOL_ROUNDS` | `16` | 单次请求最大工具轮次 |
+| `M365_MAX_TOOL_CALLS_PER_TURN` | `32` | 单轮最多并行工具调用数（有副作用操作自动降为串行），有效范围 1~64 |
+| `M365_MAX_TOOL_ROUNDS` | `512` | 单次请求最大工具轮次，有效范围 1~512 |
 | `M365_CONTEXT_WINDOW` | `128000` | 上下文窗口 |
 | `M365_MAX_OUTPUT_TOKENS` | `16384` | 最大输出 Token |
 | `M365_CHAT_TIMEOUT_SECONDS` | `300` | 聊天超时（秒）；工具密集与大附件请求在 120 秒内常常跑不完 |
 | `M365_IMAGE_TIMEOUT_SECONDS` | `150` | 图片处理超时（秒） |
+| `M365_CHATHUB_READ_TIMEOUT_SECONDS` | `150` | WebSocket 帧间空闲超时；描述的是"答案已经在流动"时两帧之间的最大间隔 |
+| `M365_CHATHUB_FIRST_TOKEN_GRACE_SECONDS` | `60` | 首个 token 之前额外允许的空闲时间。首 token 前的沉默同时包含上游读取整个 prompt，所以预算按请求体大小再上浮（每 64 KiB +10 秒，最多 +90 秒），这是工具调用、长历史、大请求体容易出现 `WS_READ_TIMEOUT` 的原因 |
+| `M365_CHATHUB_RESPONSE_DEADLINE_SECONDS` | `300` | 单次上游问答的总时限；上面两项加起来也不会超过它 |
+| `M365_SSE_KEEPALIVE_SECONDS` | `15` | `/v1/messages` 流式请求的 SSE 心跳间隔。上游沉默期间发送 SSE 注释行，避免 Claude CLI 在约 125 秒时按空闲超时主动断开 |
 
 ### 代理池与认证
 

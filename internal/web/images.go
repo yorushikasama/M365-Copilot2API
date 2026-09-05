@@ -14,6 +14,7 @@ import (
 	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,18 @@ const (
 	// imageAccountAttempts bounds how many accounts one image request may try
 	// before the throttle is reported to the caller.
 	imageAccountAttempts = 3
+	// imageRequestBudgetFactor bounds the whole request relative to the
+	// per-attempt image timeout, leaving room for roughly one failover plus the
+	// download phase instead of granting every phase a fresh full timeout.
+	imageRequestBudgetFactor = 2
+	// imageDownloadBudget bounds the Designer download phase. The overall request
+	// deadline clamps it as well, so it can only ever shorten the wait.
+	imageDownloadBudget = 60 * time.Second
+	// designerDownloadAttempts bounds the retries for one generated image. The
+	// upstream hands back a short-lived URL, so a transient 5xx or reset
+	// connection is worth another look, but a long loop would outlive the URL.
+	designerDownloadAttempts = 3
+	designerRetryBackoff     = 400 * time.Millisecond
 )
 
 // errImageQuotaRefused marks an upstream 200 whose text is a natural-language
@@ -42,14 +55,33 @@ var errImageQuotaRefused = errors.New("upstream refused image generation: quota 
 // another account before giving up.
 var errImageServiceUnavailable = errors.New("upstream image generation service is unavailable")
 
+// errImageNoResource marks an upstream 200 that carried neither an image nor a
+// recognizable refusal. It used to fail the request on the spot, which made a
+// transient upstream miss indistinguishable from a permanent one; it is the same
+// class of miss as an empty completion and deserves the same second chance.
+var errImageNoResource = errors.New("upstream returned no image resource")
+
+// imageDeliveryFailure records why one generated image could not be handed to
+// the caller. Only the first one is reported, and only when no image at all
+// could be delivered.
+type imageDeliveryFailure struct {
+	status  int
+	code    string
+	message string
+}
+
 // imageFailoverWorthwhile reports whether another account has a chance of
-// succeeding. Quota and throttling errors qualify, and so does an empty
-// completion: it is a transient upstream miss that a fresh conversation
-// usually clears (live-checked 2026-09-02, an immediate retry succeeded). A
-// content-policy block, a refused attachment or a malformed request would fail
+// succeeding. Quota and throttling errors qualify, and so does an answer that
+// carried no image at all — whether it came back empty or as prose: it is a
+// transient upstream miss that a fresh conversation usually clears (live-checked
+// 2026-09-02, an immediate retry succeeded). A transient attachment upload
+// failure qualifies too: /v1/images/edits sends the source image first, and a
+// 5xx or reset on that upload says nothing about the image itself, so it used to
+// fail the whole edit on the first stumble without trying anywhere else. A
+// content-policy block, a *refused* attachment or a malformed request would fail
 // the same way everywhere.
 func imageFailoverWorthwhile(err error) bool {
-	return IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit) || errors.Is(err, chathub.ErrEmptyCompletion)
+	return IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit) || errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, errImageNoResource) || errors.Is(err, chathub.ErrAttachmentUploadFailed)
 }
 
 // isImageCapabilityThrottle reports whether the error is an image-metering
@@ -73,16 +105,87 @@ func (s *Server) markImageThrottle(accountID string, err error) {
 	}
 }
 
-// imageURLsFromResult collects the generated image URLs, falling back to the raw
-// result and answer text when the upstream omits the structured field.
+// imageURLsFromResult collects the generated image URLs, falling back to a scan
+// of the answer text when the upstream omits the structured field.
+//
+// There used to be a second fallback that JSON-walked res.RawResult. It could
+// never fire: chathub returns early on any other value, so RawResult only ever
+// reaches here as "" or the literal "Success", and neither is valid JSON. The
+// text fallback was the same JSON walk, which is equally useless against prose —
+// so the real case it was meant to cover (the upstream names the URL in the
+// sentence instead of the structured field) was never actually handled.
 func imageURLsFromResult(res chathub.Result) []string {
 	if len(res.Images) > 0 {
 		return res.Images
 	}
-	if urls := extractImageURLs(res.RawResult); len(urls) > 0 {
-		return urls
+	return imageURLsFromText(res.Text)
+}
+
+// textURLPattern matches an https URL inside prose. The character class is the
+// RFC 3986 set on purpose: stopping at the first non-URL byte keeps a CJK
+// sentence that abuts the URL ("…dalle-1.png。这是图片") from being swallowed into
+// the match and making the extension test fail.
+var textURLPattern = regexp.MustCompile(`https://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+`)
+
+// imageURLsFromText finds image URLs the upstream mentioned in its answer, in
+// markdown (![alt](url)) or bare form.
+func imageURLsFromText(text string) []string {
+	if text == "" {
+		return nil
 	}
-	return extractImageURLs(res.Text)
+	var out []string
+	seen := map[string]bool{}
+	for _, candidate := range textURLPattern.FindAllString(text, -1) {
+		// Trailing punctuation belongs to the sentence or the markdown wrapper,
+		// not to the URL.
+		candidate = strings.TrimRight(candidate, `.,;:!?*_~)]'`)
+		if candidate == "" || seen[candidate] || !looksLikeImageURL(candidate) {
+			continue
+		}
+		seen[candidate] = true
+		out = append(out, candidate)
+	}
+	return out
+}
+
+// imageURLExtensionPattern accepts an extension that ends the URL or is followed
+// by another query parameter, mirroring chathub's own predicate: Designer puts
+// the filename in the query (?path=…/dalle-1.png&dcHint=…).
+var imageURLExtensionPattern = regexp.MustCompile(`\.(png|jpe?g|webp|gif)(&|$)`)
+
+func looksLikeImageURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" {
+		return false
+	}
+	p := strings.ToLower(u.Path + "?" + u.RawQuery)
+	return strings.Contains(p, "image") || imageURLExtensionPattern.MatchString(p)
+}
+
+// markImageRefusalCooldown applies the image-only cooldown a natural-language
+// refusal implies and returns the sentinel the failover loop should carry.
+//
+// The upstream answered HTTP 200 here, so chatWithAccount has already recorded a
+// success for this account, which clears its general cooldown. That used to be
+// called out as an ordering dependency ("our write lands after MarkSuccess"),
+// which was both hard to verify and not the thing making it safe: MarkSuccess
+// deliberately preserves an image-gen cooldown that is still in the future, so
+// the mark survives whichever order the two writes land in. Keeping the
+// refusal-to-cooldown mapping in one place makes that the only invariant to
+// check, and TestImageRefusalCooldownSurvivesSuccess pins it.
+func (s *Server) markImageRefusalCooldown(accountID string, refusal imageRefusalKind) error {
+	switch refusal {
+	case imageRefusalQuota:
+		s.accountPool.MarkImageGenTokensThrottled(accountID)
+		return errImageQuotaRefused
+	case imageRefusalCapacity:
+		// The upstream image service itself is down or overloaded rather than
+		// this account being out of quota, so hold the account back briefly and
+		// let another one try.
+		s.accountPool.MarkImageGenSystemThrottled(accountID)
+		return errImageServiceUnavailable
+	}
+	return nil
 }
 
 func logImageGenDebug(res chathub.Result) {
@@ -119,6 +222,30 @@ type imageGenerationRequest struct {
 
 func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
+	// Only the success path used to reach the usage log, so a burst of image
+	// failures was invisible both in the console and in per-key accounting —
+	// exactly the requests an operator most wants to see. Wrap the writer once
+	// and record on the way out, whichever of the dozen-plus exits is taken.
+	tw := &traceWriter{ResponseWriter: w}
+	w = tw
+	usageRec := UsageRecord{
+		APIKeyPrefix: extractAPIKey(r),
+		ClientIP:     clientIP(r),
+		Model:        "gpt-image-2",
+		Endpoint:     r.URL.Path,
+	}
+	defer func() {
+		if s.usage == nil {
+			return
+		}
+		usageRec.Time = time.Now()
+		usageRec.DurationMs = time.Since(startedAt).Milliseconds()
+		usageRec.Status = tw.status
+		if usageRec.Status == 0 {
+			usageRec.Status = http.StatusOK
+		}
+		s.usage.record(usageRec)
+	}()
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
@@ -129,6 +256,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "prompt is required")
 		return
 	}
+	usageRec.Model = firstNonEmpty(b.Model, "gpt-image-2")
 	if b.N <= 0 {
 		b.N = 1
 	}
@@ -149,6 +277,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		writeUpstreamError(w, err)
 		return
 	}
+	usageRec.AccountEmail = acc.Email
 	if acc.OID == "" || acc.TID == "" {
 		acc.OID, acc.TID = extractOIDTID(acc.AccessToken)
 	}
@@ -157,6 +286,15 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	imageTimeout := time.Duration(s.settings.get().ImageTimeoutSeconds) * time.Second
+	// ImageTimeoutSeconds used to be handed out per account attempt *and* again to
+	// the download phase, each derived straight from r.Context(): three attempts
+	// plus downloads could hold the connection for four times the configured
+	// timeout — 600s at the default 150s, long after any client had stopped
+	// listening (Claude CLI gives up near 125s). One budget now covers the whole
+	// request and every phase derives from it, so a phase can only shorten the
+	// wait, never extend it.
+	requestCtx, cancelRequest := context.WithTimeout(r.Context(), imageRequestBudgetFactor*imageTimeout)
+	defer cancelRequest()
 	size := b.Size
 	if size == "" {
 		size = "1024x1024"
@@ -171,6 +309,8 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		endpoint = "/v1/images/edits"
 		prompt = fmt.Sprintf("Edit the first attached image with GPT Image 2. Size: %s. Instructions: %s. Preserve everything not requested to change. Return the edited image URL directly.", size, b.Prompt)
 	}
+	usageRec.Endpoint = endpoint
+	usageRec.InputTokens = EstimateTokens(prompt)
 
 	// A throttled account must not become the caller's 429: rotate onto another
 	// account the way the chat path does, and only report the throttle once no
@@ -184,7 +324,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	tried := map[string]bool{}
 	for attempt := 1; ; attempt++ {
 		tried[acc.ID] = true
-		attemptCtx, cancel := context.WithTimeout(r.Context(), imageTimeout)
+		attemptCtx, cancel := context.WithTimeout(requestCtx, imageTimeout)
 		res, lastErr = s.chatWithAccount(attemptCtx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic", Attachments: b.Attachments, LicenseType: s.settings.get().LicenseType, Scenario: s.settings.get().Scenario, FeatureFlags: s.featureFlags(), Capability: "ImageGeneration"})
 		cancel()
 		if lastErr == nil {
@@ -193,35 +333,40 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 			if len(images) > 0 {
 				break
 			}
-			switch classifyImageRefusal(strings.Join([]string{res.Text, res.RawResult}, "\n")) {
-			case imageRefusalQuota:
-				// Upstream answered 200 with a natural-language refusal, so
+			switch kind := classifyImageRefusal(strings.Join([]string{res.Text, res.RawResult}, "\n")); kind {
+			case imageRefusalQuota, imageRefusalCapacity:
+				// The upstream answered 200 with a natural-language refusal, so
 				// chatWithAccount already recorded a success and cleared this
-				// account's cooldown. Mark the image quota now: the write lands
-				// after that MarkSuccess, and later ones preserve it.
-				s.accountPool.MarkImageGenTokensThrottled(acc.ID)
-				lastErr = errImageQuotaRefused
-			case imageRefusalCapacity:
-				// The upstream image service itself is down or overloaded rather
-				// than this account being out of quota, so hold the account back
-				// briefly and let another one try.
-				s.accountPool.MarkImageGenSystemThrottled(acc.ID)
-				lastErr = errImageServiceUnavailable
+				// account's cooldown. markImageRefusalCooldown is the single place a
+				// refusal turns into an image-only cooldown, and MarkSuccess is what
+				// keeps the mark alive; it also returns the sentinel the loop carries.
+				if sentinel := s.markImageRefusalCooldown(acc.ID, kind); sentinel != nil {
+					lastErr = sentinel
+				}
 			case imageRefusalPolicy:
 				// Every account would refuse the same prompt; report it as the
 				// client's problem so it does not retry and burn more quota.
 				logImageGenDebug(res)
-				writeOpenAIError(w, http.StatusBadRequest, "content_policy_violation", firstNonEmpty(strings.TrimSpace(res.Text), "upstream refused to generate this image"))
+				writeContentPolicyBlocked(w, res.Text)
 				return
 			default:
+				// The upstream answered but produced no image and gave no reason
+				// we recognise. Let the loop try another account before failing:
+				// returning here made one transient miss a hard 502.
 				logImageGenDebug(res)
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no image resource")
-				return
+				lastErr = errImageNoResource
 			}
 		} else {
 			s.markImageThrottle(acc.ID, lastErr)
 		}
 		if pinned || attempt >= imageAccountAttempts || !imageFailoverWorthwhile(lastErr) {
+			break
+		}
+		// Rotating is only worth it while enough of the overall budget remains for
+		// the next attempt to actually finish; otherwise it just delays the same
+		// failure past the caller's own patience.
+		if budget, enough := transportRetryBudget(requestCtx); !enough {
+			log.Printf("[image-gen] endpoint=%s account=%s: %s left of the image budget, not rotating (%v)", endpoint, acc.ID, budget.Round(time.Second), lastErr)
 			break
 		}
 		next, nerr := s.nextImageAccount(tried)
@@ -237,6 +382,9 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[image-gen] account=%s throttled (%v), failing over to account=%s", acc.ID, lastErr, next.ID)
 		acc = next
 	}
+	// Failover may have moved on from the account resolved up front; attribute
+	// the request to the one that actually answered, success or failure.
+	usageRec.AccountEmail = acc.Email
 	if lastErr != nil {
 		switch {
 		case errors.Is(lastErr, errImageQuotaRefused):
@@ -245,27 +393,44 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(lastErr, errImageServiceUnavailable):
 			w.Header().Set("Retry-After", strconv.Itoa(s.imageRetryAfter(acc.ID)))
 			writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_unavailable", "M365 image generation is temporarily unavailable upstream; retry shortly")
+		case errors.Is(lastErr, errImageNoResource):
+			// Every account tried answered without an image. Keep the historical
+			// 502 shape, but it now means "the upstream really has nothing for
+			// this prompt" rather than "the first attempt happened to miss".
+			log.Printf("[image-gen] endpoint=%s accounts_tried=%d: no image resource", endpoint, len(tried))
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no image resource")
 		default:
 			log.Printf("[image-gen] endpoint=%s account=%s failed: %v", endpoint, acc.ID, lastErr)
 			writeUpstreamError(w, lastErr)
 		}
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), imageTimeout)
+	ctx, cancel := context.WithTimeout(requestCtx, imageDownloadBudget)
 	defer cancel()
 	if len(images) > b.N {
 		images = images[:b.N]
 	}
 
 	var designerToken string
+	// One unlucky image used to sink the whole response: every failure below
+	// returned, discarding the images already downloaded. Collect what succeeds
+	// and only report a failure when nothing could be delivered.
+	var firstFailure *imageDeliveryFailure
+	failures := 0
+	note := func(status int, code, message string) {
+		failures++
+		if firstFailure == nil {
+			firstFailure = &imageDeliveryFailure{status: status, code: code, message: message}
+		}
+	}
 	data := make([]map[string]string, 0, len(images))
 	for _, sourceURL := range images {
 		if strings.HasPrefix(strings.ToLower(sourceURL), "data:image/") {
 			if format == "b64_json" {
 				parts := strings.SplitN(sourceURL, ",", 2)
 				if len(parts) != 2 {
-					writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "invalid upstream image data")
-					return
+					note(http.StatusBadGateway, "upstream_error", "invalid upstream image data")
+					continue
 				}
 				data = append(data, map[string]string{"b64_json": parts[1]})
 			} else {
@@ -275,24 +440,19 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		}
 		if !isDesignerImageURL(sourceURL) {
 			if format == "b64_json" {
-				writeOpenAIError(w, http.StatusBadGateway, "unsupported_response_format", "upstream returned URL, not b64_json")
-				return
+				note(http.StatusBadGateway, "unsupported_response_format", "upstream returned URL, not b64_json")
+				continue
 			}
 			data = append(data, map[string]string{"url": sourceURL})
 			continue
 		}
-		if designerToken == "" {
-			designerToken, err = s.designerAccessToken(acc)
-			if err != nil {
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", upstreamError(err))
-				return
-			}
-		}
-		imageData, contentType, err := downloadDesignerImage(ctx, sourceURL, designerToken)
+		imageData, contentType, refreshedToken, err := s.fetchDesignerImage(ctx, sourceURL, designerToken, acc)
+		designerToken = refreshedToken
 		if err != nil {
 			log.Printf("[image-gen-download] err=%v", err)
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", upstreamError(err))
-			return
+			status, code, message := designerDownloadFailure(err)
+			note(status, code, message)
+			continue
 		}
 		if format == "b64_json" {
 			data = append(data, map[string]string{"b64_json": base64.StdEncoding.EncodeToString(imageData)})
@@ -301,22 +461,56 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		id := s.storeGeneratedImage(imageData, contentType)
 		data = append(data, map[string]string{"url": generatedImageURL(r, id)})
 	}
+	if len(data) == 0 {
+		if firstFailure == nil {
+			// The upstream named images and every one of them was filtered out
+			// without an error, which should not happen; report it rather than
+			// answering 200 with an empty data array.
+			firstFailure = &imageDeliveryFailure{status: http.StatusBadGateway, code: "upstream_error", message: "no image could be delivered"}
+		}
+		if firstFailure.status == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "5")
+		}
+		log.Printf("[image-gen] endpoint=%s account=%s: all %d image(s) failed delivery: %s", endpoint, acc.ID, len(images), firstFailure.message)
+		writeOpenAIError(w, firstFailure.status, firstFailure.code, firstFailure.message)
+		return
+	}
+	if failures > 0 {
+		log.Printf("[image-gen] endpoint=%s account=%s: delivered %d/%d image(s), first failure: %s", endpoint, acc.ID, len(data), len(images), firstFailure.message)
+	}
 
-	s.usage.record(UsageRecord{
-		Time:         time.Now(),
-		APIKeyPrefix: extractAPIKey(r),
-		ClientIP:     clientIP(r),
-		AccountEmail: acc.Email,
-		Model:        firstNonEmpty(b.Model, "gpt-image-2"),
-		Endpoint:     endpoint,
-		InputTokens:  EstimateTokens(prompt),
-		DurationMs:   time.Since(startedAt).Milliseconds(),
-		Status:       200,
-	})
 	jsonOut(w, map[string]any{"created": time.Now().Unix(), "data": data, "m365": map[string]any{"conversationId": res.ConversationID, "sessionId": res.SessionID, "images": images}})
 }
 
 func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
+	// Early validation exits below return before imageGenerations, which owns the
+	// usage recording for the body of the path. Without a traceWriter here a
+	// rejected edit (bad multipart, oversized, missing prompt) would be invisible
+	// in the usage log — the same gap the unified handler just closed. Record only
+	// when we do not hand off; the forwarded request is recorded by
+	// imageGenerations itself, so it must not be double-counted.
+	startedAt := time.Now()
+	tw := &traceWriter{ResponseWriter: w}
+	w = tw
+	usageRec := UsageRecord{
+		APIKeyPrefix: extractAPIKey(r),
+		ClientIP:     clientIP(r),
+		Model:        "gpt-image-2",
+		Endpoint:     "/v1/images/edits",
+	}
+	forwarded := false
+	defer func() {
+		if s.usage == nil || forwarded {
+			return
+		}
+		usageRec.Time = time.Now()
+		usageRec.DurationMs = time.Since(startedAt).Milliseconds()
+		usageRec.Status = tw.status
+		if usageRec.Status == 0 {
+			usageRec.Status = http.StatusOK
+		}
+		s.usage.record(usageRec)
+	}()
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
@@ -406,6 +600,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 	next.Form = nil
 	next.PostForm = nil
 	next.MultipartForm = nil
+	forwarded = true
 	s.imageGenerations(w, next)
 }
 
@@ -431,9 +626,105 @@ func isDesignerImageURL(raw string) bool {
 	return err == nil && strings.EqualFold(u.Scheme, "https") && strings.EqualFold(u.Hostname(), "designerapp.officeapps.live.com")
 }
 
+// designerDownloadError explains why a generated image could not be fetched.
+// Every failure used to be an opaque error that the caller turned into a
+// permanent 502, so a reset connection was indistinguishable from an image that
+// will never be downloadable.
+type designerDownloadError struct {
+	// Status is the upstream HTTP status, or 0 for a transport-level failure.
+	Status int
+	// Retryable marks a failure that a later attempt at the same URL may clear.
+	Retryable bool
+	// Expired marks a rejected token rather than a bad URL: re-minting the
+	// short-lived Designer token is what makes the next attempt useful.
+	Expired bool
+	// Public is the client-visible reason, already free of internal detail.
+	Public string
+	cause  error
+}
+
+func (e *designerDownloadError) Error() string {
+	if e.cause == nil {
+		return e.Public
+	}
+	if e.Status != 0 {
+		return fmt.Sprintf("designer download HTTP %d: %v", e.Status, e.cause)
+	}
+	return fmt.Sprintf("designer download: %v", e.cause)
+}
+
+func (e *designerDownloadError) Unwrap() error { return e.cause }
+
+// designerDownloadFailure maps a download failure onto a client-visible
+// response. A transient fetch failure must not look like the permanent 502 this
+// path used to return for everything, otherwise callers cannot tell that
+// retrying would work.
+func designerDownloadFailure(err error) (int, string, string) {
+	var de *designerDownloadError
+	if errors.As(err, &de) {
+		if de.Retryable || de.Expired {
+			return http.StatusServiceUnavailable, "upstream_unavailable", "the generated image could not be downloaded from M365 Designer; retry shortly"
+		}
+		return http.StatusBadGateway, "upstream_error", de.Public
+	}
+	return http.StatusBadGateway, "upstream_error", upstreamError(err)
+}
+
+func isRetryableDesignerError(err error) bool {
+	var de *designerDownloadError
+	return errors.As(err, &de) && de.Retryable
+}
+
+// fetchDesignerImage downloads one generated image, retrying transient upstream
+// failures and re-minting the Designer token once if it was rejected. It returns
+// the token it ended up using so the caller can keep reusing a refreshed one
+// across the remaining images of the same request.
+func (s *Server) fetchDesignerImage(ctx context.Context, rawURL, token string, acc auth.AccountToken) ([]byte, string, string, error) {
+	var lastErr error
+	refreshed := false
+	backoff := designerRetryBackoff
+	for attempt := 1; attempt <= designerDownloadAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, "", token, ctx.Err()
+		}
+		if token == "" {
+			minted, err := s.designerAccessToken(acc)
+			if err != nil {
+				return nil, "", token, err
+			}
+			token = minted
+		}
+		data, contentType, err := downloadDesignerImage(ctx, rawURL, token)
+		if err == nil {
+			return data, contentType, token, nil
+		}
+		lastErr = err
+		var de *designerDownloadError
+		if errors.As(err, &de) && de.Expired && !refreshed {
+			// The URL is still valid; only the short-lived token was rejected, so
+			// re-mint it and go straight back in without waiting.
+			log.Printf("[image-gen-download] designer token rejected (HTTP %d), re-minting", de.Status)
+			refreshed = true
+			token = ""
+			continue
+		}
+		if attempt == designerDownloadAttempts || !isRetryableDesignerError(err) {
+			break
+		}
+		log.Printf("[image-gen-download] attempt=%d/%d retrying: %v", attempt, designerDownloadAttempts, err)
+		select {
+		case <-ctx.Done():
+			return nil, "", token, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
+	return nil, "", token, lastErr
+}
+
 func downloadDesignerImage(ctx context.Context, rawURL, accessToken string) ([]byte, string, error) {
 	if !isDesignerImageURL(rawURL) {
-		return nil, "", fmt.Errorf("unsupported generated image host")
+		return nil, "", &designerDownloadError{Public: "the upstream returned a generated image on an unsupported host", cause: fmt.Errorf("unsupported generated image host")}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -450,27 +741,45 @@ func downloadDesignerImage(ctx context.Context, rawURL, accessToken string) ([]b
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", err
+		// A reset connection or a proxy hiccup says nothing about whether the
+		// image is fetchable, so the same URL is worth another attempt.
+		return nil, "", &designerDownloadError{Retryable: true, Public: "the generated image could not be downloaded from M365 Designer", cause: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("Designer image download HTTP %d", resp.StatusCode)
+		return nil, "", classifyDesignerStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGeneratedImageBytes+1))
 	if err != nil {
-		return nil, "", err
+		// The response started arriving and then broke off mid-body; a fresh
+		// request is the only way to recover.
+		return nil, "", &designerDownloadError{Status: resp.StatusCode, Retryable: true, Public: "the generated image download was interrupted", cause: err}
 	}
 	if len(body) > maxGeneratedImageBytes {
-		return nil, "", fmt.Errorf("generated image exceeds %d bytes", maxGeneratedImageBytes)
+		return nil, "", &designerDownloadError{Status: resp.StatusCode, Public: fmt.Sprintf("the generated image exceeds the %d MiB download limit", maxGeneratedImageBytes>>20), cause: fmt.Errorf("generated image exceeds %d bytes", maxGeneratedImageBytes)}
 	}
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" || !strings.HasPrefix(strings.ToLower(contentType), "image/") {
 		contentType = http.DetectContentType(body)
 	}
 	if !strings.HasPrefix(strings.ToLower(contentType), "image/") {
-		return nil, "", fmt.Errorf("Designer returned non-image content")
+		return nil, "", &designerDownloadError{Status: resp.StatusCode, Public: "M365 Designer returned a non-image response for the generated image", cause: fmt.Errorf("Designer returned non-image content")}
 	}
 	return body, contentType, nil
+}
+
+// classifyDesignerStatus decides whether an upstream status is worth another
+// attempt, needs a fresh token, or is final.
+func classifyDesignerStatus(status int) *designerDownloadError {
+	cause := fmt.Errorf("Designer image download HTTP %d", status)
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return &designerDownloadError{Status: status, Expired: true, Public: "the M365 Designer download token was rejected", cause: cause}
+	case status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500:
+		return &designerDownloadError{Status: status, Retryable: true, Public: "M365 Designer is temporarily unable to serve the generated image", cause: cause}
+	default:
+		return &designerDownloadError{Status: status, Public: "M365 Designer rejected the generated image download", cause: cause}
+	}
 }
 
 func (s *Server) storeGeneratedImage(data []byte, contentType string) string {
@@ -602,44 +911,6 @@ func classifyImageRefusal(text string) imageRefusalKind {
 		}
 	}
 	return imageRefusalUnknown
-}
-
-// extractImageURLs finds image URLs in a raw JSON string by searching for URL patterns.
-func extractImageURLs(raw string) []string {
-	if raw == "" {
-		return nil
-	}
-	var out []string
-	seen := map[string]bool{}
-	var v any
-	if err := json.Unmarshal([]byte(raw), &v); err != nil {
-		return nil
-	}
-	var walk func(any)
-	walk = func(v any) {
-		switch x := v.(type) {
-		case []any:
-			for _, e := range x {
-				walk(e)
-			}
-		case map[string]any:
-			for k, e := range x {
-				lk := strings.ToLower(k)
-				if s, ok := e.(string); ok && (lk == "url" || lk == "imageurl" || lk == "thumbnailurl" || lk == "downloadurl" || lk == "src" || lk == "value" || lk == "data") {
-					if strings.HasPrefix(s, "https://") && !seen[s] {
-						if strings.Contains(strings.ToLower(s), "image") || strings.HasSuffix(strings.ToLower(s), ".png") || strings.HasSuffix(strings.ToLower(s), ".jpg") || strings.HasSuffix(strings.ToLower(s), ".jpeg") || strings.HasSuffix(strings.ToLower(s), ".webp") || strings.HasSuffix(strings.ToLower(s), ".gif") {
-							seen[s] = true
-							out = append(out, s)
-						}
-					}
-				} else {
-					walk(e)
-				}
-			}
-		}
-	}
-	walk(v)
-	return out
 }
 
 func downloadImageAsBase64(url string) (b64, contentType string, err error) {

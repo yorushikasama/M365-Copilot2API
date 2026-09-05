@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -100,8 +101,17 @@ var contentPolicyPatterns = []string{
 	"i apologize, i cannot",
 }
 
+// contentPolicyMaxRunes caps how long a message may be and still be read as a
+// pure refusal: beyond it the answer carries real content that merely happens to
+// contain an apology.
+const contentPolicyMaxRunes = 300
+
 func IsContentPolicyBlock(text string) bool {
-	if len(text) > 300 {
+	// This used to be len(text), i.e. bytes. Every pattern below is Chinese, and
+	// Chinese runes are 3 bytes in UTF-8, so the cap was really ~100 characters:
+	// a perfectly ordinary refusal of 120 characters sailed past the guard and
+	// was handed back as a normal answer.
+	if utf8.RuneCountInString(text) > contentPolicyMaxRunes {
 		return false
 	}
 	low := strings.ToLower(text)
@@ -119,7 +129,31 @@ type DialError struct {
 	Status     int
 	RetryAfter int
 	Kind       string
-	cause      error
+	// Streamed records that content had already been handed to the caller when
+	// the failure hit. Re-issuing such a turn would duplicate output, so
+	// failover must not. Leaving it false is the safe default: every failure
+	// before the first token (dial, handshake, payload send) left nothing on the
+	// wire.
+	Streamed bool
+	cause    error
+}
+
+// IsSafeToRetry reports whether a failed turn can be re-issued without the
+// caller observing duplicated output.
+//
+// WS_READ_TIMEOUT is already classified retryable, but nothing acted on it: only
+// 429/401 triggered failover, so a merely slow upstream surfaced as a hard 502 on
+// the first attempt. Distinguishing "timed out while still silent" from "timed
+// out mid-answer" is what makes acting on it safe.
+func IsSafeToRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	var de *DialError
+	if errors.As(err, &de) {
+		return !de.Streamed
+	}
+	return false
 }
 
 func (e *DialError) Error() string {
@@ -373,6 +407,9 @@ type Client struct {
 	// before the first delta; the historical hardcoded 90s cut those streams
 	// off mid-answer.
 	ReadFrameTimeout time.Duration
+	// FirstTokenGrace extends ReadFrameTimeout while the upstream has still sent
+	// nothing, covering prompt ingestion rather than an inter-frame gap.
+	FirstTokenGrace time.Duration
 	// ResponseDeadline bounds the whole exchange on one WebSocket, as a
 	// backstop against a silently dead upstream.
 	ResponseDeadline time.Duration
@@ -381,6 +418,18 @@ type Client struct {
 const (
 	defaultFrameReadTimeout = 150 * time.Second
 	defaultResponseDeadline = 5 * time.Minute
+	// defaultFirstTokenGrace is extra idle budget allowed before the upstream
+	// emits its first token. The flat inter-frame timeout describes the gap
+	// between frames of an answer already in flight, but the pre-token silence
+	// also covers M365 ingesting the entire prompt. That is why WS_READ_TIMEOUT
+	// clustered on tool-heavy requests, long histories and large bodies.
+	defaultFirstTokenGrace = 60 * time.Second
+	// payloadGraceUnit/payloadGraceStep grow the pre-token budget in proportion
+	// to how much the upstream has to read before it can start answering.
+	payloadGraceUnit = 64 << 10
+	payloadGraceStep = 10 * time.Second
+	// maxPayloadGrace keeps a huge payload from monopolising an account slot.
+	maxPayloadGrace = 90 * time.Second
 )
 
 func envSecondsDuration(key string, def time.Duration) time.Duration {
@@ -398,11 +447,16 @@ func NewClient() *Client {
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	d := outbound.WebSocketDialer()
 	return &Client{
-		HTTPHeader:       h,
-		HTTPClient:       outbound.HTTPClient(),
-		Dialer:           d,
+		HTTPHeader: h,
+		HTTPClient: outbound.HTTPClient(),
+		Dialer:     d,
+		// Reuse verified upstream: M365 allows a second chat invocation on a
+		// cleanly completed WebSocket (docs/har-mining/01 §7). Pool misses fall
+		// back to a fresh dial, so wiring this in is strictly a TTFB win.
+		Pool:             NewConnPool(d, h),
 		ReadFrameTimeout: envSecondsDuration("M365_CHATHUB_READ_TIMEOUT_SECONDS", defaultFrameReadTimeout),
 		ResponseDeadline: envSecondsDuration("M365_CHATHUB_RESPONSE_DEADLINE_SECONDS", defaultResponseDeadline),
+		FirstTokenGrace:  envSecondsDuration("M365_CHATHUB_FIRST_TOKEN_GRACE_SECONDS", defaultFirstTokenGrace),
 	}
 }
 
@@ -411,6 +465,36 @@ func (c *Client) readFrameTimeout() time.Duration {
 		return c.ReadFrameTimeout
 	}
 	return defaultFrameReadTimeout
+}
+
+func (c *Client) firstTokenGrace() time.Duration {
+	if c != nil && c.FirstTokenGrace > 0 {
+		return c.FirstTokenGrace
+	}
+	return defaultFirstTokenGrace
+}
+
+// firstTokenTimeout is the idle budget to allow before the upstream has produced
+// anything. It deliberately exceeds readFrameTimeout: the pre-token wait also
+// covers M365 ingesting the whole prompt, so the budget scales with the payload
+// that has to be read before an answer can begin. Once tokens flow, the tighter
+// inter-frame timeout takes over and a genuinely dead socket is still detected
+// promptly.
+func (c *Client) firstTokenTimeout(payloadBytes int) time.Duration {
+	budget := c.readFrameTimeout() + c.firstTokenGrace()
+	if payloadBytes > payloadGraceUnit {
+		grace := time.Duration(payloadBytes/payloadGraceUnit) * payloadGraceStep
+		if grace > maxPayloadGrace {
+			grace = maxPayloadGrace
+		}
+		budget += grace
+	}
+	// The exchange is already bounded by ResponseDeadline; waiting past it would
+	// only hold an account slot open with no chance of a result.
+	if d := c.responseDeadline(); budget > d {
+		budget = d
+	}
+	return budget
 }
 
 func (c *Client) responseDeadline() time.Duration {
@@ -571,7 +655,14 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			c.Pool.Return(acc.OID, acc.TID, conn)
 		} else if conn != nil {
-			conn.Close()
+			if c.Pool != nil && reused {
+				// A pooled lease that failed must leave the leased set now;
+				// waiting for the GC safety net would pin a dead entry for
+				// minutes. Discard also closes the connection.
+				c.Pool.Discard(acc.OID, acc.TID, conn)
+			} else {
+				conn.Close()
+			}
 		}
 	}()
 
@@ -630,6 +721,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 	phase = PhasePayloadSent
 
+	// streamStarted mirrors "phase >= PhaseStreaming" for the frame reader
+	// goroutine. phase is owned by this loop and must not be read from another
+	// goroutine, yet the reader needs that exact distinction to choose between
+	// the wide pre-token budget and the tight inter-frame one.
+	var streamStarted atomic.Bool
+
 	var deltas []string
 	var streamed strings.Builder
 	emitDelta := func(d string) error {
@@ -646,6 +743,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
 			ts.FirstTokenReceived = time.Now().UTC().Format(time.RFC3339Nano)
 			phase = PhaseStreaming
+			streamStarted.Store(true)
 		}
 		streamed.WriteString(d)
 		deltas = append(deltas, d)
@@ -760,6 +858,16 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		defer close(readCh)
 		for {
 			if reused {
+				// A pooled connection is read by the park pump, whose blocked
+				// ReadMessage honors the conn's read deadline — arm the same
+				// adaptive budget the fresh path uses, otherwise the flat 45s
+				// placeholder above kills slow-to-start answers on pooled
+				// connections only.
+				budget := c.readFrameTimeout()
+				if !streamStarted.Load() {
+					budget = c.firstTokenTimeout(len(payload))
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(budget))
 				var msg []byte
 				var err error
 				select {
@@ -792,7 +900,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				}
 				continue
 			}
-			_ = conn.SetReadDeadline(time.Now().Add(c.readFrameTimeout()))
+			budget := c.readFrameTimeout()
+			if !streamStarted.Load() {
+				budget = c.firstTokenTimeout(len(payload))
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(budget))
 			_, msg, err := conn.ReadMessage()
 			select {
 			case readCh <- wsRead{msg: msg, err: err}:
@@ -815,7 +927,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
 			}
-			return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
+			return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", Streamed: phase >= PhaseStreaming, cause: ctx.Err()}
 		case r, ok := <-readCh:
 			if !ok {
 				if ctx.Err() != nil {
@@ -823,7 +935,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if errors.Is(ctx.Err(), context.Canceled) {
 						return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
 					}
-					return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
+					return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", Streamed: phase >= PhaseStreaming, cause: ctx.Err()}
 				}
 				returnConn = false
 				return Result{}, fmt.Errorf("ws read before completion: %w", io.ErrUnexpectedEOF)
@@ -844,7 +956,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					kind = "WS_READ_TIMEOUT"
 				}
 			}
-			return Result{}, &DialError{Status: 0, Kind: kind, cause: fmt.Errorf("ws read before completion: %w", read.err)}
+			return Result{}, &DialError{Status: 0, Kind: kind, Streamed: phase >= PhaseStreaming, cause: fmt.Errorf("ws read before completion: %w", read.err)}
 		}
 		if !firstServiceResponse {
 			firstServiceResponse = true
@@ -869,6 +981,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 			// SignalR ping
 			if int(t) == 6 {
+				// Refresh the write deadline: the one armed before the payload
+				// send is 15s and long since expired on multi-minute answers,
+				// which would turn this pong into an immediate i/o timeout and
+				// leave the upstream free to drop the connection as idle.
+				_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 				_ = wsWrite(websocket.TextMessage, []byte(`{"type":6}`+rs))
 				continue
 			}
@@ -891,6 +1008,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						}
 						if len(seenStreamTools) > beforeTools {
 							phase = PhaseStreaming
+							streamStarted.Store(true)
 						}
 					}
 
@@ -1210,6 +1328,10 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					Images:                    imageURLs(events),
 					Timestamps:                ts,
 				}
+				// The turn completed cleanly, so the socket is safe to re-park.
+				// Every failure path above clears this flag; without setting it
+				// here the pool could only ever be filled by Warm.
+				returnConn = true
 				return result, nil
 			}
 		}
