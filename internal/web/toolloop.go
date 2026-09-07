@@ -206,7 +206,6 @@ var sandboxHallucinationPatterns = []string{
 	"code interpreter",
 	"python sandbox",
 	"sandbox environment",
-	"/mnt/data",
 	"linux container",
 	"linux sandbox",
 	"cloud sandbox",
@@ -229,11 +228,35 @@ var sandboxHallucinationPatterns = []string{
 	"none of which can reach",
 }
 
+// mountDataDenialPatterns describe the specific hallucination where the model
+// claims the caller's workspace is a Linux mount (/mnt/data) that is empty or
+// unavailable to the caller. They only fire together with an environment
+// refusal so normal discussion of /mnt/data is not misclassified.
+var mountDataDenialPatterns = []string{
+	"/mnt/data 为空",
+	"/mnt/data 是空的",
+	"/mnt/data 也是空的",
+	"/mnt/data is empty",
+	"/mnt/data is not mounted",
+	"/mnt/data has no",
+	"no /mnt/data",
+	"mnt/data empty",
+	"cannot find /mnt/data",
+	"/mnt/data 无法访问",
+}
+
 func isSandboxHallucination(text string) bool {
 	low := strings.ToLower(text)
 	for _, p := range sandboxHallucinationPatterns {
 		if strings.Contains(low, strings.ToLower(p)) {
 			return true
+		}
+	}
+	if strings.Contains(low, "/mnt/data") {
+		for _, p := range mountDataDenialPatterns {
+			if strings.Contains(low, strings.ToLower(p)) {
+				return true
+			}
 		}
 	}
 	return false

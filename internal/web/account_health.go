@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -340,6 +341,7 @@ func (g *globalCircuitState) IsOpen() bool {
 	if time.Now().Before(g.openUntil) {
 		return true
 	}
+	log.Printf("[global-circuit] recovered")
 	g.openUntil = time.Time{}
 	return false
 }
@@ -373,17 +375,28 @@ func (g *globalCircuitState) Record(err error) {
 			g.failures = 0
 		}
 		if g.total >= 10 && g.failures*2 >= g.total {
+			wasOpen := !g.openUntil.IsZero() && now.Before(g.openUntil)
 			g.openUntil = now.Add(30 * time.Second)
+			if !wasOpen {
+				log.Printf("[global-circuit] opened category=success_ratio total=%d failures=%d until=%s", g.total, g.failures, g.openUntil.Format(time.RFC3339))
+			}
 		}
 		g.mu.Unlock()
 		return
 	}
 	cat := ClassifyError(err)
 	switch cat {
-	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSProtocol, CategoryWSReadTimeout:
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake:
 		// Only shared transport and infrastructure failures contribute to the
 		// global circuit. Account-, policy-, quota-, and request-specific errors
 		// are handled by per-account health state.
+		//
+		// WSProtocol and WSReadTimeout are deliberately excluded: they are
+		// per-connection issues (a single WebSocket got a bad frame or stalled),
+		// not shared infrastructure failures. The bad connection is already
+		// discarded by the pool, so arming the global circuit here would block
+		// all healthy accounts for 30s every time a few connections corrupt,
+		// which is exactly the 429 storm observed in production.
 	default:
 		// Client cancels are not upstream faults. Failures already classified
 		// as GLOBAL_UNAVAILABLE must not re-arm the circuit, otherwise traffic
@@ -401,7 +414,11 @@ func (g *globalCircuitState) Record(err error) {
 	g.total++
 	g.failures++
 	if g.total >= 10 && g.failures*2 >= g.total {
+		wasOpen := !g.openUntil.IsZero() && now.Before(g.openUntil)
 		g.openUntil = now.Add(30 * time.Second)
+		if !wasOpen {
+			log.Printf("[global-circuit] opened category=%s total=%d failures=%d until=%s", cat, g.total, g.failures, g.openUntil.Format(time.RFC3339))
+		}
 	}
 	if g.total > 1000 {
 		g.windowStart = now

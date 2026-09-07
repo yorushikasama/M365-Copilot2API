@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) string {
+func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, anchors ...string) string {
 	defs, _ := json.Marshal(tools)
 	mode := normalizedToolChoiceMode(choice)
 	rules := `- If a tool is needed, respond with: CALL_TOOL: tool_name({"arg1":"value1"})
@@ -21,7 +21,7 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 - Completed evidence must not be repeated: tool_calls/tool[call_x] rows are prior results already delivered to the user, never re-invoke them
 - Only start a new tool call when fresh unfinished work remains on the current request`
 	}
-	return fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
+	result := fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
 
 Available tools: %s
 
@@ -32,6 +32,10 @@ Rules:
 
 User request and evidence:
 %s`, defs, mode, rules, prompt)
+	if len(anchors) > 0 {
+		result = appendExecutionAnchor(result, anchors[0])
+	}
+	return result
 }
 
 func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {

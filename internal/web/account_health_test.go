@@ -356,6 +356,19 @@ func TestGlobalCircuitOnlyRecordsInfrastructureFailures(t *testing.T) {
 		}
 	}
 
+	for _, err := range []error{
+		&chathub.DialError{Kind: "WS_PROTOCOL"},
+		&chathub.DialError{Kind: "WS_READ_TIMEOUT"},
+	} {
+		ResetGlobalCircuit()
+		for i := 0; i < 10; i++ {
+			GlobalCircuitRecord(err)
+		}
+		if GlobalCircuitIsOpen() {
+			t.Fatalf("per-connection error opened circuit: %v", err)
+		}
+	}
+
 	ResetGlobalCircuit()
 	for i := 0; i < 10; i++ {
 		GlobalCircuitRecord(fmt.Errorf("connection refused"))

@@ -315,6 +315,7 @@ type Request struct {
 	TimeZoneOffset        int
 	DeviceOS              string
 	Capability            string
+	ExecutionAnchor       string
 }
 
 type FeatureFlags struct {
@@ -1652,7 +1653,7 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 	if deviceOS == "" {
 		deviceOS = "Windows"
 	}
-	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, len(clientPlugins(req.Tools, req.MCPServerURL)) > 0)
+	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, len(clientPlugins(req.Tools, req.MCPServerURL)) > 0, req.ExecutionAnchor)
 	federatedConns := req.ConnectedFederatedIDs
 	if len(federatedConns) == 0 {
 		federatedConns = []string{"dummyId"}
