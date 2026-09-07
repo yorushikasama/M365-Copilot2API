@@ -296,7 +296,7 @@ func IsRetryable(err error) bool {
 	switch cat {
 	case CategoryQuota429, CategoryOverload503, CategoryRetryable422,
 		CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS,
-		CategoryWSHandshake, CategoryWSReadTimeout, CategoryUpstreamStructured,
+		CategoryWSHandshake, CategoryWSProtocol, CategoryWSReadTimeout, CategoryUpstreamStructured,
 		CategoryGlobalUnavailable:
 		return true
 	case CategoryForbidden403, CategoryAuthExpired401,
@@ -343,6 +343,19 @@ func shouldFailoverTransport(ctx context.Context, err error) (time.Duration, boo
 		return budget, false
 	}
 	return budget, true
+}
+
+// canFailoverChatTurn reports whether a failed, still-unobserved turn may move
+// to another account. Quota/auth failures are account-local by definition;
+// transport failures are admitted only when the transport itself proved no
+// output had reached the caller and enough of the original request budget
+// remains for another upstream turn.
+func canFailoverChatTurn(ctx context.Context, err error) bool {
+	if IsRateLimited(err) || IsAuthFailure(err) {
+		return true
+	}
+	_, ok := shouldFailoverTransport(ctx, err)
+	return ok
 }
 
 func ClassifyErrorCode(code string) ErrorCategory {

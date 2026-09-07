@@ -187,6 +187,8 @@ func classifyTransportError(err error) string {
 		return "WS_HANDSHAKE"
 	case strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "timeout") && strings.Contains(msg, "read"):
 		return "WS_READ_TIMEOUT"
+	case strings.Contains(msg, "bad opcode") || strings.Contains(msg, "rsv1 set") || strings.Contains(msg, "rsv2 set") || strings.Contains(msg, "rsv3 set") || strings.Contains(msg, "fin not set on control"):
+		return "WS_PROTOCOL"
 	case strings.Contains(msg, "connection refused") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "network is unreachable") || strings.Contains(msg, "connection was forcibly closed"):
 		return "TCP"
 	default:
@@ -240,8 +242,16 @@ func commonPrefixLen(a, b string) int {
 	}
 	for i := 0; i < n; i++ {
 		if a[i] != b[i] {
-			return i
+			n = i
+			break
 		}
+	}
+	// The prefix is used as a slice boundary when emitting the unseen suffix of
+	// a snapshot. Byte prefixes may end between the bytes of one UTF-8 rune
+	// (for example, two runes sharing a leading byte), which would stream a
+	// replacement character; only a rune boundary is a safe emit point.
+	for n > 0 && n < len(a) && !utf8.RuneStart(a[n]) {
+		n--
 	}
 	return n
 }
@@ -952,8 +962,8 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				kind = "WS_READ_TIMEOUT"
 			} else {
 				kind = classifyTransportError(read.err)
-				if kind == "TCP" {
-					kind = "WS_READ_TIMEOUT"
+				if kind == "" || kind == "TCP" {
+					kind = "TCP"
 				}
 			}
 			return Result{}, &DialError{Status: 0, Kind: kind, Streamed: phase >= PhaseStreaming, cause: fmt.Errorf("ws read before completion: %w", read.err)}

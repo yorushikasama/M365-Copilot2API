@@ -61,21 +61,21 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		FeatureFlags: s.featureFlags(),
 	}
 	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, streamReq)
-	if err != nil && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) {
-		// A throttled or expired account must not fail the console the way it
-		// used to: retry once on the next healthy account. A pinned conversation
-		// cannot move, so start a fresh one on the replacement account.
-		if next, nerr := s.nextHealthyAccount(acc.ID); nerr == nil {
-			failoverReq := streamReq
-			failoverReq.ConversationID = ""
-			failoverReq.SessionID = ""
-			failoverReq.ConversationSignature = ""
-			ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-			defer cancel2()
-			if res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq); err2 == nil {
-				res, err, acc = res2, nil, next
-			}
+	triedAccountIDs := map[string]bool{acc.ID: true}
+	for err != nil && body.AccountID == "" && canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
+		next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
+		if nerr != nil {
+			break
 		}
+		triedAccountIDs[next.ID] = true
+		failoverReq := streamReq
+		failoverReq.ConversationID = ""
+		failoverReq.SessionID = ""
+		failoverReq.ConversationSignature = ""
+		ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+		res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
+		cancel2()
+		res, err, acc = res2, err2, next
 	}
 	if err != nil {
 		if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {

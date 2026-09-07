@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // collectEmit returns an emit func appending every delta to out.
@@ -11,6 +12,21 @@ func collectEmit(out *[]string) func(string) error {
 	return func(d string) error {
 		*out = append(*out, d)
 		return nil
+	}
+}
+
+func TestCommonPrefixLenNeverCutsUTF8Rune(t *testing.T) {
+	// These two runes share their UTF-8 leading byte. A byte-wise prefix is one
+	// byte long, but slicing there would emit an invalid continuation byte and
+	// surface as the U+FFFD replacement character.
+	streamed := "Āx"
+	snapshot := "Áy"
+	overlap := commonPrefixLen(streamed, snapshot)
+	if overlap != 0 {
+		t.Fatalf("commonPrefixLen() = %d, want 0; prefix must stop at a rune boundary", overlap)
+	}
+	if !utf8.ValidString(snapshot[overlap:]) {
+		t.Fatalf("suffix %q is not valid UTF-8", snapshot[overlap:])
 	}
 }
 

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -38,6 +39,25 @@ func TestStreamErrorEventCarriesRealCategory(t *testing.T) {
 	}
 	if strings.Contains(msg, "ws dial") || strings.Contains(msg, "tcp") {
 		t.Fatalf("message leaks transport internals: %q", msg)
+	}
+}
+
+func TestMalformedWebSocketFrameIsNotReportedAsTimeout(t *testing.T) {
+	err := fmt.Errorf("ws dial: %w", &chathub.DialError{Status: 0, Kind: "WS_PROTOCOL"})
+	ev := streamErrorEvent("req-frame", err)
+	em := errMap(t, ev)
+	if em["category"] != string(CategoryWSProtocol) {
+		t.Fatalf("category = %v, want %v", em["category"], CategoryWSProtocol)
+	}
+	if em["code"] == "upstream_timeout" {
+		t.Fatalf("malformed frame must not be reported as a timeout: %v", em)
+	}
+	msg, _ := em["message"].(string)
+	if strings.Contains(msg, "took too long") {
+		t.Fatalf("malformed frame must not use the timeout message: %q", msg)
+	}
+	if !canFailoverChatTurn(context.Background(), err) {
+		t.Fatal("a silent malformed-frame failure must be eligible for account failover")
 	}
 }
 

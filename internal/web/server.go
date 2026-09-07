@@ -1115,13 +1115,7 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 1, Body: "all accounts are at their concurrency limit; try again shortly"}
 		}
 	}
-	result, err := s.tokens.EnsureValid(accountID)
-	if err == nil {
-		s.mu.Lock()
-		s.lastHealthyAccount = accountID
-		s.mu.Unlock()
-	}
-	return result, err
+	return s.tokens.EnsureValid(accountID)
 }
 
 // resolveImageAccount picks an account for image generation. Image allowance is
@@ -1172,21 +1166,38 @@ func (s *Server) imageRetryAfter(accountID string) int {
 }
 
 // nextHealthyAccount returns the next round-robin account that is still
-// healthy, skipping the given id first, and validates its token. Used by the
-// failover path after a rate-limited or auth-failed attempt.
+// healthy, skipping the given id first, and validates its token.
 func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
-	for i := 0; i < maxAccountProbe; i++ {
+	tried := map[string]bool{}
+	if avoidID != "" {
+		tried[avoidID] = true
+	}
+	return s.nextHealthyAccountExcluding(tried)
+}
+
+// nextHealthyAccountExcluding returns an available chat account that has not
+// already been attempted by the current request. Each account is considered at
+// most once, and accounts in quota cooldown or at local concurrency capacity
+// are skipped without changing their health state.
+func (s *Server) nextHealthyAccountExcluding(tried map[string]bool) (auth.AccountToken, error) {
+	accounts := s.tokens.List()
+	if len(accounts) == 0 {
+		return auth.AccountToken{}, fmt.Errorf("%w: none is signed in", errNoAccounts)
+	}
+	for i := 0; i < len(accounts); i++ {
 		acc, ok := s.tokens.Next()
 		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("%w: none is signed in", errNoAccounts)
+			break
 		}
-		if avoidID != "" && acc.ID == avoidID {
+		if tried[acc.ID] || !s.accountAvailable(acc.ID) {
 			continue
 		}
-		if !s.accountAvailable(acc.ID) {
+		validated, err := s.tokens.EnsureValid(acc.ID)
+		if err != nil {
+			tried[acc.ID] = true
 			continue
 		}
-		return s.tokens.EnsureValid(acc.ID)
+		return validated, nil
 	}
 	return auth.AccountToken{}, fmt.Errorf("%w: none is healthy for failover", errNoAccounts)
 }
@@ -1347,46 +1358,36 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		FeatureFlags:          s.featureFlags(),
 	})
 	if err != nil {
-		originalErr := err
-		// Failover: a rate-limited or auth-failed account must not take down the
-		// request when the pool has other healthy accounts. Only auto-selected
-		// requests fail over; an explicitly chosen account is respected, and a
-		// conversation-bound chat stays on its account.
-		if body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "") {
-			next, nerr := s.nextHealthyAccount(acc.ID)
-			if nerr == nil {
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				defer cancel2()
-				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{
-					Text: text,
-					Tone: body.Tone,
-					// A conversation belongs to the account that created it, so the
-					// replacement account has to start a fresh one.
-					ConversationID:        "",
-					SessionID:             "",
-					Attachments:           body.Attachments,
-					LicenseType:           chatSettings.LicenseType,
-					Scenario:              chatSettings.Scenario,
-					ConversationSignature: "",
-					PreviousMessages:      body.PreviousMessages,
-					ConnectedFederatedIDs: body.ConnectedFederatedIDs,
-					FeatureFlags:          s.featureFlags(),
-				})
-				if err2 == nil {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					acc = next
-					res = res2
-					err = nil
-				} else {
-					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(next.ID)
-					}
-					err = err2
-				}
+		triedAccountIDs := map[string]bool{acc.ID: true}
+		for body.AccountID == "" && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "") && r.Context().Err() == nil {
+			next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
+			if nerr != nil {
+				break
+			}
+			triedAccountIDs[next.ID] = true
+			ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+			res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{
+				Text:                  text,
+				Tone:                  body.Tone,
+				ConversationID:        "",
+				SessionID:             "",
+				Attachments:           body.Attachments,
+				LicenseType:           chatSettings.LicenseType,
+				Scenario:              chatSettings.Scenario,
+				ConversationSignature: "",
+				PreviousMessages:      body.PreviousMessages,
+				ConnectedFederatedIDs: body.ConnectedFederatedIDs,
+				FeatureFlags:          s.featureFlags(),
+			})
+			cancel2()
+			acc = next
+			res = res2
+			err = err2
+			if err == nil {
+				break
 			}
 		}
+
 		if err != nil {
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
@@ -1954,22 +1955,19 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if routeErr != nil {
-			if (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && body.AccountID == "" {
-				if next, nerr := s.nextHealthyAccount(acc.ID); nerr == nil {
-					// chatWithAccount already recorded this failure; marking it
-					// again here would advance the quota backoff twice per request.
-					routeRes2, routeErr2 := s.chatWithAccount(ctx, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
-					if routeErr2 == nil {
-						routeRes = routeRes2
-						acc = next
-						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-						routeErr = nil
-					} else {
-						writeUpstreamErrorWithAccount(w, routeErr2, next.ID)
-						return
-					}
+			triedAccountIDs := map[string]bool{acc.ID: true}
+			for body.AccountID == "" && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
+				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
+				if nerr != nil {
+					break
 				}
+				triedAccountIDs[next.ID] = true
+				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+				routeRes, routeErr = s.chatWithAccount(ctx, next.ID, nextAccount, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+				acc = next
+				account = nextAccount
 			}
+
 			if routeErr != nil {
 				log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
 				writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
@@ -2073,31 +2071,30 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			text.WriteString(ev.Text)
 			return emitText(ev.Text)
 		})
-		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
-			originalErr := err
-			// A throttled stream may retry on the next healthy account: only the
-			// ": connected" preamble reached the client, so the retried stream is
-			// indistinguishable from a fresh request.
-			next, nerr := s.nextHealthyAccount(acc.ID)
-			if nerr != nil {
-				// no healthy alternative
-			} else {
+		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+			// Retry every eligible account only while no business delta or tool call
+			// has reached the client. Once output starts, never splice accounts.
+			triedAccountIDs := map[string]bool{acc.ID: true}
+			for text.Len() == 0 && len(streamedTools) == 0 && canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
+				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
+				if nerr != nil {
+					break
+				}
+				triedAccountIDs[next.ID] = true
 				failoverReq := answerReq
 				if body.ConversationID == resolvedConversationID {
 					failoverReq.ConversationID = ""
 					failoverReq.SessionID = ""
 				}
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				defer cancel2()
-				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, func(ev chathub.StreamEvent) error {
+				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, nextAccount, failoverReq, func(ev chathub.StreamEvent) error {
 					if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 						toolKnown := false
 						for _, tm := range toolMaps {
-							if fn, ok := tm["function"].(map[string]any); ok {
-								if fn["name"] == ev.ToolName {
-									toolKnown = true
-									break
-								}
+							if fn, ok := tm["function"].(map[string]any); ok && fn["name"] == ev.ToolName {
+								toolKnown = true
+								break
 							}
 						}
 						if toolKnown {
@@ -2111,21 +2108,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					text.WriteString(ev.Text)
 					return emitText(ev.Text)
 				})
-				if err2 == nil {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					res = res2
-					acc = next
-					err = nil
-				} else {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(next.ID)
-					}
-					err = err2
+				cancel2()
+				acc = next
+				account = nextAccount
+				res = res2
+				err = err2
+				if err == nil || text.Len() > 0 || len(streamedTools) > 0 {
+					break
 				}
 			}
 		}
@@ -2239,18 +2228,21 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 		if routeErr != nil {
-			if IsRateLimited(routeErr) || IsAuthFailure(routeErr) {
-				next, nerr := s.nextHealthyAccount(acc.ID)
-				if nerr == nil {
-					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-					defer cancel2()
-					if res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}); err2 == nil {
-						routeRes, routeErr = res2, nil
-						acc = next
-						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-					}
+			triedAccountIDs := map[string]bool{acc.ID: true}
+			for body.AccountID == "" && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
+				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
+				if nerr != nil {
+					break
 				}
+				triedAccountIDs[next.ID] = true
+				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+				routeRes, routeErr = s.chatWithAccount(ctx2, next.ID, nextAccount, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+				cancel2()
+				acc = next
+				account = nextAccount
 			}
+
 			if routeErr != nil {
 				log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
 				writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
@@ -2389,32 +2381,29 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return onReasoning(reasoning)
 		}
 		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDeltaWrapped, onReasoningWrapped)
-		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
-			originalErr := err
-			next, nerr := s.nextHealthyAccount(acc.ID)
-			if nerr == nil {
+		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+			triedAccountIDs := map[string]bool{acc.ID: true}
+			for streamedReasoningLen == 0 && canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
+				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
+				if nerr != nil {
+					break
+				}
+				triedAccountIDs[next.ID] = true
 				failoverReq := answerReq
 				if body.ConversationID == resolvedConversationID {
 					failoverReq.ConversationID = ""
 					failoverReq.SessionID = ""
 				}
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				defer cancel2()
-				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning); err2 == nil {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					res = res2
-					acc = next
-					err = nil
-				} else {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(next.ID)
-					}
-					err = err2
+				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+				res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, nextAccount, failoverReq, onDeltaWrapped, onReasoningWrapped)
+				cancel2()
+				res = res2
+				err = err2
+				acc = next
+				account = nextAccount
+				if err == nil || streamedReasoningLen > 0 {
+					break
 				}
 			}
 		}
@@ -2497,48 +2486,38 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		// A slow or half-open upstream is retryable but used to reach no failover
 		// at all, so the very first WS_READ_TIMEOUT surfaced as a hard 502.
 		retryBudget, transportRetry := shouldFailoverTransport(ctx, err)
-		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err) || transportRetry) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
-			originalErr := err
-			// Failover only when nothing pins the request to a conversation or
-			// account; a fresh chat can safely retry on the next healthy account.
-			next, nerr := s.nextHealthyAccount(acc.ID)
-			if nerr == nil {
+		if err != nil && !convReused && body.AccountID == "" && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+			triedAccountIDs := map[string]bool{acc.ID: true}
+			for canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
+				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
+				if nerr != nil {
+					break
+				}
+				triedAccountIDs[next.ID] = true
 				failoverReq := answerReq
 				if body.ConversationID == resolvedConversationID {
 					failoverReq.ConversationID = ""
 					failoverReq.SessionID = ""
 				}
 				failoverTimeout := time.Duration(s.settings.get().ChatTimeoutSeconds) * time.Second
-				// A transport failover is a second run at the same request, so it
-				// inherits what is left of the original budget rather than silently
-				// granting the caller a second full timeout. Quota and auth
-				// failovers keep their existing full-budget behaviour: those fail
-				// during the handshake, so nothing has been spent yet.
 				if transportRetry && !IsRateLimited(err) && !IsAuthFailure(err) {
 					if retryBudget > 0 && retryBudget < failoverTimeout {
 						failoverTimeout = retryBudget
 					}
-					log.Printf("[transport-failover] account=%s next=%s budget=%s err=%v", acc.ID, next.ID, failoverTimeout.Round(time.Second), originalErr)
+					log.Printf("[transport-failover] account=%s next=%s budget=%s err=%v", acc.ID, next.ID, failoverTimeout.Round(time.Second), err)
 				}
 				ctx2, cancel2 := context.WithTimeout(r.Context(), failoverTimeout)
-				defer cancel2()
-				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
-				if err2 == nil {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					res = res2
-					acc = next
-					err = nil
-				} else {
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(next.ID)
-					}
-					err = err2
+				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+				res2, err2 := s.chatWithAccount(ctx2, next.ID, nextAccount, failoverReq)
+				cancel2()
+				res = res2
+				err = err2
+				acc = next
+				account = nextAccount
+				if err == nil {
+					break
 				}
+				retryBudget, transportRetry = shouldFailoverTransport(ctx, err)
 			}
 		}
 	}

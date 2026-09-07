@@ -29,6 +29,7 @@ const (
 	CategoryTCP                ErrorCategory = "TCP"
 	CategoryTLS                ErrorCategory = "TLS"
 	CategoryWSHandshake        ErrorCategory = "WS_HANDSHAKE"
+	CategoryWSProtocol         ErrorCategory = "WS_PROTOCOL"
 	CategoryWSReadTimeout      ErrorCategory = "WS_READ_TIMEOUT"
 	CategoryUpstreamStructured ErrorCategory = "UPSTREAM_STRUCTURED"
 	CategoryClientCanceled     ErrorCategory = "CLIENT_CANCELED"
@@ -130,6 +131,8 @@ func ClassifyError(err error) ErrorCategory {
 				return CategoryTLS
 			case "WS_HANDSHAKE":
 				return CategoryWSHandshake
+			case "WS_PROTOCOL":
+				return CategoryWSProtocol
 			case "WS_READ_TIMEOUT":
 				return CategoryWSReadTimeout
 			case "CLIENT_CANCELED":
@@ -303,6 +306,8 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 		return 30 * time.Second
 	case CategoryWSHandshake:
 		return 15 * time.Second
+	case CategoryWSProtocol:
+		return 15 * time.Second
 	case CategoryWSReadTimeout:
 		return 30 * time.Second
 	case CategoryUpstreamStructured:
@@ -375,7 +380,7 @@ func (g *globalCircuitState) Record(err error) {
 	}
 	cat := ClassifyError(err)
 	switch cat {
-	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout:
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSProtocol, CategoryWSReadTimeout:
 		// Only shared transport and infrastructure failures contribute to the
 		// global circuit. Account-, policy-, quota-, and request-specific errors
 		// are handled by per-account health state.
@@ -856,11 +861,6 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
 		h.limited[accountID] = true
-		if errors.Is(err, chathub.ErrMeteringThrottled) && RetryAfterSeconds(err) == 0 {
-			h.quotaAttempts[accountID] = 0
-			h.cooldown[accountID] = time.Now().Add(15 * time.Minute)
-			return
-		}
 		attempt := h.quotaAttempts[accountID] + 1
 		h.quotaAttempts[accountID] = attempt
 		cd := CooldownForCategory(cat, RetryAfterSeconds(err), attempt)
@@ -871,7 +871,7 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		delete(h.authFailReason, accountID)
 		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, RetryAfterSeconds(err), 1))
 		return
-	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout:
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSProtocol, CategoryWSReadTimeout:
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
 		cd := CooldownForCategory(cat, 0, 1)

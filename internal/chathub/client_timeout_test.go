@@ -95,6 +95,18 @@ func TestFirstTokenTimeoutCappedByResponseDeadline(t *testing.T) {
 	}
 }
 
+func TestClassifyTransportErrorDetectsMalformedWebSocketFrames(t *testing.T) {
+	for _, raw := range []string{
+		"websocket: RSV2 set, bad opcode 13",
+		"websocket: RSV1 set, RSV2 set, bad opcode 5",
+		"websocket: RSV1 set, RSV2 set, FIN not set on control",
+	} {
+		if got := classifyTransportError(errors.New(raw)); got != "WS_PROTOCOL" {
+			t.Fatalf("classifyTransportError(%q) = %q, want WS_PROTOCOL", raw, got)
+		}
+	}
+}
+
 func TestIsSafeToRetry(t *testing.T) {
 	cases := []struct {
 		name string
