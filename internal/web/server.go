@@ -2092,6 +2092,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls, _ = validateCalls("router", calls)
 			}
 		}
+		if len(calls) == 0 {
+			// Observability: a silent empty router decision is the hardest
+			// failure mode to diagnose after the fact (the client just sees a
+			// chatty answer instead of tool calls). Record the decision.
+			log.Printf("[router-nocalls] id=%s stream=true route_prompt_len=%d parsed=%t upstream_text=%q", requestID, len(routePrompt), parsed, compactToolResult(routeRes.Text, 300))
+		}
 		if parsed && len(calls) > 0 {
 			scope := fmt.Sprintf("%d:%v:stream", len(body.Messages), completedCallIDs(ledger))
 			for i := range calls {
@@ -2380,6 +2386,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
+		if len(calls) == 0 {
+			// Observability: record why the request fell through to the plain
+			// answer turn (see the streaming twin of this log line).
+			log.Printf("[router-nocalls] id=%s stream=false route_prompt_len=%d parsed=%t upstream_text=%q", requestID, len(routePrompt), parsed, compactToolResult(routeRes.Text, 300))
+		}
 		if len(calls) > 0 {
 			scope := fmt.Sprintf("%d:%v", len(body.Messages), completedCallIDs(ledger))
 			for i := range calls {
