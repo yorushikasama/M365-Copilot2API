@@ -91,7 +91,13 @@ type pipeResponseWriter struct {
 	h      http.Header
 	w      *io.PipeWriter
 	status int
+	// bodyHead keeps the first bytes written with an error status so the
+	// Responses adapter can surface the real rejection reason in its
+	// response.failed event instead of a generic "inner chat request failed".
+	bodyHead []byte
 }
+
+const maxPipeBodyHead = 16 << 10
 
 func (p *pipeResponseWriter) Header() http.Header { return p.h }
 func (p *pipeResponseWriter) WriteHeader(n int) {
@@ -103,9 +109,41 @@ func (p *pipeResponseWriter) Write(b []byte) (int, error) {
 	if p.status == 0 {
 		p.status = 200
 	}
+	if p.status >= http.StatusBadRequest && len(p.bodyHead) < maxPipeBodyHead {
+		room := maxPipeBodyHead - len(p.bodyHead)
+		if len(b) < room {
+			room = len(b)
+		}
+		p.bodyHead = append(p.bodyHead, b[:room]...)
+	}
 	return p.w.Write(b)
 }
 func (p *pipeResponseWriter) Flush() {}
+
+// innerErrorDetail extracts a human-readable message from an inner handler's
+// error body (OpenAI error JSON or any text), for logging and for the
+// response.failed event payload.
+func innerErrorDetail(raw []byte) (code string, message string) {
+	var parsed struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err == nil && parsed.Error != nil {
+		if v, ok := parsed.Error["code"].(string); ok && v != "" {
+			code = v
+		}
+		if v, ok := parsed.Error["message"].(string); ok && v != "" {
+			return code, v
+		}
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return "", ""
+	}
+	if len(trimmed) > 500 {
+		trimmed = trimmed[:500]
+	}
+	return "", trimmed
+}
 
 // streamResponsesAdapter converts the internal OpenAI SSE incrementally instead
 // of buffering the entire completion in httptest.ResponseRecorder.
@@ -228,11 +266,22 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		if status == 0 {
 			status = http.StatusBadGateway
 		}
+		code, detail := innerErrorDetail(irw.bodyHead)
+		if code == "" {
+			code = "upstream_error"
+		}
+		if detail == "" {
+			detail = "inner chat request failed"
+		}
+		// Surface the real rejection reason: a generic message here cost a
+		// full incident investigation (Codex sessions silently failing for
+		// 90 minutes with no diagnosable cause in the gateway logs).
+		log.Printf("[responses] inner-reject id=%s status=%d code=%s detail=%q", id, status, code, detail)
 		emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
 				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": map[string]any{"code": status, "message": "inner chat request failed"},
+				"error": map[string]any{"code": code, "message": detail, "status": status},
 			},
 		})
 		return
