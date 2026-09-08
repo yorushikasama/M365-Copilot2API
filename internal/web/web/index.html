@@ -603,7 +603,7 @@ if (response.output_text) {
         </div>
         <div class="card">
           <div class="card-head"><span class="card-title">Conversation list</span></div>
-          <table class="table"><thead><tr><th>Name</th><th>Messages</th><th>Account</th><th>Last updated</th><th>Actions</th></tr></thead><tbody id="convRows"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody></table>
+          <table class="table"><thead><tr><th>Name</th><th>IP</th><th>Messages</th><th>Account</th><th>Last updated</th><th>Actions</th></tr></thead><tbody id="convRows"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody></table>
         </div>
       </section>
 
@@ -1642,12 +1642,13 @@ async function loadConversations(){
       const updated=x.updateTimeUtc||x.createTimeUtc;
       return `<tr class="conv-row" data-conversation-id="${esc(id)}">
         <td><button class="conv-link" type="button">${esc(x.chatName||'未命名对话')}</button><div class="conv-meta"><code>${esc(id)}</code></div></td>
+        <td>${esc(x.clientIp||'-')}</td>
         <td>${Number(x.messageCount||0)}</td>
         <td>${esc(x.accountEmail||x.accountId||'-')}</td>
         <td style="font-size:12px;color:var(--muted)">${updated?new Date(updated).toLocaleString():'-'}</td>
         <td><div style="display:flex;gap:6px"><button class="btn-sm btn" data-conv-action="view">View</button><button class="btn-sm btn danger" data-conv-action="delete">Delete</button></div></td>
       </tr>`;
-    }).join(''):'<tr><td colspan="5" class="empty">No conversations</td></tr>';
+    }).join(''):'<tr><td colspan="6" class="empty">No conversations</td></tr>';
     $('convRows').querySelectorAll('.conv-row').forEach(row=>{
       row.addEventListener('click',event=>{
         const action=event.target.closest('[data-conv-action]')?.dataset.convAction;
@@ -1656,7 +1657,7 @@ async function loadConversations(){
       });
     });
     applyLocale(currentLocale);
-  }catch(e){$('convRows').innerHTML=`<tr><td colspan="5" class="empty">${esc(e.message)}</td></tr>`;}
+  }catch(e){$('convRows').innerHTML=`<tr><td colspan="6" class="empty">${esc(e.message)}</td></tr>`;}
 }
 
 function openConversation(id){window.open('/conversation?id='+encodeURIComponent(id),'_blank','noopener');}

@@ -175,6 +175,7 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 		row["updateTimeUtc"] = session.LastUsedAt.UnixMilli()
 		row["messageCount"] = len(session.ContextHistory)
 		row["historyAvailable"] = len(session.ContextHistory) > 0
+		row["clientIp"] = session.ClientIP
 		row["source"] = "gateway"
 		if account, found := s.tokens.Get(session.AccountID); found {
 			row["accountEmail"] = account.Email
@@ -229,6 +230,7 @@ func (s *Server) handleM365ConversationDetail(w http.ResponseWriter, r *http.Req
 		"sessionId":      session.SessionID,
 		"accountId":      session.AccountID,
 		"accountEmail":   accountEmail,
+		"clientIp":       session.ClientIP,
 		"chatName":       conversationTitle(session.ContextHistory),
 		"createdAt":      session.CreatedAt,
 		"updatedAt":      session.LastUsedAt,

@@ -25,6 +25,7 @@ type sessionBinding struct {
 	CreatedAt      time.Time `json:"createdAt"`
 	LastUsedAt     time.Time `json:"lastUsedAt"`
 	IPFingerprint  string    `json:"ipFingerprint,omitempty"`
+	ClientIP       string    `json:"clientIp,omitempty"`
 	UserField      string    `json:"userField,omitempty"`
 	ContextFinger  string    `json:"contextFinger,omitempty"`
 	// ContextHistory 鎸佷箙鍖栦繚瀛樻渶杩戜竴娆″崗璁殑瀹屾暣娑堟伅锛屼緵閲嶅惎鍚庣户缁仛
@@ -472,6 +473,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		sess.LastUsedAt = now
 		sess.UserField = body.User
 		sess.IPFingerprint = clientIPFingerprint(r)
+		sess.ClientIP = clientIP(r)
 		sess.ContextFinger = contextFingerprint(history)
 		sess.ContextHistory = history
 		sess.Tenant = tenant
@@ -493,6 +495,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		CreatedAt:      now,
 		LastUsedAt:     now,
 		IPFingerprint:  clientIPFingerprint(r),
+		ClientIP:       clientIP(r),
 		UserField:      body.User,
 		ContextFinger:  contextFingerprint(history),
 		ContextHistory: history,
