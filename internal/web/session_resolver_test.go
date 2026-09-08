@@ -102,6 +102,48 @@ func resolverTestRequest(ip, ua, user string) *http.Request {
 	return r
 }
 
+// TestResolveReturnsBoundAccountPinsRoutingHint: when a conversation is matched
+// by the resolver, its bound account is returned as a routing hint. openaiChat
+// copies it into body.AccountID via firstNonEmpty; the account is NOT
+// client-pinned and must remain failoverable when it gets throttled. This test
+// locks the premise so removing the account hint (or pinning it) is a visible
+// regression.
+func TestResolveReturnsBoundAccount(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	sr := openSessionResolver()
+	sr.Bind("", "conv-jayz", "f205e3da-b084-438f-917f-2cc2ae057052",
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "第一轮问题"},
+			{Role: "assistant", Content: "第一轮回答"},
+		}},
+		"",
+		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+	res := sr.Resolve(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "第一轮问题"},
+			{Role: "assistant", Content: "第一轮回答"},
+			{Role: "user", Content: "第二轮问题"},
+		}})
+	if res.IsNew {
+		t.Fatal("incremental request should reuse the bound conversation")
+	}
+	if res.AccountID != "f205e3da-b084-438f-917f-2cc2ae057052" {
+		t.Fatalf("expected resolver to return the bound account, got %q", res.AccountID)
+	}
+
+	// Mirror openaiChat's merge: a request without its own accountId takes the
+	// resolved account as a routing hint, not as a client pin.
+	body := &oaiReq{AccountID: ""}
+	if got := firstNonEmpty(body.AccountID, res.AccountID); got != "f205e3da-b084-438f-917f-2cc2ae057052" {
+		t.Fatalf("firstNonEmpty must adopt the resolved account, got %q", got)
+	}
+	clientPinned := body.AccountID != ""
+	if clientPinned {
+		t.Fatal("resolved account must not be treated as client-pinned")
+	}
+}
+
 func TestResolverIncrementalBoundary(t *testing.T) {
 	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
 	sr := openSessionResolver()

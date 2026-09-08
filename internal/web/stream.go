@@ -29,6 +29,9 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "message required")
 		return
 	}
+	// Only a client-supplied accountId pins the stream to one account; an
+	// account restored from sessionKey is a routing hint and may fail over.
+	clientPinnedAccount := body.AccountID != ""
 	if body.SessionKey != "" {
 		if v, ok := s.sessions.get(body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
@@ -62,7 +65,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, streamReq)
 	triedAccountIDs := map[string]bool{acc.ID: true}
-	for err != nil && body.AccountID == "" && canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
+	for err != nil && !clientPinnedAccount && canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
 		next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
 		if nerr != nil {
 			break

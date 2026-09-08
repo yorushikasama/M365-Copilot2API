@@ -1314,6 +1314,8 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "message or attachment required")
 		return
 	}
+	// See openaiChat: only a client-supplied accountId pins the request.
+	clientPinnedAccount := body.AccountID != ""
 	if body.SessionKey != "" {
 		if v, ok := s.sessions.get(body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
@@ -1359,7 +1361,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		triedAccountIDs := map[string]bool{acc.ID: true}
-		for body.AccountID == "" && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "") && r.Context().Err() == nil {
+		for !clientPinnedAccount && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "") && r.Context().Err() == nil {
 			next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
 			if nerr != nil {
 				break
@@ -1755,6 +1757,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	body.ConversationID = firstNonEmpty(body.ConversationID, body.ConversationIDC)
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
+	// Only a client-supplied accountId pins the request to one account. Account
+	// IDs restored later by sessionKey, user session, or the session resolver
+	// are routing hints, not client intent: when that account fails, failover must
+	// still be allowed instead of returning 429 to the caller.
+	clientPinnedAccount := body.AccountID != ""
 	if err := validateToolConversation(body.Messages); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
 		return
@@ -1962,7 +1969,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if routeErr != nil {
 			triedAccountIDs := map[string]bool{acc.ID: true}
-			for body.AccountID == "" && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
+			for !clientPinnedAccount && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
 				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
 				if nerr != nil {
 					break
@@ -2078,7 +2085,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			text.WriteString(ev.Text)
 			return emitText(ev.Text)
 		})
-		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && !clientPinnedAccount && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			// Retry every eligible account only while no business delta or tool call
 			// has reached the client. Once output starts, never splice accounts.
 			triedAccountIDs := map[string]bool{acc.ID: true}
@@ -2236,7 +2243,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 		if routeErr != nil {
 			triedAccountIDs := map[string]bool{acc.ID: true}
-			for body.AccountID == "" && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
+			for !clientPinnedAccount && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
 				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
 				if nerr != nil {
 					break
@@ -2389,7 +2396,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return onReasoning(reasoning)
 		}
 		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDeltaWrapped, onReasoningWrapped)
-		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && streamedReasoningLen == 0 && !convReused && !clientPinnedAccount && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			triedAccountIDs := map[string]bool{acc.ID: true}
 			for streamedReasoningLen == 0 && canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
 				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
@@ -2494,7 +2501,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		// A slow or half-open upstream is retryable but used to reach no failover
 		// at all, so the very first WS_READ_TIMEOUT surfaced as a hard 502.
 		retryBudget, transportRetry := shouldFailoverTransport(ctx, err)
-		if err != nil && !convReused && body.AccountID == "" && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && !convReused && !clientPinnedAccount && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
 			triedAccountIDs := map[string]bool{acc.ID: true}
 			for canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
 				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
