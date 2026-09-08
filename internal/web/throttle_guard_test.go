@@ -49,6 +49,9 @@ func TestMarkFailureExhaustedMeteringCoolsToMidnight(t *testing.T) {
 	if !ok {
 		t.Fatal("cooldown must be recorded")
 	}
+	// Compare against the actual next UTC midnight rather than a fixed
+	// duration: a hardcoded ">12h" only holds before 12:00 UTC and fails
+	// for the rest of the day.
 	expected := nextUTCMidnight()
 	if delta := until.Sub(expected); delta < -time.Second || delta > time.Second {
 		t.Fatalf("exhausted cooldown until=%v, want next UTC midnight %v", until, expected)
