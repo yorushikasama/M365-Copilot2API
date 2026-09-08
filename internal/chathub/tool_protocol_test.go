@@ -94,9 +94,13 @@ func TestToolProtocolPromptNoToolsWithPluginsEmitsExecutionGuard(t *testing.T) {
 }
 
 func TestToolProtocolPromptNoToolsNoPluginsOmitsGuard(t *testing.T) {
-	// Plain chat with no execution capability must not be primed as an agent.
+	// Degenerate branch only: hasPlugins is false solely when tools are
+	// present but every one fails to parse. It is NOT the shape of a plain
+	// tool-less chat — clientPlugins() falls back to a built-in plugin
+	// whenever tools are empty, so a tool-less request arrives with
+	// hasPlugins == true and does receive the guard (covered above).
 	text := toolProtocolPrompt("hello", nil, nil, false)
 	if strings.Contains(text, "/mnt/data") {
-		t.Fatalf("plain chat must not carry the execution guard: %s", text)
+		t.Fatalf("no-capability branch must not carry the execution guard: %s", text)
 	}
 }

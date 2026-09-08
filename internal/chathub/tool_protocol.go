@@ -6,17 +6,24 @@ import (
 	"strings"
 )
 
-// windowsExecutionGuard is the caller-side execution contract. It must be
-// emitted whenever the request carries caller execution capability, i.e.
-// native tools or an MCP gateway plugin. Without it, upstream models drift
-// into describing their own cloud/container sandbox ("/mnt/data", "Linux
-// container") and refuse to act on Windows paths.
+// windowsExecutionGuard is the caller-side execution contract: tools run on
+// the caller's Windows machine, never in an upstream sandbox. Without it,
+// upstream models drift into describing their own environment ("/mnt/data",
+// "Linux container") and refuse to act on Windows paths.
 //
-// Historically this guard lived only in the "tools inlined as fenced schema"
-// branch. But clientPlugins() always registers an "mcp-gateway" plugin
-// whenever an MCP gateway URL is configured, so in production hasPlugins was
-// effectively always true and both hasPlugins early-returns skipped the guard
-// entirely — leaving the weaker executionAnchor as the only mitigation.
+// This guard used to be unreachable dead code, not merely rarely hit. It sat
+// only in the branch that inlines tool schemas, which is guarded by
+// hasPlugins == false. But clientPlugins() registers a plugin for every
+// *valid* tool, and building a non-empty defs list requires at least one
+// valid tool — so hasPlugins is true whenever defs is non-empty. The guard
+// therefore required hasPlugins == false and len(defs) > 0 simultaneously,
+// which is impossible. Both `if hasPlugins` early-returns skipped it, leaving
+// only the weaker executionAnchor as live mitigation.
+//
+// Note the guard now applies to essentially every request: clientPlugins()
+// falls back to a built-in plugin whenever tools are empty, and registers an
+// mcp-gateway plugin whenever a gateway URL is configured, so hasPlugins is
+// almost always true in practice.
 const windowsExecutionGuard = "You are an execution agent on the caller's Windows machine. The tools available to you are real, active, and callable right now, and they are executed by the caller on its own machine, not by you in any remote environment. The bash tool runs Windows PowerShell 5.1; Windows paths like D:\\ are directly accessible. Do NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. Do NOT emit backtick-backtick-backtick-python or backtick-backtick-backtick-code blocks for execution — if you need to run code, use the bash tool. Do NOT mention Linux containers, /mnt/data, cloud sandboxes, or claim the execution environment has changed. Do NOT claim the caller workspace is not mounted, is unmounted, or is otherwise unavailable or inaccessible."
 
 // toolCallConvention explains how to emit a call when definitions are inlined
