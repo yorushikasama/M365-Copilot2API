@@ -142,10 +142,10 @@ func (m *ipManager) remove(id string) error {
 	return os.ErrNotExist
 }
 
-func (m *ipManager) blocked(ip string) bool {
+func (m *ipManager) match(ip string) (IPRule, bool) {
 	a, err := netip.ParseAddr(strings.TrimSpace(ip))
 	if err != nil {
-		return false
+		return IPRule{}, false
 	}
 	a = a.Unmap()
 	m.mu.RLock()
@@ -153,10 +153,15 @@ func (m *ipManager) blocked(ip string) bool {
 	for _, r := range m.rules {
 		p, err := netip.ParsePrefix(r.Prefix)
 		if err == nil && p.Contains(a) {
-			return true
+			return r, true
 		}
 	}
-	return false
+	return IPRule{}, false
+}
+
+func (m *ipManager) blocked(ip string) bool {
+	_, matched := m.match(ip)
+	return matched
 }
 
 type IPResolution struct {
@@ -209,7 +214,20 @@ func (s *Server) ipManagement(w http.ResponseWriter, r *http.Request) {
 		if n, err := strconv.Atoi(r.URL.Query().Get("days")); err == nil && n > 0 && n <= 365 {
 			days = n
 		}
-		jsonOut(w, map[string]any{"days": days, "rules": s.ipManager.list(), "ips": s.usage.ipSnapshot(days)})
+		ips := s.usage.ipSnapshot(days)
+		for _, item := range ips {
+			ip, _ := item["ip"].(string)
+			rule, blocked := s.ipManager.match(ip)
+			item["blocked"] = blocked
+			if blocked {
+				item["matched_rule"] = rule
+				item["matchedRule"] = rule
+			} else {
+				item["matched_rule"] = nil
+				item["matchedRule"] = nil
+			}
+		}
+		jsonOut(w, map[string]any{"days": days, "rules": s.ipManager.list(), "ips": ips})
 	case http.MethodPost:
 		var body struct{ Prefix, Note string }
 		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body) != nil {

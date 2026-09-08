@@ -31,6 +31,10 @@ func main() {
 	s.InitM365CloudClient()
 	s.StartAutoCleanup()
 	s.StartConvCacheGC()
+	// Background recovery probe: silently re-validate accounts whose quota
+	// cooldown expired, so the first real user after expiry never hits the
+	// upstream throttle itself (new-api channel-test pattern).
+	s.StartCooldownProber()
 	s.RefreshExpiredTokens()
 	// Warm the WebSocket pool so the first requests skip dial+handshake; the
 	// pool keeps itself warm afterwards via Return and re-warm on hits.

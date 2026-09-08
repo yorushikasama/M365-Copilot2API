@@ -322,6 +322,23 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 	}
 }
 
+// chatQuotaExhausted reports whether a metering error proves the chat (LLM)
+// capability's allowance is fully consumed for today. Only an explicit
+// remainingAllowance of 0 for the LLM capability counts: an image-side zero is
+// the image path's business, and an unparseable payload keeps the generic
+// exponential backoff.
+func chatQuotaExhausted(err error) bool {
+	var mErr *chathub.MeteringError
+	if !errors.As(err, &mErr) {
+		return false
+	}
+	remaining := remainingAllowances(mErr.Throttling)
+	if v, ok := remaining["LLMOnly"]; ok {
+		return v <= 0
+	}
+	return false
+}
+
 type globalCircuitState struct {
 	mu          sync.Mutex
 	windowStart time.Time
@@ -536,6 +553,33 @@ func (h *accountHealth) RateLimited(accountID string) bool {
 	defer h.mu.Unlock()
 	h.cleanupExpiredCooldownLocked(accountID)
 	return h.limited[accountID]
+}
+
+// RemainingCooldown reports how much of the account's quota-429 cooldown is
+// still left. It is true only while the account is marked limited AND the
+// cooldown has not expired; this is the gate for the local throttle
+// short-circuit, so an expired cooldown correctly falls through to a real
+// upstream probe (metering recovery is silent upstream — the first request
+// after expiry is the probe).
+func (h *accountHealth) RemainingCooldown(accountID string) (time.Duration, bool) {
+	if h == nil {
+		return 0, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cleanupExpiredCooldownLocked(accountID)
+	if !h.limited[accountID] {
+		return 0, false
+	}
+	until, ok := h.cooldown[accountID]
+	if !ok {
+		return 0, false
+	}
+	d := time.Until(until)
+	if d <= 0 {
+		return 0, false
+	}
+	return d, true
 }
 
 // nextUTCMidnight is when the upstream daily image allowance resets.
@@ -881,6 +925,17 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		attempt := h.quotaAttempts[accountID] + 1
 		h.quotaAttempts[accountID] = attempt
 		cd := CooldownForCategory(cat, RetryAfterSeconds(err), attempt)
+		if chatQuotaExhausted(err) {
+			// The throttling payload proves the chat capability's
+			// remainingAllowance is 0: the daily metering bucket is empty and
+			// only refills at UTC midnight. A 30s→30min backoff would keep
+			// re-probing a dry account every 30 minutes, so cool down to the
+			// reset instead (same shape as the image-side exhaustion paths).
+			cd = time.Until(nextUTCMidnight())
+			if cd < time.Minute {
+				cd = time.Minute
+			}
+		}
 		h.cooldown[accountID] = time.Now().Add(cd)
 		return
 	case CategoryOverload503:
@@ -978,6 +1033,51 @@ func (h *accountHealth) Available(accountID string) bool {
 	return true
 }
 
+// ChatAvailable reports whether the account should still receive chat turns.
+// On top of Available it consults the locally tracked metering allowance: an
+// account whose estimated LLM allowance has been observed and is exhausted is
+// skipped for chat even though it is not in cooldown, so rotation prefers
+// accounts with headroom instead of bouncing off the upstream throttle.
+// The estimate only exists after UpdateMetering observed real metering data;
+// accounts without observations are always chat-available.
+//
+// Estimates only ratchet down (UpdateMetering keeps the minimum), so an
+// exhausted reading must not outlive the metering day it was observed in —
+// the upstream bucket resets at UTC midnight. On a later UTC day the stale
+// estimate is dropped and the account is re-admitted; its next request then
+// doubles as the fresh-metering probe.
+func (h *accountHealth) ChatAvailable(accountID string) bool {
+	if h == nil {
+		return true
+	}
+	if !h.Available(accountID) {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	est, ok := h.allowanceEstimated[accountID]
+	if !ok {
+		return true
+	}
+	v, ok := est["LLMOnly"]
+	if !ok || v > 0 {
+		return true
+	}
+	if updated := h.allowanceUpdatedAt[accountID]; sameUTCDay(updated, time.Now()) {
+		return false
+	}
+	delete(h.allowanceEstimated, accountID)
+	delete(h.allowanceConsumed, accountID)
+	return true
+}
+
+// sameUTCDay reports whether both instants fall on the same UTC calendar day,
+// the granularity the upstream metering buckets reset on.
+func sameUTCDay(a, b time.Time) bool {
+	ua, ub := a.UTC(), b.UTC()
+	return ua.Year() == ub.Year() && ua.YearDay() == ub.YearDay()
+}
+
 func (h *accountHealth) CooldownUntil(accountID string) (time.Time, bool) {
 	if h == nil {
 		return time.Time{}, false
@@ -990,6 +1090,33 @@ func (h *accountHealth) CooldownUntil(accountID string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return until, true
+}
+
+// ExpiredLimitedCooldowns snapshots the accounts still marked limited whose
+// quota cooldown deadline has passed. Unlike every other reader it must NOT
+// run cleanupExpiredCooldownLocked inline: the cooldown prober relies on
+// observing the expired-but-uncleaned window to schedule its recovery probe,
+// and dropping the limited mark here would silently hide those accounts from
+// it. Cleanup stays the job of the next real reader (or the probe itself).
+func (h *accountHealth) ExpiredLimitedCooldowns() map[string]time.Time {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now()
+	out := make(map[string]time.Time)
+	for id, limited := range h.limited {
+		if !limited {
+			continue
+		}
+		until, ok := h.cooldown[id]
+		if !ok || now.Before(until) {
+			continue
+		}
+		out[id] = until
+	}
+	return out
 }
 
 func (h *accountHealth) Snapshot() map[string]map[string]any {

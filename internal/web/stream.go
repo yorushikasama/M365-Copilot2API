@@ -31,7 +31,8 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	// Only a client-supplied accountId pins the stream to one account; an
 	// account restored from sessionKey is a routing hint and may fail over.
-	clientPinnedAccount := body.AccountID != ""
+	// X-M365-Allow-Failover:true lifts the pin's veto over failover.
+	clientPinnedAccount := body.AccountID != "" && !allowFailoverRequested(r)
 	if body.SessionKey != "" {
 		if v, ok := s.sessions.get(body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
@@ -42,6 +43,13 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	acc, err := s.resolveAccount(body.AccountID)
 	if err != nil {
 		writeUpstreamError(w, err)
+		return
+	}
+	// Cooldown gate: answer 429 locally for an account still inside its quota
+	// cooldown instead of forwarding upstream; with X-M365-Allow-Failover the
+	// gate fails over to a healthy account instead (see handleCooldownGate in
+	// throttle_guard.go).
+	if !s.handleCooldownGate(r, w, &acc) {
 		return
 	}
 	if acc.OID == "" || acc.TID == "" {

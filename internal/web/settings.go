@@ -75,6 +75,16 @@ type runtimeSettings struct {
 	EnableDesignerImageGen4o   bool           `json:"enableDesignerImageGen4o"`
 	EnableCodeCanvas           bool           `json:"enableCodeCanvas"`
 	EnableSydneyReconnect      bool           `json:"enableSydneyReconnect"`
+	// FailoverMaxAttempts caps account failover inside one request (router and
+	// answer turns) so a widely-degraded pool cannot spin a request until its
+	// timeout. Env: M365_FAILOVER_MAX_ATTEMPTS.
+	FailoverMaxAttempts int `json:"failoverMaxAttempts"`
+	// Router prompt slimming (see router_prompt.go). Env:
+	// M365_ROUTER_PROMPT_SLIMMING=false disables, M365_ROUTER_PROMPT_TAIL_MESSAGES
+	// / M365_ROUTER_PROMPT_MAX_BYTES tune the window.
+	RouterPromptSlimming     bool `json:"routerPromptSlimming"`
+	RouterPromptTailMessages int  `json:"routerPromptTailMessages"`
+	RouterPromptMaxBytes     int  `json:"routerPromptMaxBytes"`
 }
 
 type settingsStore struct {
@@ -124,6 +134,10 @@ func defaultRuntimeSettings() runtimeSettings {
 		EnableDesignerImageGen4o:   os.Getenv("M365_ENABLE_DESIGNER_IMAGE_GEN_4O") == "true",
 		EnableCodeCanvas:           os.Getenv("M365_ENABLE_CODE_CANVAS") == "true",
 		EnableSydneyReconnect:      os.Getenv("M365_ENABLE_SYDNEY_RECONNECT") == "true",
+		FailoverMaxAttempts:        envInt("M365_FAILOVER_MAX_ATTEMPTS", 3),
+		RouterPromptSlimming:       os.Getenv("M365_ROUTER_PROMPT_SLIMMING") != "false",
+		RouterPromptTailMessages:   envInt("M365_ROUTER_PROMPT_TAIL_MESSAGES", 4),
+		RouterPromptMaxBytes:       envInt("M365_ROUTER_PROMPT_MAX_BYTES", 4096),
 	}
 }
 func settingsPath() string {
@@ -230,6 +244,15 @@ func validateSettings(v runtimeSettings) error {
 	}
 	if v.AccountConcurrencyLimit < 1 || v.AccountConcurrencyLimit > 64 {
 		return fmt.Errorf("账号并发上限必须为 1-64")
+	}
+	if v.FailoverMaxAttempts < 1 || v.FailoverMaxAttempts > 16 {
+		return fmt.Errorf("failover 最大尝试数必须为 1-16")
+	}
+	if v.RouterPromptTailMessages < 1 || v.RouterPromptTailMessages > 20 {
+		return fmt.Errorf("路由瘦身保留消息数必须为 1-20")
+	}
+	if v.RouterPromptMaxBytes < 256 || v.RouterPromptMaxBytes > 65536 {
+		return fmt.Errorf("路由瘦身单窗字节上限必须为 256-65536")
 	}
 	if strings.TrimSpace(v.Scenario) == "" {
 		return fmt.Errorf("场景标识不能为空")

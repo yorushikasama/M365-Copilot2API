@@ -35,6 +35,13 @@ func TestIPManagerCIDRRemoveAndResolve(t *testing.T) {
 	if !m.blocked("192.0.2.42") || m.blocked("192.0.3.1") {
 		t.Fatal("CIDR matching incorrect")
 	}
+	matched, ok := m.match("192.0.2.42")
+	if !ok || matched.ID != rule.ID || matched.Prefix != "192.0.2.0/24" {
+		t.Fatalf("matched rule=%+v ok=%v", matched, ok)
+	}
+	if _, ok := m.match("192.0.3.1"); ok {
+		t.Fatal("unexpected rule match outside CIDR")
+	}
 	if err := m.remove(rule.ID); err != nil || m.blocked("192.0.2.42") {
 		t.Fatal("remove failed")
 	}

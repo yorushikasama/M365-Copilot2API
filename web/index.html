@@ -189,6 +189,17 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
 .copy-field{display:flex;gap:8px;align-items:center;margin:8px 0}
 .copy-field .form-input{flex:1;font-family:SF Mono,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 
+/* IP management */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.ip-form-grid{display:grid;grid-template-columns:minmax(220px,1fr) minmax(180px,1fr) auto;gap:10px;align-items:end}
+.ip-toolbar{display:grid;grid-template-columns:minmax(180px,1fr) auto auto;gap:8px;margin-top:16px}
+.ip-toolbar .form-input,#ipDays{width:100%}
+.ip-rule-match{display:block;margin-top:4px;font-size:11px;color:var(--muted)}
+.ip-cell-actions{display:flex;gap:6px;align-items:center;white-space:nowrap}
+@media(max-width:760px){.ip-form-grid,.ip-toolbar{grid-template-columns:1fr}.ip-form-grid .btn{width:100%}.page-head{align-items:flex-start;flex-wrap:wrap}.table-scroll .table{min-width:760px}}
+@media(prefers-reduced-motion:reduce){.modal-overlay,.modal{transition:none}}
+
 /* Modal */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.3);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);display:none;align-items:center;justify-content:center;z-index:50}
 .modal-overlay.open{display:flex}
@@ -425,6 +436,18 @@ if (response.output_text) {
           </div>
         </div>
         <div class="card">
+          <div class="card-head"><span class="card-title">429 / 限流监控</span><span style="font-size:11px;color:var(--muted)">24h 滚动窗口</span><button class="btn btn-sm" style="margin-left:auto" onclick="loadThrottleStats()">刷新</button></div>
+          <div class="card-body">
+            <div class="stats" style="margin-bottom:10px">
+              <div class="stat"><span class="stat-label">上游 429</span><span class="stat-value" id="ts-upstream">0</span><span class="stat-unit">次</span></div>
+              <div class="stat"><span class="stat-label">本地短路</span><span class="stat-value" id="ts-local">0</span><span class="stat-unit">次</span></div>
+              <div class="stat"><span class="stat-label">防抖回放</span><span class="stat-value" id="ts-debounce">0</span><span class="stat-unit">次</span></div>
+              <div class="stat"><span class="stat-label">故障转移</span><span class="stat-value" id="ts-failover">0</span><span class="stat-unit">次</span></div>
+            </div>
+            <div class="table-scroll"><table class="table"><thead><tr><th>时间</th><th>类型</th><th>账号</th><th>详情</th></tr></thead><tbody id="throttleRows"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody></table></div>
+          </div>
+        </div>
+        <div class="card">
           <div class="card-head"><span class="card-title">Quick actions</span></div>
           <div class="card-body">
             <div class="quick-grid">
@@ -586,9 +609,22 @@ if (response.output_text) {
 
       <!-- IP Management -->
       <section id="page-ipmanagement" style="display:none">
-        <div class="page-head"><div><h2 class="page-title">IP Management</h2><p class="page-sub">View client request volume, resolve addresses, and manage block rules</p></div><button class="btn" onclick="loadIPManagement()">Refresh</button></div>
-        <div class="card" style="margin-bottom:16px"><div class="card-head"><span class="card-title">Block IP / CIDR</span></div><div class="card-body"><div style="display:flex;gap:8px;flex-wrap:wrap"><input class="form-input" id="ipRulePrefix" placeholder="203.0.113.10 or 203.0.113.0/24" style="flex:1;min-width:220px"><input class="form-input" id="ipRuleNote" placeholder="Optional note" style="flex:1;min-width:180px"><button class="btn danger" onclick="addIPRule()">Block</button></div></div></div>
-        <div class="card"><div class="card-head"><span class="card-title">Client IP usage</span><select class="form-input" id="ipDays" style="width:110px" onchange="loadIPManagement()"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></div><table class="table"><thead><tr><th>IP address</th><th>Requests</th><th>Tokens</th><th>Last seen</th><th>Resolved address</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ipRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table></div>
+        <div class="page-head"><div><h2 class="page-title">IP Management</h2><p class="page-sub">Manage blocking rules separately from observed client traffic</p></div><button class="btn" id="ipRefresh" onclick="loadIPManagement()">Refresh</button></div>
+        <div class="card" style="margin-bottom:16px" aria-labelledby="ipRulesTitle">
+          <div class="card-head"><div><span class="card-title" id="ipRulesTitle">Block rules</span><p class="form-hint">Create and review exact IP or CIDR rules</p></div></div>
+          <div class="card-body">
+            <form id="ipRuleForm" onsubmit="event.preventDefault();addIPRule()">
+              <div class="ip-form-grid"><label><span class="form-label">IP or CIDR</span><input class="form-input" id="ipRulePrefix" placeholder="203.0.113.10 or 203.0.113.0/24" autocomplete="off" required></label><label><span class="form-label">Note</span><input class="form-input" id="ipRuleNote" placeholder="Optional note" autocomplete="off"></label><button class="btn danger" id="ipRuleSubmit" type="submit">Block</button></div>
+            </form>
+            <div class="ip-toolbar" role="search"><label><span class="sr-only">Search rules</span><input class="form-input" id="ipRuleSearch" placeholder="Search rules" oninput="renderIPRules()"></label><label><span class="sr-only">Rule status</span><select class="form-input" id="ipRuleStatus" onchange="renderIPRules()"><option value="all">All rules</option><option value="matching">Matching traffic</option><option value="idle">No matching traffic</option></select></label><label><span class="sr-only">Sort rules</span><select class="form-input" id="ipRuleSort" onchange="renderIPRules()"><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="prefix">Prefix A–Z</option></select></label></div>
+          </div>
+          <div class="table-scroll"><table class="table"><thead><tr><th>Prefix</th><th>Note</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ipRuleRows"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody></table></div>
+        </div>
+        <div class="card" aria-labelledby="ipTrafficTitle">
+          <div class="card-head"><div><span class="card-title" id="ipTrafficTitle">Traffic observations</span><p class="form-hint">Request volume and rule matches seen by the gateway</p></div><select class="form-input" id="ipDays" aria-label="Observation period" onchange="loadIPManagement()"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></div>
+          <div class="card-body"><div class="ip-toolbar" role="search"><label><span class="sr-only">Search traffic</span><input class="form-input" id="ipTrafficSearch" placeholder="Search IP addresses" oninput="renderIPTraffic()"></label><label><span class="sr-only">Traffic status</span><select class="form-input" id="ipTrafficStatus" onchange="renderIPTraffic()"><option value="all">All statuses</option><option value="blocked">Blocked</option><option value="active">Active</option></select></label><label><span class="sr-only">Sort traffic</span><select class="form-input" id="ipTrafficSort" onchange="renderIPTraffic()"><option value="requests">Most requests</option><option value="recent">Most recent</option><option value="ip">IP address</option></select></label></div></div>
+          <div class="table-scroll"><table class="table"><thead><tr><th>IP address</th><th>Requests</th><th>Tokens</th><th>Last seen</th><th>Resolved address</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ipRows" aria-live="polite"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table></div>
+        </div>
       </section>
       <!-- Proxy Pool -->
       <section id="page-proxies" style="display:none">
@@ -692,7 +728,20 @@ if (response.output_text) {
   </div>
 </div>
 
-<div class="notice" id="notice" style="display:none"></div>
+<!-- IP Action Confirmation Modal -->
+<div class="modal-overlay" id="ipConfirmModal" role="dialog" aria-modal="true" aria-labelledby="ipConfirmTitle" aria-describedby="ipConfirmMessage" onclick="if(event.target===this)closeIPConfirm(false)">
+  <div class="modal" tabindex="-1">
+    <h3 id="ipConfirmTitle">Confirm action</h3>
+    <p class="subtitle" id="ipConfirmMessage"></p>
+    <div id="ipConfirmWarning" class="alert" style="display:none;margin-top:12px"></div>
+    <div class="modal-actions">
+      <button class="btn" type="button" onclick="closeIPConfirm(false)">Cancel</button>
+      <button class="btn danger" id="ipConfirmButton" type="button" onclick="closeIPConfirm(true)">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div class="notice" id="notice" role="status" aria-live="polite" style="display:none"></div>
 
 <script>
 const $=id=>document.getElementById(id);
@@ -1000,7 +1049,7 @@ function showPage(p){
     document.querySelector('[data-page="'+k+'"]')?.classList.toggle('active',k===p);
   });
   $('pageTitle').textContent=pages[p];
-  if(p==='dashboard'){loadStats();loadOnboarding();loadAccounts();}
+  if(p==='dashboard'){loadStats();loadOnboarding();loadAccounts();loadThrottleStats();}
   if(p==='usage')loadUsage();
   if(p==='accounts')loadAccounts();
   if(p==='apikeys')loadKeys();
@@ -1143,6 +1192,27 @@ async function loadRecentRequests(){
     </tr>`).join('');
     $('dashRecentRows').innerHTML=rows||'<tr><td colspan="5" class="empty">No requests yet</td></tr>';
   }catch(e){$('dashRecentRows').innerHTML=`<tr><td colspan="5" class="empty">No requests yet</td></tr>`;}
+}
+
+const _throttleKindLabel={upstream_429:'上游429',local_shortcircuit:'本地短路',debounce_replay:'防抖回放',failover:'故障转移',probe_recovered:'探活恢复',probe_failed:'探活失败'};
+async function loadThrottleStats(){
+  try{
+    const d=await api('/api/throttle-stats');
+    const t=d.totals||{};
+    $('ts-upstream').textContent=t.upstream429||0;
+    $('ts-local').textContent=t.localShortCircuit||0;
+    $('ts-debounce').textContent=t.debounceReplay||0;
+    $('ts-failover').textContent=t.failovers||0;
+    const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    const rows=(d.events||[]).slice(0,12).map(e=>{
+      const acct=e.accountId?e.accountId.slice(0,8):'—';
+      const dt=e.at?new Date(e.at).toLocaleTimeString():'';
+      const label=_throttleKindLabel[e.kind]||e.kind;
+      const color=e.kind==='probe_recovered'?'#28a745':(e.kind==='upstream_429'||e.kind==='local_shortcircuit'||e.kind==='probe_failed')?'var(--red,#ff3b30)':'var(--muted)';
+      return `<tr><td style="font-size:12px;color:var(--muted)">${dt}</td><td style="font-size:12px;font-weight:600;color:${color}">${esc(label)}</td><td style="font-size:12px" title="${esc(e.accountId||'')}">${esc(acct)}</td><td style="font-size:12px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.detail||'')}">${esc(e.detail||'')}</td></tr>`;
+    }).join('');
+    $('throttleRows').innerHTML=rows||'<tr><td colspan="4" class="empty">窗口内无限流事件</td></tr>';
+  }catch(e){$('throttleRows').innerHTML=`<tr><td colspan="4" class="empty">${esc(e.message)}</td></tr>`;}
 }
 
 let _accountsCache=[],_accountFilter='all';
@@ -1627,52 +1697,104 @@ async function cleanupAll(){
   showNotice('清理完成','success');loadConversations();
 }
 
+let ipManagementState={rules:[],ips:[],resolved:new Map()};
+let ipConfirmResolve=null;
+function ipRuleFor(row){return row.matched_rule||row.matchedRule||null;}
+function setIPTableState(id,columns,text){$(id).innerHTML=`<tr><td colspan="${columns}" class="empty">${esc(text)}</td></tr>`;}
+function confirmIPAction(title,message,confirmLabel,warning=''){
+  $('ipConfirmTitle').textContent=title;
+  $('ipConfirmMessage').textContent=message;
+  $('ipConfirmButton').textContent=confirmLabel;
+  $('ipConfirmWarning').textContent=warning;
+  $('ipConfirmWarning').style.display=warning?'block':'none';
+  $('ipConfirmModal').classList.add('open');
+  $('ipConfirmModal').querySelector('.modal').focus();
+  return new Promise(resolve=>{ipConfirmResolve=resolve;});
+}
+function closeIPConfirm(accepted){
+  $('ipConfirmModal').classList.remove('open');
+  if(ipConfirmResolve){const resolve=ipConfirmResolve;ipConfirmResolve=null;resolve(accepted);}
+}
+function renderIPRules(){
+  const query=($('ipRuleSearch')?.value||'').trim().toLowerCase();
+  const status=$('ipRuleStatus')?.value||'all';
+  const sort=$('ipRuleSort')?.value||'newest';
+  const matching=new Set(ipManagementState.ips.filter(x=>x.blocked).map(x=>ipRuleFor(x)?.id).filter(Boolean));
+  let rows=ipManagementState.rules.filter(rule=>{
+    const hit=matching.has(rule.id);
+    return (!query||(rule.prefix+' '+(rule.note||'')).toLowerCase().includes(query))&&(status==='all'||(status==='matching'&&hit)||(status==='idle'&&!hit));
+  });
+  rows.sort((a,b)=>sort==='prefix'?a.prefix.localeCompare(b.prefix):sort==='oldest'?new Date(a.createdAt)-new Date(b.createdAt):new Date(b.createdAt)-new Date(a.createdAt));
+  $('ipRuleRows').innerHTML=rows.length?rows.map(rule=>{
+    const hit=matching.has(rule.id);
+    return `<tr><td><code>${esc(rule.prefix)}</code></td><td>${esc(rule.note||'-')}</td><td>${rule.createdAt?new Date(rule.createdAt).toLocaleString():'-'}</td><td>${hit?'<span class="status offline"><i></i>Matching traffic</span>':'<span class="status"><i></i>No matching traffic</span>'}</td><td><button class="btn-sm btn danger" aria-label="Remove rule ${esc(rule.prefix)}" onclick="removeIPRule('${esc(rule.id)}')">Remove rule</button></td></tr>`;
+  }).join(''):`<tr><td colspan="5" class="empty">${ipManagementState.rules.length?'No rules match the current filters':'No block rules'}</td></tr>`;
+  applyLocale(currentLocale);
+}
+function renderIPTraffic(){
+  const query=($('ipTrafficSearch')?.value||'').trim().toLowerCase();
+  const status=$('ipTrafficStatus')?.value||'all';
+  const sort=$('ipTrafficSort')?.value||'requests';
+  let rows=ipManagementState.ips.filter(row=>(!query||String(row.ip).toLowerCase().includes(query))&&(status==='all'||(status==='blocked'&&row.blocked)||(status==='active'&&!row.blocked)));
+  rows.sort((a,b)=>sort==='ip'?String(a.ip).localeCompare(String(b.ip)):sort==='recent'?new Date(b.lastSeen)-new Date(a.lastSeen):(b.requests||0)-(a.requests||0));
+  $('ipRows').innerHTML=rows.length?rows.map(row=>{
+    const rule=ipRuleFor(row),cached=ipManagementState.resolved.get(row.ip);
+    const resolved=cached?resolvedIPHTML(cached):`<button class="btn-sm btn" onclick="resolveIP('${esc(row.ip)}',this)">Resolve</button>`;
+    const match=rule?`<small class="ip-rule-match">Matched ${esc(rule.prefix)}</small>`:'';
+    return `<tr data-ip-row="${esc(row.ip)}"><td><code>${esc(row.ip)}</code></td><td>${row.requests||0}</td><td>${row.tokens||0}</td><td>${row.lastSeen?new Date(row.lastSeen).toLocaleString():'-'}</td><td class="ip-resolved">${resolved}</td><td>${row.blocked?'<span class="status offline"><i></i>Blocked</span>':'<span class="status online"><i></i>Active</span>'}${match}</td><td><div class="ip-cell-actions">${rule?`<button class="btn-sm btn" onclick="removeIPRule('${esc(rule.id)}')">Unblock</button>`:`<button class="btn-sm btn danger" onclick="quickBlockIP('${esc(row.ip)}')">Block</button>`}</div></td></tr>`;
+  }).join(''):`<tr><td colspan="7" class="empty">${ipManagementState.ips.length?'No traffic matches the current filters':'No client IP usage records'}</td></tr>`;
+  applyLocale(currentLocale);
+}
 async function loadIPManagement(){
+  const refresh=$('ipRefresh');
+  refresh.disabled=true;
+  setIPTableState('ipRuleRows',5,'Loading...');
+  setIPTableState('ipRows',7,'Loading...');
   try{
     const days=$('ipDays').value||30;
-    const d=await api('/api/admin/ip-management?days='+encodeURIComponent(days));
-    const rules=d.rules||[], ruleMap={}; rules.forEach(x=>ruleMap[x.prefix]=x);
-    const rows=d.ips||[];
-    $('ipRows').innerHTML=rows.length?rows.map(x=>{
-      const rule=ruleMap[x.ip];
-      return `<tr data-ip-row="${esc(x.ip)}"><td><code>${esc(x.ip)}</code></td><td>${x.requests||0}</td><td>${x.tokens||0}</td><td>${x.lastSeen?new Date(x.lastSeen).toLocaleString():'-'}</td><td id="ip-resolved-${esc(x.ip).replace(/[^a-zA-Z0-9_-]/g,'_')}" style="font-size:12px;color:var(--muted)"><button class="btn-sm btn" onclick="resolveIP('${esc(x.ip)}',this)">Resolve</button></td><td>${rule?'<span class="status offline"><i></i>Blocked</span>':'<span class="status online"><i></i>Active</span>'}</td><td>${rule?'<button class="btn-sm btn" onclick="removeIPRule(\''+esc(rule.id)+'\')">Unblock</button>':'<button class="btn-sm btn danger" onclick="quickBlockIP(\''+esc(x.ip)+'\')">Block</button>'}</td></tr>`;
-    }).join(''):'<tr><td colspan="7" class="empty">No client IP usage records</td></tr>';
-    applyLocale(currentLocale);
-  }catch(e){showNotice(e.message,'error');}
+    const data=await api('/api/admin/ip-management?days='+encodeURIComponent(days));
+    ipManagementState.rules=data.rules||[];
+    ipManagementState.ips=data.ips||[];
+    renderIPRules();renderIPTraffic();
+  }catch(e){
+    setIPTableState('ipRuleRows',5,'Could not load IP rules');
+    setIPTableState('ipRows',7,'Could not load traffic observations');
+    showNotice(e.message,'error');
+  }finally{refresh.disabled=false;applyLocale(currentLocale);}
+}
+function broadCIDRWarning(prefix){
+  const parts=prefix.split('/');if(parts.length!==2)return '';
+  const bits=Number(parts[1]),v6=parts[0].includes(':');
+  if((v6&&bits<=64)||(!v6&&bits<=16))return 'This broad CIDR can block a large network and may affect administrative access.';
+  return '';
 }
 async function addIPRule(){
-  const prefix=$('ipRulePrefix').value.trim(); if(!prefix)return showNotice('请输入 IP 或 CIDR','error');
-  try{await api('/api/admin/ip-management',{method:'POST',body:JSON.stringify({prefix,note:$('ipRuleNote').value.trim()})});$('ipRulePrefix').value='';$('ipRuleNote').value='';showNotice('IP 已封禁','success');loadIPManagement();}catch(e){showNotice(e.message,'error');}
+  const prefix=$('ipRulePrefix').value.trim(),note=$('ipRuleNote').value.trim();
+  if(!prefix)return showNotice('Enter an IP address or CIDR','error');
+  const observedSelf=ipManagementState.ips.some(x=>x.ip===prefix.split('/')[0]);
+  const warning=observedSelf?'This address appears in recent traffic. Blocking it may lock you out of the administration console.':broadCIDRWarning(prefix);
+  if(warning&&!await confirmIPAction('Confirm block rule',`Block ${prefix}?`,'Block',warning))return;
+  const submit=$('ipRuleSubmit');submit.disabled=true;
+  try{await api('/api/admin/ip-management',{method:'POST',body:JSON.stringify({prefix,note})});$('ipRulePrefix').value='';$('ipRuleNote').value='';showNotice('Block rule created','success');await loadIPManagement();}
+  catch(e){showNotice(e.message,'error');}finally{submit.disabled=false;}
 }
 async function quickBlockIP(ip){$('ipRulePrefix').value=ip;await addIPRule();}
-async function removeIPRule(id){if(!confirm('确定解封此 IP 规则？'))return;try{await api('/api/admin/ip-management?id='+encodeURIComponent(id),{method:'DELETE'});showNotice('IP 已解封','success');loadIPManagement();}catch(e){showNotice(e.message,'error');}}
-function localeSpan(text){const s=document.createElement('span');s.textContent=text;return s;}
-async function resolveIP(ip,button){
-  const cell=button?.closest('td');
-  if(!cell)return;
-  button.disabled=true;button.textContent='Resolving…';
-  try{
-    const d=await api('/api/admin/ip-resolve?ip='+encodeURIComponent(ip));
-    const geo=d.geo||{};
-    const place=[geo.city,geo.region,geo.country].filter(Boolean).join(', ');
-    cell.textContent='';
-    const line=document.createElement('div');
-    if(place)line.textContent=place;
-    else line.appendChild(localeSpan(d.public?'Unknown location':'Local address'));
-    const meta=document.createElement('small');
-    meta.style.cssText='display:block;color:var(--muted);margin-top:3px';
-    const names=(d.reverseDns||[]).join(', ');
-    const parts=[];
-    if(geo.isp)parts.push(document.createTextNode(geo.isp));
-    parts.push(names?document.createTextNode(names):localeSpan('No reverse DNS'));
-    parts.push(localeSpan(d.public?'Public':'Private'));
-    parts.forEach((node,i)=>{if(i)meta.appendChild(document.createTextNode(' · '));meta.appendChild(node);});
-    cell.append(line,meta);
-    applyLocale(currentLocale);
-  }catch(e){
-    button.disabled=false;button.textContent='Resolve';showNotice(e.message,'error');
-  }
+async function removeIPRule(id){
+  const rule=ipManagementState.rules.find(x=>x.id===id);if(!rule)return;
+  if(!await confirmIPAction('Remove block rule',`Remove ${rule.prefix}?`,'Remove rule'))return;
+  try{await api('/api/admin/ip-management?id='+encodeURIComponent(id),{method:'DELETE'});showNotice('Block rule removed','success');await loadIPManagement();}catch(e){showNotice(e.message,'error');}
 }
+function resolvedIPHTML(data){
+  const geo=data.geo||{},place=[geo.city,geo.region,geo.country].filter(Boolean).join(', '),names=(data.reverseDns||[]).join(', ');
+  return `<div>${esc(place||(data.public?'Unknown location':'Local address'))}</div><small style="display:block;color:var(--muted);margin-top:3px">${esc([geo.isp,names||(data.public?'No reverse DNS':'Private')].filter(Boolean).join(' · '))}</small><button class="btn-sm btn" style="margin-top:6px" onclick="resolveIP('${esc(data.ip)}',this)">Resolve again</button>`;
+}
+async function resolveIP(ip,button){
+  const cell=button?.closest('td');if(!cell)return;
+  button.disabled=true;button.textContent='Resolving…';
+  try{const data=await api('/api/admin/ip-resolve?ip='+encodeURIComponent(ip));ipManagementState.resolved.set(ip,data);cell.innerHTML=resolvedIPHTML(data);applyLocale(currentLocale);}
+  catch(e){button.disabled=false;button.textContent='Resolve';showNotice(e.message,'error');}
+}
+document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('ipConfirmModal')?.classList.contains('open'))closeIPConfirm(false);});
 function proxyRow(x){
   const inCooldown=x.cooldownUntil&&new Date(x.cooldownUntil)>new Date();
   const badge=x.health==='reachable'?'<span class="status online"><i></i>Healthy</span>':x.health==='unreachable'?'<span class="status offline"><i></i>Unreachable</span>':x.health==='upstream_error'?'<span class="status warn"><i></i>Upstream error</span>':'<span class="status">Not checked</span>';
@@ -1798,6 +1920,7 @@ async function saveSettings(){
 }
 
 setInterval(()=>{if($('page-accounts').style.display!=='none')loadAccounts();},15000);
+setInterval(()=>{const p=$('page-dashboard');if(p&&p.style.display!=='none')loadThrottleStats();},15000);
 
 async function loadAppVersion(){
   const el=$('appVersion');

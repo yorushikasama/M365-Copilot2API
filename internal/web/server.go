@@ -85,6 +85,12 @@ func (s *Server) markAccountResult(accountID string, err error) {
 		return
 	}
 	if err != nil {
+		// A real upstream quota rejection: record it for the admin 429 panel
+		// before the health state is updated, so the panel can distinguish
+		// "Microsoft said 429" from "we answered 429 locally".
+		if ClassifyError(err) == CategoryQuota429 {
+			RecordThrottleEvent(ThrottleUpstream429, accountID, err.Error())
+		}
 		s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
 		return
 	}
@@ -158,6 +164,7 @@ type Server struct {
 	generatedImages      map[string]generatedImage
 	convCache            *conversationCache
 	lastHealthyAccount   string
+	debounce             *requestDebounce
 }
 
 const maxResponsesPerTenant = 256
@@ -254,6 +261,7 @@ func New() (*Server, error) {
 		ipManager:            openIPManager(),
 		generatedImages:      map[string]generatedImage{},
 		convCache:            newConversationCache(),
+		debounce:             newRequestDebounce(30*time.Second, 4096),
 	}
 	// Let the persisted/console-editable account concurrency drive the gate;
 	// an explicit env override still wins (see bindLimitProvider).
@@ -377,6 +385,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/m365/conversations/cleanup", s.handleM365Cleanup)
 	m.HandleFunc("/api/stats", s.handleCacheStats)
 	m.HandleFunc("/api/stats/reset", s.handleCacheStatsReset)
+	m.HandleFunc("/api/throttle-stats", s.throttleStats)
 	m.HandleFunc("/api/usage", s.adminUsage)
 	m.HandleFunc("/api/usage/logs", s.adminUsageLogs)
 	m.HandleFunc("/api/plugins", s.plugins)
@@ -1081,19 +1090,26 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		s.mu.Lock()
 		preferred := s.lastHealthyAccount
 		s.mu.Unlock()
-		if preferred != "" && s.accountAvailable(preferred) && s.accountPool.Available(preferred) && s.accountConcurrency.Available(preferred) {
+		if preferred != "" && s.accountAvailable(preferred) && s.accountPool.ChatAvailable(preferred) && s.accountPool.Available(preferred) && s.accountConcurrency.Available(preferred) {
 			if acc, err := s.tokens.EnsureValid(preferred); err == nil {
 				accountID = preferred
 				return acc, nil
 			}
 		}
-		// No preferred account or it's unavailable; fall back to round-robin
+		// No preferred account or it's unavailable; fall back to round-robin.
+		// ChatAvailable additionally skips accounts whose locally tracked LLM
+		// allowance estimate is exhausted, so rotation prefers headroom over
+		// bouncing off the upstream metering throttle.
 		acc, ok := s.tokens.Next()
 		if !ok {
 			return auth.AccountToken{}, fmt.Errorf("%w: none is signed in", errNoAccounts)
 		}
 		accountID = acc.ID
-		for i := 0; !s.accountAvailable(accountID) && i < maxAccountProbe; i++ {
+		probeBudget := len(s.tokens.List())
+		if probeBudget < 1 {
+			probeBudget = 1
+		}
+		for i := 0; (!s.accountAvailable(accountID) || !s.accountPool.ChatAvailable(accountID)) && i < probeBudget; i++ {
 			acc, ok = s.tokens.Next()
 			if !ok {
 				break
@@ -1189,7 +1205,7 @@ func (s *Server) nextHealthyAccountExcluding(tried map[string]bool) (auth.Accoun
 		if !ok {
 			break
 		}
-		if tried[acc.ID] || !s.accountAvailable(acc.ID) {
+		if tried[acc.ID] || !s.accountAvailable(acc.ID) || !s.accountPool.ChatAvailable(acc.ID) {
 			continue
 		}
 		validated, err := s.tokens.EnsureValid(acc.ID)
@@ -1197,6 +1213,7 @@ func (s *Server) nextHealthyAccountExcluding(tried map[string]bool) (auth.Accoun
 			tried[acc.ID] = true
 			continue
 		}
+		RecordThrottleEvent(ThrottleFailover, validated.ID, "nextHealthyAccountExcluding")
 		return validated, nil
 	}
 	return auth.AccountToken{}, fmt.Errorf("%w: none is healthy for failover", errNoAccounts)
@@ -1314,8 +1331,10 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "message or attachment required")
 		return
 	}
-	// See openaiChat: only a client-supplied accountId pins the request.
-	clientPinnedAccount := body.AccountID != ""
+	// See openaiChat: only a client-supplied accountId pins the request, and
+	// X-M365-Allow-Failover:true lifts the pin's veto over failover.
+	allowFailover := allowFailoverRequested(r)
+	clientPinnedAccount := body.AccountID != "" && !allowFailover
 	if body.SessionKey != "" {
 		if v, ok := s.sessions.get(body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
@@ -1326,6 +1345,11 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	acc, err := s.resolveAccount(body.AccountID)
 	if err != nil {
 		writeUpstreamError(w, err)
+		return
+	}
+	// Cooldown gate: local 429 for a dry account, or failover when the client
+	// explicitly allowed it (see handleCooldownGate in throttle_guard.go).
+	if !s.handleCooldownGate(r, w, &acc) {
 		return
 	}
 	if acc.OID == "" || acc.TID == "" {
@@ -1761,7 +1785,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// IDs restored later by sessionKey, user session, or the session resolver
 	// are routing hints, not client intent: when that account fails, failover must
 	// still be allowed instead of returning 429 to the caller.
-	clientPinnedAccount := body.AccountID != ""
+	// X-M365-Allow-Failover:true additionally lifts the pin's veto over
+	// failover after the pinned account fails (first attempt still honors it).
+	allowFailover := allowFailoverRequested(r)
+	clientPinnedAccount := body.AccountID != "" && !allowFailover
 	if err := validateToolConversation(body.Messages); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
 		return
@@ -1830,6 +1857,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
+			if !clientPinnedAccount && body.AccountID != "" && !s.accountAvailable(body.AccountID) {
+				// sessionKey restores a routing hint, not client intent; an
+				// unhealthy hinted account must not pin the request. Starting
+				// a fresh conversation is safe here: answerPrompt is still the
+				// full flatten at this point.
+				log.Printf("[session-key] unpin account=%s conversation=%s reason=unhealthy", body.AccountID, body.ConversationID)
+				body.AccountID = ""
+				body.ConversationID = ""
+				body.SessionID = ""
+			}
 		}
 	}
 	if body.User != "" && body.ConversationID == "" {
@@ -1838,6 +1875,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			body.ConversationID = us.ConversationID
 			body.SessionID = us.SessionID
 			log.Printf("[user-session] hit user=%s conversation=%s session=%s", body.User, us.ConversationID, us.SessionID)
+			if !clientPinnedAccount && body.AccountID != "" && !s.accountAvailable(body.AccountID) {
+				log.Printf("[user-session] unpin account=%s user=%s reason=unhealthy", body.AccountID, body.User)
+				body.AccountID = ""
+				body.ConversationID = ""
+				body.SessionID = ""
+			}
 		}
 	}
 	if body.Metadata != nil && body.Metadata.CopilotTempSession {
@@ -1847,6 +1890,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	answerPrompt := prompt
 	resolvedConversationID := ""
+	// Snapshot of the full-prompt attachment set. The resolver may swap in an
+	// incremental attachment subset (the cloud conversation already holds the
+	// rest); if the resolver's account turns out unhealthy we unpin to a fresh
+	// conversation elsewhere and need the full set back.
+	fullPromptAttachments := body.Attachments
 	if body.ConversationID == "" && len(body.Messages) > 0 && (body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		resolved := s.sessionResolver.Resolve(r, &body)
 		if !resolved.IsNew {
@@ -1863,13 +1911,47 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					body.Attachments = incAtt
 				}
 			}
+			if !clientPinnedAccount && body.AccountID != "" && !s.accountAvailable(body.AccountID) {
+				// The matched account is cooling down (e.g. upstream metering
+				// throttle). Keep the request pinned to it and every client
+				// retry slams the same throttled account with the full payload
+				// — the 2026-09-08 storm shape. Unpin instead: rotation picks
+				// a healthy account, the full prompt+attachments are restored
+				// so the new account's fresh conversation sees complete
+				// history, and when the original account recovers the
+				// resolver's context-prefix match rebinds automatically.
+				log.Printf("[session-resolver] unpin account=%s conversation=%s reason=unhealthy", body.AccountID, resolved.ConversationID)
+				body.AccountID = ""
+				body.ConversationID = ""
+				body.SessionID = ""
+				resolvedConversationID = ""
+				answerPrompt = prompt
+				body.Attachments = fullPromptAttachments
+			}
 		}
 	}
 	accountID := body.AccountID
+	// Retry-storm debounce: an identical request (tenant+conversation+model+
+	// effective prompt) that failed with 429/5xx within the debounce window is
+	// replayed from cache instead of re-burning a real upstream call.
+	debounceKey := requestFingerprint(tenantFromRequest(r), body.ConversationID, body.Model, answerPrompt)
+	if s.debounceReplay(w, debounceKey, requestID) {
+		return
+	}
 	acc, err := s.resolveAccount(accountID)
 	if err != nil {
 		log.Printf("[account-route] resolve failed requested=%q err=%v", accountID, err)
 		writeUpstreamErrorWithAccount(w, err, accountID)
+		return
+	}
+	// Throttle short-circuit: the resolved account is still inside its quota-429
+	// cooldown. Answer locally with the exact Retry-After instead of forwarding
+	// the payload upstream — this covers pinned accounts too, because "pin this
+	// account" does not mean "burn its exhausted quota on every retry". The
+	// first request after cooldown expiry passes through and acts as the
+	// recovery probe. With X-M365-Allow-Failover the gate fails over to a
+	// healthy account instead of answering 429 (see handleCooldownGate).
+	if !s.handleCooldownGate(r, w, &acc) {
 		return
 	}
 	log.Printf("[account-route] selected id=%q email=%q token_present=%t oid_present=%t tid_present=%t", acc.ID, acc.Email, acc.AccessToken != "", acc.OID != "", acc.TID != "")
@@ -1957,7 +2039,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// Only fall through to text streaming when the router explicitly selects
 		// no tool; this prevents a natural-language preamble from becoming a
 		// completed assistant turn with the actual call lost.
-		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, executionAnchor)
+		routePrompt := s.buildRoutePrompt(&body, prompt, answerPrompt, ledger, executionAnchor, toolMaps)
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
@@ -1969,7 +2051,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if routeErr != nil {
 			triedAccountIDs := map[string]bool{acc.ID: true}
-			for !clientPinnedAccount && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
+			// Cap the failover loop: nextHealthyAccountExcluding only returns
+			// accounts that are healthy right now, but with a large pool a
+			// persistent upstream refusal would otherwise turn one request
+			// into one real upstream call per account.
+			maxRouteFailover := s.settings.get().FailoverMaxAttempts
+			routeAttempts := 0
+			for !clientPinnedAccount && routeAttempts < maxRouteFailover && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
+				routeAttempts++
 				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
 				if nerr != nil {
 					break
@@ -1982,7 +2071,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if routeErr != nil {
-				log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
+				log.Printf("[tool-router] id=%s account=%s attempts=%d failed: %v", requestID, acc.ID, routeAttempts, routeErr)
+				s.debounceRememberFailure(debounceKey, routeErr)
 				writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
 				return
 			}
@@ -2239,11 +2329,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// Ask the upstream model to select and validate the next tool. The gateway
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
-		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, executionAnchor)
+		routePrompt := s.buildRoutePrompt(&body, prompt, answerPrompt, ledger, executionAnchor, toolMaps)
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 		if routeErr != nil {
 			triedAccountIDs := map[string]bool{acc.ID: true}
-			for !clientPinnedAccount && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
+			maxRouteFailover := s.settings.get().FailoverMaxAttempts
+			routeAttempts := 0
+			for !clientPinnedAccount && routeAttempts < maxRouteFailover && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
+				routeAttempts++
 				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
 				if nerr != nil {
 					break
@@ -2258,7 +2351,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if routeErr != nil {
-				log.Printf("[tool-router] account=%s failed: %v", acc.ID, routeErr)
+				log.Printf("[tool-router] id=%s account=%s attempts=%d failed: %v", requestID, acc.ID, routeAttempts, routeErr)
+				s.debounceRememberFailure(debounceKey, routeErr)
 				writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
 				return
 			}
@@ -2275,7 +2369,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				// An upstream failure during repair is not a malformed decision;
 				// report its real category so clients can back off correctly.
 				if repairErr != nil {
-					log.Printf("[tool-repair] account=%s failed: %v", acc.ID, repairErr)
+					log.Printf("[tool-repair] id=%s account=%s failed: %v", requestID, acc.ID, repairErr)
+					s.debounceRememberFailure(debounceKey, repairErr)
 					writeUpstreamErrorWithAccount(w, repairErr, acc.ID)
 					return
 				}
@@ -2544,6 +2639,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			s.invalidateConvCache(acc.ID, convCacheModel)
 			log.Printf("[conv-cache] invalidated account=%s model=%s after error: %v", acc.ID, convCacheModel, err)
 		}
+		s.debounceRememberFailure(debounceKey, err)
 		writeUpstreamErrorWithAccount(w, err, acc.ID)
 		return
 	}
