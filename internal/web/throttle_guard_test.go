@@ -49,8 +49,9 @@ func TestMarkFailureExhaustedMeteringCoolsToMidnight(t *testing.T) {
 	if !ok {
 		t.Fatal("cooldown must be recorded")
 	}
-	if d := time.Until(until); d < 12*time.Hour {
-		t.Fatalf("exhausted cooldown=%v, want ~until UTC midnight (>12h)", d)
+	expected := nextUTCMidnight()
+	if delta := until.Sub(expected); delta < -time.Second || delta > time.Second {
+		t.Fatalf("exhausted cooldown until=%v, want next UTC midnight %v", until, expected)
 	}
 	if !h.RateLimited("acc") {
 		t.Fatal("account must be marked limited")

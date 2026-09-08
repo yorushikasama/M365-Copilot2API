@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"m365-copilot2api/internal/chathub"
 )
 
 func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, anchors ...string) string {
@@ -21,7 +23,17 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, an
 - Completed evidence must not be repeated: tool_calls/tool[call_x] rows are prior results already delivered to the user, never re-invoke them
 - Only start a new tool call when fresh unfinished work remains on the current request`
 	}
-	result := fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
+	// The router decides whether to call a tool *at all*, which makes a sandbox
+	// hallucination fatal here: a model that believes it sits in a Linux
+	// container with no access to D:\ concludes no tool can help and answers
+	// NO_TOOL_NEEDED, so the turn degrades into prose with no execution.
+	// Prepend the same caller-side contract the answer turn uses; it must come
+	// first because the evidence block below can be tens of KB.
+	guard := ""
+	if len(tools) > 0 {
+		guard = chathub.WindowsExecutionGuard + "\n\n"
+	}
+	result := fmt.Sprintf(`%sYou are a tool selection assistant. Based on the user request, decide which tool to call next.
 
 Available tools: %s
 
@@ -31,7 +43,7 @@ Rules:
 %s
 
 User request and evidence:
-%s`, defs, mode, rules, prompt)
+%s`, guard, defs, mode, rules, prompt)
 	if len(anchors) > 0 {
 		result = appendExecutionAnchor(result, anchors[0])
 	}

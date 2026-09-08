@@ -43,6 +43,33 @@ func TestModelToolRouterPromptWithoutAnchor(t *testing.T) {
 	}
 }
 
+// The router decides whether a tool is called at all. Without the guard a
+// model that believes it runs in a Linux container answers NO_TOOL_NEEDED for
+// Windows paths, and the turn degrades into prose with no execution.
+func TestModelToolRouterPromptPrependsExecutionGuard(t *testing.T) {
+	p := modelToolRouterPrompt("request", testTools(), "auto")
+	if !strings.Contains(p, "/mnt/data") || !strings.Contains(p, "not mounted") {
+		t.Fatalf("router prompt missing Windows execution guard: %s", p)
+	}
+	// Primacy matters: the guard must precede both the role line and the
+	// (potentially very large) evidence block.
+	if strings.Index(p, "/mnt/data") > strings.Index(p, "You are a tool selection assistant.") {
+		t.Fatalf("guard must precede the role line: %s", p)
+	}
+	if strings.Index(p, "/mnt/data") > strings.Index(p, "User request and evidence:") {
+		t.Fatalf("guard must precede the evidence block: %s", p)
+	}
+}
+
+// No declared tools means nothing can be executed on the caller's machine, so
+// routing must not be primed with an execution contract.
+func TestModelToolRouterPromptWithoutToolsOmitsGuard(t *testing.T) {
+	p := modelToolRouterPrompt("request", nil, "auto")
+	if strings.Contains(p, "/mnt/data") {
+		t.Fatalf("tool-less router prompt must not carry the execution guard: %s", p)
+	}
+}
+
 func TestParseModelToolDecisionRejectsBadSchema(t *testing.T) {
 	calls, ok := parseModelToolDecision("```json\n{\"calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":2}}]}\n```", testTools(), "auto")
 	if !ok || len(calls) != 0 {

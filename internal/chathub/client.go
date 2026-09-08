@@ -1653,7 +1653,10 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 	if deviceOS == "" {
 		deviceOS = "Windows"
 	}
-	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, len(clientPlugins(req.Tools, req.MCPServerURL)) > 0, req.ExecutionAnchor)
+	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, protocolCapabilities{
+		HasPlugins: len(clientPlugins(req.Tools, req.MCPServerURL)) > 0,
+		CanExecute: callerCanExecute(req.Tools, req.MCPServerURL),
+	}, req.ExecutionAnchor)
 	federatedConns := req.ConnectedFederatedIDs
 	if len(federatedConns) == 0 {
 		federatedConns = []string{"dummyId"}
