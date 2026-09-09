@@ -28,7 +28,7 @@ func customCallSource() map[string]any {
 
 func TestResponsesResultWritesCustomToolCall(t *testing.T) {
 	rr := httptest.NewRecorder()
-	writeResponsesResult(rr, "m", false, customCallSource())
+	writeResponsesResult(rr, "m", false, customCallSource(), nil, nil, nil)
 	var response map[string]any
 	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestResponsesResultWritesCustomToolCall(t *testing.T) {
 
 func TestResponsesStreamWritesCustomToolEvents(t *testing.T) {
 	rr := httptest.NewRecorder()
-	writeResponsesResult(rr, "m", true, customCallSource())
+	writeResponsesResult(rr, "m", true, customCallSource(), nil, nil, nil)
 	body := rr.Body.String()
 	for _, want := range []string{"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done", `"input":"uname -s"`} {
 		if !strings.Contains(body, want) {

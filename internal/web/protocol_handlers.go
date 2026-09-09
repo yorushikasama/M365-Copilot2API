@@ -549,7 +549,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		s.responseMu.Unlock()
 		log.Printf("[responses-audit] tenantHash=%s session=%s new=%s parent=%s toolCalls=%d version=1", tenantHashPrefix(tenant), sessionHashPrefix(sessionID), publicID, body.PreviousResponseID, len(toolCallsMap))
 	}
-	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
+	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out, o.Messages, o.Tools, o.ToolChoice)
 }
 
 func responsesOutputHasContent(src map[string]any) bool {

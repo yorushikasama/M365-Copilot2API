@@ -29,7 +29,7 @@ func toolSource() map[string]any {
 
 func TestResponsesToolSSEEvents(t *testing.T) {
 	rr := httptest.NewRecorder()
-	writeResponsesResult(rr, "m", true, toolSource())
+	writeResponsesResult(rr, "m", true, toolSource(), nil, nil, nil)
 	body := rr.Body.String()
 	for _, want := range []string{"event: response.created", "event: response.output_item.added", "event: response.function_call_arguments.delta", "event: response.function_call_arguments.done", "event: response.output_item.done", "event: response.completed"} {
 		if !strings.Contains(body, want) {
@@ -40,7 +40,7 @@ func TestResponsesToolSSEEvents(t *testing.T) {
 
 func TestResponsesToolSSEDoesNotDuplicateArguments(t *testing.T) {
 	rr := httptest.NewRecorder()
-	writeResponsesResult(rr, "m", true, toolSource())
+	writeResponsesResult(rr, "m", true, toolSource(), nil, nil, nil)
 	body := rr.Body.String()
 	if !strings.Contains(body, `"arguments":"","call_id":"call_1"`) {
 		t.Fatalf("initial function_call must have empty arguments: %s", body)

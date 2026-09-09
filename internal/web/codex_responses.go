@@ -7,11 +7,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"m365-copilot2api/internal/chathub"
 )
 
 // writeResponsesResult projects an internal OpenAI-style result into the
-// Responses events and completion shape consumed by Codex.
-func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
+// Responses events and completion shape consumed by Codex. input/tools/
+// toolChoice are the caller's request; Codex derives its context-window meter
+// from the usage block, so the fallback estimate must count the REAL request —
+// a constant estimate keeps the meter at zero and auto-compaction never fires.
+func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src map[string]any, input []oaiMsg, tools []chathub.Tool, toolChoice any) {
 	id := firstNonEmpty(fmt.Sprint(src["m365_response_id"]), "resp_"+uuid.NewString())
 	msg, _ := openAIChoice(src)
 	sanitizePublicAssistantMessage(msg, model)
@@ -34,7 +39,7 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 	usage, _ := src["usage"].(map[string]any)
 	usageSource, _ := src["m365_usage_source"].(string)
 	if usage == nil {
-		estimate := estimateResponsesUsage(model, nil, nil, nil, fmt.Sprint(msg["content"]))
+		estimate := estimateResponsesUsage(model, input, tools, toolChoice, fmt.Sprint(msg["content"]))
 		usage = estimate.Values
 		usageSource = estimate.Source
 	}

@@ -24,7 +24,7 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, an
 	// direct steps stay direct calls instead of being bundled into a subagent.
 	if hasDelegationTool(tools) {
 		rules += `
-- Do the immediate work yourself with direct tools; a subagent/orchestrator tool must only be chosen when the user explicitly asked for delegation or direct tools genuinely cannot accomplish the task
+- A subagent/orchestrator tool is your own judgment call, made by comparing the work against the tool's own description: delegate only when the task genuinely matches (a large, self-contained subtask); users rarely ask for delegation explicitly, and routine step-by-step work must stay on direct tools
 - Several independent direct steps must be parallel direct calls, never bundled into a subagent: respond with one JSON code block {"calls":[{"name":"...","arguments":{...}}]}`
 	}
 	// Multi-turn: completed tool evidence (tool[...], tool_calls:) was already

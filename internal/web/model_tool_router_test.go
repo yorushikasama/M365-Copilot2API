@@ -114,14 +114,14 @@ func TestParseModelToolDecisionRejectsBadSchema(t *testing.T) {
 func TestModelToolRouterPromptCountersDelegationBias(t *testing.T) {
 	tools := append(testTools(), map[string]any{"type": "function", "function": map[string]any{"name": "Agent", "description": "launch a subagent", "parameters": map[string]any{"type": "object", "properties": map[string]any{"prompt": map[string]any{"type": "string"}}}}})
 	p := modelToolRouterPrompt("request", tools, "auto")
-	if !strings.Contains(p, "Do the immediate work yourself with direct tools") {
+	if !strings.Contains(p, "your own judgment call") || !strings.Contains(p, "tool's own description") {
 		t.Fatalf("delegation-bias rule missing: %s", p)
 	}
 	if !strings.Contains(p, `{"calls":[{"name":"...","arguments":{...}}]}`) {
 		t.Fatalf("parallel envelope hint missing: %s", p)
 	}
 	plain := modelToolRouterPrompt("request", testTools(), "auto")
-	if strings.Contains(plain, "Do the immediate work yourself") {
+	if strings.Contains(plain, "your own judgment call") {
 		t.Fatal("bias rule must not appear without a delegation tool")
 	}
 }
