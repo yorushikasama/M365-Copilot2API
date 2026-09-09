@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"m365-copilot2api/internal/chathub"
@@ -95,9 +96,15 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 				var args map[string]any
 				if json.Unmarshal([]byte(argsStr), &args) == nil && toolChoiceAllows(choice, name) {
 					fn := toolFunction(name, tools)
-					if fn != nil && schemaValid(args, fn) == nil {
-						b, _ := json.Marshal(args)
-						return []detectedToolCall{{ID: callID(name, string(b), 0), Type: toolType(name, tools), Name: name, Arguments: b}}, true
+					if fn != nil {
+						coerced, dropped := coerceToolArgs(args, fn)
+						if coerced != nil {
+							if dropped {
+								log.Printf("[tool-coerce] dropped undeclared args for %s", name)
+							}
+							b, _ := json.Marshal(coerced)
+							return []detectedToolCall{{ID: callID(), Type: toolType(name, tools), Name: name, Arguments: b}}, true
+						}
 					}
 				}
 			}
@@ -138,16 +145,23 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 	seen := make(map[string]bool, len(envelope.Calls))
 	for _, c := range envelope.Calls {
 		fn := toolFunction(c.Name, tools)
-		if fn == nil || c.Arguments == nil || !toolChoiceAllows(choice, c.Name) || schemaValid(c.Arguments, fn) != nil {
+		if fn == nil || c.Arguments == nil || !toolChoiceAllows(choice, c.Name) {
 			continue
 		}
-		b, _ := json.Marshal(c.Arguments)
+		coerced, dropped := coerceToolArgs(c.Arguments, fn)
+		if coerced == nil {
+			continue
+		}
+		if dropped {
+			log.Printf("[tool-coerce] dropped undeclared args for %s", c.Name)
+		}
+		b, _ := json.Marshal(coerced)
 		key := c.Name + "\x00" + string(b)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		out = append(out, detectedToolCall{ID: callID(c.Name, string(b), len(out)), Type: toolType(c.Name, tools), Name: c.Name, Arguments: b})
+		out = append(out, detectedToolCall{ID: callID(), Type: toolType(c.Name, tools), Name: c.Name, Arguments: b})
 	}
 	return out, true
 }

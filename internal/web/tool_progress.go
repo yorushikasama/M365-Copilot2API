@@ -1,7 +1,6 @@
 package web
 
 import (
-	"encoding/json"
 	"strings"
 )
 
@@ -30,9 +29,4 @@ func parseToolProgress(v map[string]any) (toolProgress, bool) {
 		return toolProgress{}, false
 	}
 	return p, true
-}
-
-func progressJSON(p toolProgress) []byte {
-	b, _ := json.Marshal(p)
-	return b
 }

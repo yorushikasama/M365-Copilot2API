@@ -24,6 +24,41 @@ func schemaValid(args map[string]any, fn map[string]any) error {
 	return validateJSONSchema(args, params, "arguments")
 }
 
+// coerceToolArgs returns the arguments to execute for a tool call, tolerating
+// extra keys the schema does not declare. The router model occasionally emits
+// params that exist on a sibling tool but not on the chosen one (e.g. offset/
+// limit on Read); dropping the whole call on additionalProperties cost a full
+// router round and silently turned the decision into prose. Mirrors new-api's
+// pass-through principle: keep required/type checks, but when the only failure
+// is undeclared keys, strip them and execute with what the schema knows. The
+// second return value reports whether undeclared keys were dropped.
+func coerceToolArgs(args map[string]any, fn map[string]any) (map[string]any, bool) {
+	if schemaValid(args, fn) == nil {
+		return args, false
+	}
+	params, _ := fn["parameters"].(map[string]any)
+	if params == nil {
+		return args, false
+	}
+	props, _ := params["properties"].(map[string]any)
+	if props == nil {
+		return nil, false
+	}
+	stripped := make(map[string]any, len(args))
+	dropped := false
+	for k, v := range args {
+		if _, ok := props[k]; ok {
+			stripped[k] = v
+		} else {
+			dropped = true
+		}
+	}
+	if schemaValid(stripped, fn) != nil {
+		return nil, false
+	}
+	return stripped, dropped
+}
+
 func validateJSONSchema(value any, schema map[string]any, path string) error {
 	if enums, ok := schema["enum"].([]any); ok {
 		found := false

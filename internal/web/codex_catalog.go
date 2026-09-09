@@ -7,10 +7,8 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +37,7 @@ var advertisedReasoningEfforts = []reasoningEffortPreset{
 	{Effort: "medium", Description: "Balances speed and reasoning depth for everyday tasks."},
 	{Effort: "high", Description: "Greater reasoning depth for complex problems."},
 	{Effort: "xhigh", Description: "Extra high reasoning depth for complex problems."},
+	{Effort: "max", Description: "Maximum reasoning depth for the hardest problems."},
 }
 
 // gatewayCodexBaseInstructions is returned only in the Codex model catalog.
@@ -201,13 +200,6 @@ func configuredModelSpecs(mappings []modelMapping) []modelSpec {
 	return models
 }
 
-func positiveEnvInt(name string, fallback int) int {
-	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
-	if err == nil && v > 0 {
-		return v
-	}
-	return fallback
-}
 func configuredModelLimits() modelLimits {
 	cfg := currentSettings()
 	contextWindow := cfg.ContextWindow
@@ -226,10 +218,10 @@ func normalizeReasoningEffort(e string) (string, error) {
 		return "", nil
 	}
 	switch e {
-	case "none", "minimal", "low", "medium", "high", "xhigh":
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
 		return e, nil
 	}
-	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, or xhigh", e)
+	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, xhigh, or max", e)
 }
 func reasoningTone(model, effort string) (string, error) {
 	e, err := normalizeReasoningEffort(effort)

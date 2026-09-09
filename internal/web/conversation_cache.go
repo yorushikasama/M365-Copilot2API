@@ -121,15 +121,6 @@ func systemPromptHash(messages []oaiMsg) string {
 	return hex.EncodeToString(h[:])
 }
 
-func extractLastUserMessage(messages []oaiMsg) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			return contentToString(messages[i].Content)
-		}
-	}
-	return ""
-}
-
 // messagesHash fingerprints a message sequence the same way the increment gets
 // flattened downstream, so a prefix whose actual content changed (different
 // client, edited history) produces a different hash and fails the Lookup match.

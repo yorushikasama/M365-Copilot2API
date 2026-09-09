@@ -48,11 +48,6 @@ func adminPasswordPaths() (primary, legacy string) {
 	return filepath.Join(home, ".config", "m365-copilot2api", "admin-password.json"), filepath.Join(home, ".config", "m365-copilot2api", "admin-password")
 }
 
-func adminPasswordPath() string {
-	primary, _ := adminPasswordPaths()
-	return primary
-}
-
 func isBcryptHash(s string) bool {
 	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
 }

@@ -307,7 +307,3 @@ var m365CloudClient *M365CloudClient
 func InitM365CloudClient(clientID, tenantID, refreshToken string) {
 	m365CloudClient = NewM365CloudClient(clientID, tenantID, refreshToken)
 }
-
-func GetM365CloudClient() *M365CloudClient {
-	return m365CloudClient
-}

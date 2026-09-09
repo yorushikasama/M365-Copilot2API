@@ -201,19 +201,6 @@ func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToo
 	}
 	return out
 }
-func recordMetering(l *agentLedger, meterError string, hasAccess bool, remaining map[string]int) {
-	if l == nil {
-		return
-	}
-	snap := meteringSnapshot{
-		MeterError:         meterError,
-		HasAccess:          hasAccess,
-		RemainingAllowance: remaining,
-		Timestamp:          time.Now(),
-	}
-	l.Metering = append(l.Metering, snap)
-}
-
 func (l agentLedger) CanContinue(maxRounds int) error {
 	if maxRounds <= 0 {
 		maxRounds = 32
