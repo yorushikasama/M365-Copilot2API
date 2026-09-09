@@ -42,7 +42,10 @@ func TestWebIndexIncludesIPManagementAndAllPages(t *testing.T) {
 		"'IP Management':",
 		"'Unknown location':",
 		"'Local address':",
+		"'Resolve again':",
+		"'Resolving…':",
 		"const geo=data.geo||{},",
+		"applyLocale(currentLocale);",
 	} {
 		if !strings.Contains(page, needle) {
 			t.Fatalf("web index missing page wiring %q", needle)

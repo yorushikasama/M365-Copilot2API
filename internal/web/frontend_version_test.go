@@ -26,7 +26,7 @@ func TestFrontendVersionDisplayUsesBackendVersion(t *testing.T) {
 		`id="appVersion">&mdash;</div>`,
 		"async function loadAppVersion()",
 		"fetch('/api/version'",
-		"el.textContent=v==='dev'?'vdev':'v'+v",
+		"el.textContent=v==='dev'?'vdev':(v.startsWith('v')?v:'v'+v)",
 		// The badge must also refresh after an in-page login, otherwise the
 		// placeholder survives until the next full page load.
 		"showPage('dashboard');loadStats();loadAppVersion();",

@@ -388,8 +388,8 @@ func TestProtocolAdaptersSanitizeAssistantIdentity(t *testing.T) {
 		name  string
 		write func(*httptest.ResponseRecorder)
 	}{
-		{name: "responses", write: func(rr *httptest.ResponseRecorder) { writeResponsesResult(rr, "gpt-5.6-sol", false, src) }},
-		{name: "responses_stream", write: func(rr *httptest.ResponseRecorder) { writeResponsesResult(rr, "gpt-5.6-sol", true, src) }},
+		{name: "responses", write: func(rr *httptest.ResponseRecorder) { writeResponsesResult(rr, "gpt-5.6-sol", false, src, nil, nil, nil) }},
+		{name: "responses_stream", write: func(rr *httptest.ResponseRecorder) { writeResponsesResult(rr, "gpt-5.6-sol", true, src, nil, nil, nil) }},
 		{name: "anthropic", write: func(rr *httptest.ResponseRecorder) { writeAnthropicResult(rr, "gpt-5.6-sol", false, src) }},
 		{name: "anthropic_stream", write: func(rr *httptest.ResponseRecorder) { writeAnthropicResult(rr, "gpt-5.6-sol", true, src) }},
 	} {
