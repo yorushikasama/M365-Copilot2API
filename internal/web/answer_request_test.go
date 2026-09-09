@@ -58,3 +58,21 @@ func TestBuildAnswerRequestSingleToolChannel(t *testing.T) {
 		t.Fatalf("router answer must carry no native tools: tools=%d", len(req.Tools))
 	}
 }
+
+// Regression for the sandbox-hallucination relapse after the MCP gateway was
+// removed: the caller DID declare tools, so the answer turn must keep the
+// Windows execution guard even though router planning mode withholds the
+// native tool schemas (native_tools=0). Without CallerCanExecute the model
+// answered "the execution environment has no D:\... and /mnt/data is empty".
+func TestBuildAnswerRequestCallerCanExecuteSurvivesRouterMode(t *testing.T) {
+	req := buildAnswerRequest("[user]\nhello", "magic", answerRequestTestBody(), agentLedger{}, "router", runtimeSettings{}, chathub.FeatureFlags{}, chathubLocale{}, false)
+	if !req.CallerCanExecute {
+		t.Fatal("router answer with declared tools must keep CallerCanExecute=true")
+	}
+
+	plain := oaiReq{}
+	req = buildAnswerRequest("[user]\nhello", "magic", plain, agentLedger{}, "router", runtimeSettings{}, chathub.FeatureFlags{}, chathubLocale{}, false)
+	if req.CallerCanExecute {
+		t.Fatal("plain chat without declared tools must not claim execution capability")
+	}
+}

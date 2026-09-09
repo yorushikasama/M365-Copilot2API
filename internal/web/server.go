@@ -1712,6 +1712,12 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 		req.Tools = body.Tools
 		req.ToolChoice = body.ToolChoice
 	}
+	// The caller declared tools, so the caller executes on its machine — the
+	// execution contract must ride along even when router planning mode
+	// withholds native tool schemas from this answer turn. This restores the
+	// guard signal the removed self-referential MCP gateway used to carry
+	// incidentally (see Request.CallerCanExecute for the regression it fixes).
+	req.CallerCanExecute = len(body.Tools) > 0
 	// Single tool channel: declared tools are exposed upstream as API plugins
 	// only. The former self-referential MCP gateway (req.MCPServerURL pointing
 	// back at this process) advertised every tool a second time through a

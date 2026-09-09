@@ -293,13 +293,23 @@ type Account struct {
 }
 
 type Request struct {
-	Text                  string
-	Tone                  string
-	ConversationID        string
-	SessionID             string
-	Attachments           []Attachment
-	Tools                 []Tool
-	ToolChoice            any
+	Text           string
+	Tone           string
+	ConversationID string
+	SessionID      string
+	Attachments    []Attachment
+	Tools          []Tool
+	ToolChoice     any
+	// CallerCanExecute reports that the API caller declared executable tools
+	// for this conversation turn, even when native tool schemas are
+	// deliberately withheld from the upstream payload (router planning mode).
+	// Without it the answer turn following a NO_TOOL_NEEDED routing decision
+	// computed CanExecute=false from the empty tool list, dropped the Windows
+	// execution guard, and the model hallucinated a Linux sandbox with an
+	// empty /mnt/data (regression introduced on 2026-09-09 when the
+	// self-referential MCP gateway — which used to keep CanExecute true — was
+	// removed as a duplicate tool channel).
+	CallerCanExecute      bool
 	Started               bool
 	ConversationSignature string
 	PreviousMessages      []ContextMessage
@@ -1636,7 +1646,7 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 	}
 	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, protocolCapabilities{
 		HasPlugins: len(clientPlugins(req.Tools)) > 0,
-		CanExecute: callerCanExecute(req.Tools),
+		CanExecute: req.CallerCanExecute || callerCanExecute(req.Tools),
 	}, req.ExecutionAnchor)
 	federatedConns := req.ConnectedFederatedIDs
 	if len(federatedConns) == 0 {
