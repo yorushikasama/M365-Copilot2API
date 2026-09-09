@@ -145,6 +145,10 @@ func innerErrorDetail(raw []byte) (code string, message string) {
 	return "", trimmed
 }
 
+// runResponsesInnerChat is an indirect seam so tests can drive
+// streamResponsesAdapter with a canned inner chat stream.
+var runResponsesInnerChat = (*Server).openaiChat
+
 // streamResponsesAdapter converts the internal OpenAI SSE incrementally instead
 // of buffering the entire completion in httptest.ResponseRecorder.
 func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string) {
@@ -165,7 +169,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			_ = pw.Close()
 			close(innerDone)
 		}()
-		s.openaiChat(irw, r2)
+		runResponsesInnerChat(s, irw, r2)
 	}()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -186,6 +190,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	type tcState struct {
 		ID, Name, Args, Type string
 		ItemID               string
+		Added                bool
 	}
 	calls := map[int]*tcState{}
 	scanner := bufio.NewScanner(pr)
@@ -234,26 +239,37 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				}
 				if st == nil {
 					prefix := "fc_"
-					item := map[string]any{"type": "function_call", "call_id": "", "name": "", "arguments": "", "status": "in_progress"}
 					if typ == "custom" {
 						prefix = "ctc_"
-						item = map[string]any{"type": "custom_tool_call", "call_id": "", "name": "", "input": "", "status": "in_progress"}
 					}
 					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ}
 					calls[idx] = st
-					item["id"] = st.ItemID
-					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
 				}
-				if v, ok := tc["id"].(string); ok {
+				if v, ok := tc["id"].(string); ok && v != "" {
 					st.ID = v
 				}
 				fn, _ := tc["function"].(map[string]any)
 				if v, ok := fn["name"].(string); ok {
 					st.Name += v
 				}
+				// Announce the item only once the tool identity is known.
+				// ZCode's AI-SDK adapter validates the name on the added
+				// event itself and aborts the whole turn with
+				// "tool name is empty" (invalid_request) when it is blank,
+				// as it was under the previous emit-before-parse ordering.
+				if !st.Added && st.Name != "" {
+					st.Added = true
+					var item map[string]any
+					if st.Type == "custom" {
+						item = map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": "", "status": "in_progress"}
+					} else {
+						item = map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": "", "status": "in_progress"}
+					}
+					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+				}
 				if v, ok := fn["arguments"].(string); ok {
 					st.Args += v
-					if st.Type != "custom" {
+					if st.Type != "custom" && st.Added {
 						emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": v})
 					}
 				}
@@ -308,7 +324,10 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		sort.Ints(keys)
 		for _, i := range keys {
 			st := calls[i]
-			if st == nil {
+			if st == nil || !st.Added {
+				if st != nil && st.Name == "" {
+					log.Printf("[responses] dropping nameless tool call index=%d args_bytes=%d", i, len(st.Args))
+				}
 				continue
 			}
 			if st.Type == "custom" {
