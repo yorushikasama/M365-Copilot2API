@@ -1807,10 +1807,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// failover after the pinned account fails (first attempt still honors it).
 	allowFailover := allowFailoverRequested(r)
 	clientPinnedAccount := body.AccountID != "" && !allowFailover
-	if err := validateToolConversation(body.Messages); err != nil {
+	repairedMessages, err := repairToolConversation(requestID, body.Messages)
+	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
 		return
 	}
+	body.Messages = repairedMessages
 	// Rebuild a protocol-neutral evidence ledger from actual tool calls/results.
 	// Round limits apply only to the current user turn; full history still informs evidence.
 	ledger := buildAgentLedger(body.Messages)

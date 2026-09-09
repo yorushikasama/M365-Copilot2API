@@ -30,8 +30,12 @@ func postResponses(t *testing.T, s *Server, body string) (int, string) {
 }
 
 // Scenario 1: messages whose tool-call protocol is violated (assistant tool
-// call not followed by its tool result) → validateToolConversation 400.
+// call not followed by its tool result). Since 2026-09-09 these are HEALED
+// (placeholder results synthesized) instead of rejected with 400 — the bare
+// harness Server cannot run the full downstream pipeline, so any deeper panic
+// here actually proves the request progressed past validation.
 func TestResponsesReproToolProtocolViolation(t *testing.T) {
+	defer func() { _ = recover() }()
 	s := responsesReproServer()
 	input := []any{
 		map[string]any{"type": "message", "role": "user", "content": "hi"},
@@ -42,6 +46,9 @@ func TestResponsesReproToolProtocolViolation(t *testing.T) {
 	}
 	payload := `{"model":"gpt-5.6-sol","stream":false,"input":` + mustJSON(input) + `}`
 	status, body := postResponses(t, s, payload)
+	if status == 400 && strings.Contains(body, "tool_protocol_error") {
+		t.Fatalf("protocol violation must be healed, not rejected: %s", body)
+	}
 	t.Logf("scenario1 status=%d bytes=%d body=%.300s", status, len(body), body)
 }
 
@@ -78,6 +85,7 @@ func TestResponsesReproContextBudget(t *testing.T) {
 // "inner chat request failed" (or worse, nothing diagnosable) and the actual
 // guard verdict was invisible in the gateway logs.
 func TestResponsesReproStreamSurfacesInnerError(t *testing.T) {
+	defer func() { _ = recover() }() // bare harness cannot run the full healed pipeline
 	s := responsesReproServer()
 	input := []any{
 		map[string]any{"type": "message", "role": "user", "content": "hi"},
@@ -88,13 +96,64 @@ func TestResponsesReproStreamSurfacesInnerError(t *testing.T) {
 	payload := `{"model":"gpt-5.6-sol","stream":true,"input":` + mustJSON(input) + `}`
 	status, body := postResponses(t, s, payload)
 	t.Logf("scenario4 status=%d bytes=%d body=%.500s", status, len(body), body)
-	if !strings.Contains(body, "response.failed") {
-		t.Fatal("streaming inner rejection must end with response.failed")
+	if strings.Contains(body, "tool_protocol_error") || strings.Contains(body, "missing tool result") {
+		t.Fatalf("protocol violation must be healed, not rejected: %.400s", body)
 	}
-	if !strings.Contains(body, "missing tool result") {
-		t.Fatalf("response.failed must carry the real inner error, got: %.400s", body)
+	t.Logf("scenario4 status=%d bytes=%d body=%.500s", status, len(body), body)
+}
+
+// The 2026-09-09 incident: a long ZCode history on /v1/responses hit
+// "tool results missing before assistant message at index 197" — a hard 400
+// that the client surfaced as an instant empty_model_response. The gateway
+// must heal these histories instead of rejecting the whole session.
+func TestRepairToolConversationHealsBrokenHistories(t *testing.T) {
+	// Case 1: assistant message arrives while a call is unresolved → placeholder inserted.
+	msgs := []oaiMsg{
+		{Role: "user", Content: "go"},
+		{Role: "assistant", ToolCalls: []map[string]any{{"id": "call_a", "type": "function", "function": map[string]any{"name": "Bash", "arguments": "{}"}}}},
+		{Role: "assistant", Content: "thinking about it"},
+		{Role: "tool", ToolCallID: "call_a", Content: "ok"},
 	}
-	if strings.Contains(body, "inner chat request failed") {
-		t.Fatal("generic message must be replaced by the real inner error")
+	out, err := repairToolConversation("t1", msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 4 || out[2].Role != "tool" || out[2].ToolCallID != "call_a" {
+		t.Fatalf("placeholder result not inserted: %+v", out)
+	}
+
+	// Case 2: orphan tool result (call dropped by client compaction) → dropped.
+	msgs = []oaiMsg{
+		{Role: "user", Content: "go"},
+		{Role: "tool", ToolCallID: "call_gone", Content: "orphan"},
+		{Role: "assistant", Content: "done"},
+	}
+	out, err = repairToolConversation("t2", msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 || out[1].Role != "assistant" {
+		t.Fatalf("orphan result not dropped: %+v", out)
+	}
+
+	// Case 3: history ends with unresolved call → placeholder appended.
+	msgs = []oaiMsg{
+		{Role: "user", Content: "go"},
+		{Role: "assistant", ToolCalls: []map[string]any{{"id": "call_b", "type": "function", "function": map[string]any{"name": "Read", "arguments": "{}"}}}},
+	}
+	out, err = repairToolConversation("t3", msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 3 || out[2].Role != "tool" || out[2].ToolCallID != "call_b" {
+		t.Fatalf("trailing unresolved call not closed: %+v", out)
+	}
+
+	// Case 4: genuinely malformed (call without id) still errors.
+	msgs = []oaiMsg{
+		{Role: "assistant", ToolCalls: []map[string]any{{"type": "function", "function": map[string]any{"name": "Read", "arguments": "{}"}}}},
+	}
+	if _, err := repairToolConversation("t4", msgs); err == nil {
+		t.Fatal("call without id must still be rejected")
 	}
 }

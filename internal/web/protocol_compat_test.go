@@ -75,7 +75,7 @@ func TestResponsesCustomToolOutputToOpenAI(t *testing.T) {
 	if err != nil || len(o.Messages) != 2 || o.Messages[0].Role != "assistant" || o.Messages[0].ToolCalls[0]["type"] != "custom" || o.Messages[1].Role != "tool" || o.Messages[1].ToolCallID != "call_exec" {
 		t.Fatalf("messages=%+v err=%v", o.Messages, err)
 	}
-	if err := validateToolConversation(o.Messages); err != nil {
+	if _, err := repairToolConversation("test", o.Messages); err != nil {
 		t.Fatalf("custom tool continuation rejected: %v", err)
 	}
 }

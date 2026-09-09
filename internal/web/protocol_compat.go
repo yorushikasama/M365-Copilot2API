@@ -61,6 +61,11 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			}
 			typ, _ := m["type"].(string)
 			switch typ {
+			case "reasoning", "item_reference":
+				// Model-internal reasoning traces and history pointers are not
+				// conversation turns. Falling through would turn them into
+				// user-role messages containing raw item JSON.
+				continue
 			case "function_call_progress":
 				// Progress is deliberately not converted into an assistant/tool
 				// message. It is transport metadata from a long-running client-side
