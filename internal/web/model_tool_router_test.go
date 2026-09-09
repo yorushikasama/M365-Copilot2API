@@ -11,6 +11,36 @@ func TestParseModelToolDecisionAutoAndParallel(t *testing.T) {
 		t.Fatalf("calls=%v ok=%v", calls, ok)
 	}
 }
+
+// Regression: models occasionally emit the same call twice in one envelope
+// (historically encouraged by tools being exposed through both an API plugin
+// and a self-referential MCP gateway). Each duplicate used to become a
+// separate tool_call — two identical subtasks for the client.
+func TestParseModelToolDecisionDeduplicatesIdenticalCalls(t *testing.T) {
+	calls, ok := parseModelToolDecision(`{"calls":[
+		{"name":"get_weather","arguments":{"city":"Beijing"}},
+		{"name":"get_weather","arguments":{"city":"Beijing"}},
+		{"name":"get_time","arguments":{"city":"Beijing"}},
+		{"name":"get_weather","arguments":{"city":"Shanghai"}}
+	]}`, testTools(), "auto")
+	if !ok {
+		t.Fatal("expected a parsed decision")
+	}
+	if len(calls) != 3 {
+		t.Fatalf("expected duplicates to be dropped, got %d calls: %+v", len(calls), calls)
+	}
+	seen := map[string]bool{}
+	for _, c := range calls {
+		key := c.Name + string(c.Arguments)
+		if seen[key] {
+			t.Fatalf("duplicate call survived: %s %s", c.Name, c.Arguments)
+		}
+		seen[key] = true
+	}
+	if calls[0].ID == calls[1].ID {
+		t.Fatalf("call IDs must remain unique after dedup: %s", calls[0].ID)
+	}
+}
 func TestParseModelToolDecisionNoCall(t *testing.T) {
 	calls, ok := parseModelToolDecision(`{"calls":[]}`, testTools(), "auto")
 	if !ok || len(calls) != 0 {

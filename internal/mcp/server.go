@@ -33,6 +33,10 @@ func (r *toolRegistry) RegisterTools(tools []Tool) {
 }
 
 // MergeTools adds tools that are not already in the registry by name.
+//
+// Deprecated: use ReplaceTools. MergeTools grows the registry without bound —
+// tools declared by one client's request stayed registered forever and leaked
+// into every later listing, even after that client disconnected.
 func (r *toolRegistry) MergeTools(tools []Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -45,6 +49,17 @@ func (r *toolRegistry) MergeTools(tools []Tool) {
 			r.tools = append(r.tools, t)
 		}
 	}
+}
+
+// ReplaceTools atomically swaps the registry contents so it always mirrors the
+// most recent tool-bearing API request instead of accumulating every tool ever
+// declared. With concurrent requests the last writer wins; that is acceptable
+// because the registry is a discovery listing, not per-session state — sessions
+// that need to execute tools carry their own ToolProvider.
+func (r *toolRegistry) ReplaceTools(tools []Tool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tools = append([]Tool(nil), tools...)
 }
 
 // ListTools returns the currently registered tools.
@@ -258,19 +273,21 @@ func handleRPC(ctx context.Context, sess *session, req *jsonRPCRequest) *jsonRPC
 			"serverInfo":      map[string]any{"name": "m365-copilot2api", "version": "0.1.0"},
 		})
 	case "tools/list":
-		// First check session-specific tools, then fall back to global registry
+		// A session without a provider cannot execute anything: tool execution
+		// happens on the API client, and no callback path exists from here.
+		// Advertising the global registry to such sessions created a zombie
+		// channel — tools/list showed N tools while every tools/call failed —
+		// so an empty list is the honest answer. Global discovery remains
+		// available at /v1/mcp/tools.
 		sess.providerMu.RLock()
 		provider := sess.provider
 		sess.providerMu.RUnlock()
-		var tools []Tool
-		if provider != nil {
-			t, err := provider.ListTools(ctx)
-			if err == nil && len(t) > 0 {
-				tools = t
-			}
+		if provider == nil {
+			return jsonRPCResult(req.ID, map[string]any{"tools": []Tool{}})
 		}
-		if len(tools) == 0 {
-			tools = GlobalToolRegistry.ListTools()
+		tools, err := provider.ListTools(ctx)
+		if err != nil {
+			tools = []Tool{}
 		}
 		if tools == nil {
 			tools = []Tool{}
@@ -281,7 +298,7 @@ func handleRPC(ctx context.Context, sess *session, req *jsonRPCRequest) *jsonRPC
 		provider := sess.provider
 		sess.providerMu.RUnlock()
 		if provider == nil {
-			return newRPCError(req.ID, -32603, "no tools available")
+			return newRPCError(req.ID, -32603, "tool execution is not available on this session: MCP transport is discovery-only, tools are executed by the API client via tool_calls")
 		}
 		var params struct {
 			Name      string         `json:"name"`

@@ -1695,7 +1695,7 @@ func normalizeLegacyTools(body *oaiReq) {
 	}
 }
 
-func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedger, planningMode string, mcpServerURL string, cfg runtimeSettings, flags chathub.FeatureFlags, locale chathubLocale, disableMemory bool, anchors ...string) chathub.Request {
+func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedger, planningMode string, cfg runtimeSettings, flags chathub.FeatureFlags, locale chathubLocale, disableMemory bool, anchors ...string) chathub.Request {
 	if len(ledger.Completed) > 0 || len(ledger.Pending) > 0 {
 		answerPrompt += "\n" + ledger.RouterContext()
 	}
@@ -1712,12 +1712,14 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 		req.Tools = body.Tools
 		req.ToolChoice = body.ToolChoice
 	}
-	if mcpServerURL != "" {
-		req.Tools = body.Tools
-		if req.ToolChoice == nil {
-			req.ToolChoice = body.ToolChoice
-		}
-	}
+	// Single tool channel: declared tools are exposed upstream as API plugins
+	// only. The former self-referential MCP gateway (req.MCPServerURL pointing
+	// back at this process) advertised every tool a second time through a
+	// transport that could never execute anything — tool execution happens on
+	// the API client — so the model saw duplicate tools and emitted duplicate
+	// subtask calls. The registry below feeds the external /v1/mcp/tools
+	// discovery listing; ReplaceTools keeps it a bounded snapshot of the most
+	// recent tool-bearing request instead of an ever-growing union.
 	if len(body.Tools) > 0 {
 		mcpTools := make([]mcp.Tool, 0, len(body.Tools))
 		for _, t := range body.Tools {
@@ -1734,12 +1736,22 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 			}
 			mcpTools = append(mcpTools, mcp.Tool{Name: f.Name, Description: f.Description, InputSchema: schema})
 		}
-		if len(mcpTools) > 0 {
-			mcp.GlobalToolRegistry.MergeTools(mcpTools)
-		}
+		mcp.GlobalToolRegistry.ReplaceTools(mcpTools)
 	}
-	req.MCPServerURL = mcpServerURL
 	return req
+}
+
+// logRouterToolDecision records a successful router turn. The failure paths
+// ([tool-router] failed, [router-nocalls]) were logged, but a successful
+// decision was previously silent, so there was no way to tell from logs
+// whether a routed request produced tool calls or quietly fell through to a
+// prose answer — and nothing to correlate duplicate subtask reports against.
+func logRouterToolDecision(requestID, accountID, stage string, startedAt time.Time, calls []detectedToolCall) {
+	names := make([]string, 0, len(calls))
+	for _, c := range calls {
+		names = append(names, c.Name)
+	}
+	log.Printf("[tool-router] id=%s account=%s stage=%s decision=call count=%d names=%v elapsed_ms=%d", requestID, accountID, stage, len(calls), names, time.Since(startedAt).Milliseconds())
 }
 
 func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
@@ -2004,14 +2016,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.ToolChoice == nil && len(toolMaps) > 0 {
 		body.ToolChoice = "auto"
 	}
-	var mcpServerURL string
+	// Single tool channel: declared tools travel to upstream as API plugins
+	// only. No self-referential MCP gateway URL is constructed anymore.
 	if len(toolMaps) > 0 {
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		mcpServerURL = fmt.Sprintf("%s://%s/v1/mcp/sse", scheme, r.Host)
-		log.Printf("[mcp] tools=%d mcp_gateway=%s", len(toolMaps), mcpServerURL)
+		log.Printf("[tools] id=%s declared=%d transport=api-plugins", requestID, len(toolMaps))
 	}
 	validateCalls := func(stage string, calls []detectedToolCall) ([]detectedToolCall, int) {
 		valid, rejected := validateDetectedToolCalls(calls, toolMaps, body.ToolChoice)
@@ -2107,14 +2115,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 				calls = calls[:1]
 			}
+			logRouterToolDecision(requestID, acc.ID, "stream-router", startedAt, calls)
 			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, body.shouldSendStreamUsage(), calls, routeRes)
 			return
 		}
 	}
 	if body.Stream {
-		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, mcpServerURL, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession, executionAnchor)
+		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession, executionAnchor)
 		answerPrompt = answerReq.Text
-		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d native_tools=%d mcp=%s", requestID, len(answerPrompt), len(answerReq.Tools), mcpServerURL)
+		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d native_tools=%d", requestID, len(answerPrompt), len(answerReq.Tools))
 		id := "chatcmpl-" + uuid.NewString()
 		model := firstNonEmpty(body.Model, "m365-copilot")
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -2400,6 +2409,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 				calls = calls[:1]
 			}
+			logRouterToolDecision(requestID, acc.ID, "router", startedAt, calls)
 			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, body.shouldSendStreamUsage(), calls, routeRes)
 			return
 		}
@@ -2422,6 +2432,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 						calls = calls[:1]
 					}
+					logRouterToolDecision(requestID, acc.ID, "router-required-retry", startedAt, calls)
 					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, body.shouldSendStreamUsage(), calls, retryRes)
 					return
 				}
@@ -2435,7 +2446,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return
 		}
 	}
-	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, mcpServerURL, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession, executionAnchor)
+	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession, executionAnchor)
 	answerPrompt = answerReq.Text
 	var res chathub.Result
 	if body.Stream {

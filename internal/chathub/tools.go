@@ -2,27 +2,29 @@ package chathub
 
 import (
 	"encoding/json"
-	"strings"
 )
 
 type Tool struct {
-	Type     string          `json:"type"`
+	Type     string          `json:"type,omitempty"`
 	Function json.RawMessage `json:"function,omitempty"`
 }
 
 // callerCanExecute reports whether this request carries execution capability
-// on the caller's machine: caller-declared API tools or an MCP gateway.
+// on the caller's machine: caller-declared API tools.
 //
 // This is deliberately not len(clientPlugins(...)) > 0. clientPlugins falls
 // back to a built-in BingWebSearch plugin when the request declares no tools
 // at all, so "has plugins" is true even for an ordinary chat and cannot be
-// used to tell a chat turn from an agent turn. Only API tools and an MCP
-// gateway mean the caller can actually execute something, and only those
-// should prime the model with the caller-side execution contract.
-func callerCanExecute(tools []Tool, mcpServerURL string) bool {
-	if strings.TrimSpace(mcpServerURL) != "" {
-		return true
-	}
+// used to tell a chat turn from an agent turn. Only API tools mean the caller
+// can actually execute something, and only those should prime the model with
+// the caller-side execution contract.
+//
+// The former second channel — a self-referential MCP gateway plugin — was
+// removed on 2026-09-09: it exposed every declared tool twice (once as an API
+// plugin, once as an MCP server tool), and the MCP transport could never
+// execute anything because tool execution happens on the API client, so the
+// upstream saw duplicate tools and emitted duplicate subtask calls.
+func callerCanExecute(tools []Tool) bool {
 	for _, t := range tools {
 		var f struct {
 			Name string `json:"name"`
@@ -34,20 +36,10 @@ func callerCanExecute(tools []Tool, mcpServerURL string) bool {
 	return false
 }
 
-func clientPlugins(tools []Tool, mcpServerURL string) []any {
-	plugins := make([]any, 0, len(tools)+2)
-	if mcpServerURL == "" && len(tools) == 0 {
+func clientPlugins(tools []Tool) []any {
+	plugins := make([]any, 0, len(tools)+1)
+	if len(tools) == 0 {
 		plugins = append(plugins, map[string]any{"Id": "BingWebSearch", "Source": "BuiltIn"})
-	}
-	if mcpServerURL != "" {
-		plugins = append(plugins, map[string]any{
-			"Id":                "mcp-gateway",
-			"Source":            "MCPServer",
-			"Description":       "MCP Gateway tools",
-			"Transport":         "mcp",
-			"TransportUrl":      mcpServerURL,
-			"TransportProtocol": "https://copilot.microsoft.com/schemas/plugins/local/transport/1.0",
-		})
 	}
 	for _, t := range tools {
 		var f struct {

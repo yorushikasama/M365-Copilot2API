@@ -15,24 +15,20 @@ func TestCallerCanExecute(t *testing.T) {
 	broken := Tool{Type: "function", Function: json.RawMessage(`{not json`)}
 	nameless := Tool{Type: "function", Function: json.RawMessage(`{"description":"no name"}`)}
 	cases := []struct {
-		name         string
-		tools        []Tool
-		mcpServerURL string
-		want         bool
+		name  string
+		tools []Tool
+		want  bool
 	}{
-		{"plain chat", nil, "", false},
-		{"mcp gateway only", nil, "http://gw/v1/mcp/sse", true},
-		{"declared tool", []Tool{valid}, "", true},
-		{"declared tool plus gateway", []Tool{valid}, "http://gw", true},
+		{"plain chat", nil, false},
+		{"declared tool", []Tool{valid}, true},
 		// A tool that cannot be parsed grants no capability: upstream gets no
 		// usable schema for it either.
-		{"unparseable tool only", []Tool{broken}, "", false},
-		{"nameless tool only", []Tool{nameless}, "", false},
-		{"one valid among broken", []Tool{broken, valid}, "", true},
-		{"blank gateway url", nil, "   ", false},
+		{"unparseable tool only", []Tool{broken}, false},
+		{"nameless tool only", []Tool{nameless}, false},
+		{"one valid among broken", []Tool{broken, valid}, true},
 	}
 	for _, tc := range cases {
-		if got := callerCanExecute(tc.tools, tc.mcpServerURL); got != tc.want {
+		if got := callerCanExecute(tc.tools); got != tc.want {
 			t.Errorf("%s: callerCanExecute=%v want %v", tc.name, got, tc.want)
 		}
 	}
@@ -41,10 +37,10 @@ func TestCallerCanExecute(t *testing.T) {
 // The built-in search fallback makes "has plugins" true for an ordinary chat,
 // so plugin presence alone must never be treated as execution capability.
 func TestClientPluginsFallbackIsNotExecutionCapability(t *testing.T) {
-	if got := len(clientPlugins(nil, "")); got == 0 {
+	if got := len(clientPlugins(nil)); got == 0 {
 		t.Fatal("clientPlugins must fall back to a built-in plugin for a tool-less request")
 	}
-	if callerCanExecute(nil, "") {
+	if callerCanExecute(nil) {
 		t.Fatal("built-in search fallback must not count as caller execution capability")
 	}
 }
@@ -126,8 +122,8 @@ func TestToolProtocolPromptPluginsEmitsExecutionGuard(t *testing.T) {
 }
 
 func TestToolProtocolPromptNoToolsWithPluginsEmitsExecutionGuard(t *testing.T) {
-	// The production MCP-gateway shape: no inlined tools, but the gateway
-	// plugin means the caller can execute.
+	// Degenerate-but-defensive shape: plugin presence with caller execution
+	// capability even though no tools are inlined. The guard must still fire.
 	text := toolProtocolPrompt("hello", nil, nil, protocolCapabilities{HasPlugins: true, CanExecute: true})
 	if !strings.Contains(text, "/mnt/data") {
 		t.Fatalf("mcp-gateway-only branch must emit the Windows execution guard: %s", text)
@@ -147,8 +143,8 @@ func TestToolProtocolPromptNoToolsNoPluginsOmitsGuard(t *testing.T) {
 // flag for the guard primed every ordinary conversation as an agent turn.
 func TestToolProtocolPromptPlainChatWithPluginFallbackOmitsGuard(t *testing.T) {
 	caps := protocolCapabilities{
-		HasPlugins: len(clientPlugins(nil, "")) > 0, // true: built-in fallback
-		CanExecute: callerCanExecute(nil, ""),       // false: nothing to execute
+		HasPlugins: len(clientPlugins(nil)) > 0, // true: built-in fallback
+		CanExecute: callerCanExecute(nil),       // false: nothing to execute
 	}
 	if !caps.HasPlugins {
 		t.Fatal("precondition: tool-less request must still report plugins")
@@ -167,8 +163,8 @@ func TestToolProtocolPromptPlainChatWithPluginFallbackOmitsGuard(t *testing.T) {
 func TestToolProtocolPromptUnparseableToolsOmitsGuard(t *testing.T) {
 	broken := Tool{Type: "function", Function: json.RawMessage(`{not json`)}
 	caps := protocolCapabilities{
-		HasPlugins: len(clientPlugins([]Tool{broken}, "")) > 0,
-		CanExecute: callerCanExecute([]Tool{broken}, ""),
+		HasPlugins: len(clientPlugins([]Tool{broken})) > 0,
+		CanExecute: callerCanExecute([]Tool{broken}),
 	}
 	if caps.CanExecute {
 		t.Fatal("precondition: broken tool must not grant capability")

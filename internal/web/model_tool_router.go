@@ -101,13 +101,23 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 		return nil, false
 	}
 	out := make([]detectedToolCall, 0, len(envelope.Calls))
-	for i, c := range envelope.Calls {
+	// Deduplicate identical (name, arguments) pairs. Models occasionally emit
+	// the same call twice in one envelope — especially when tools were exposed
+	// through more than one channel historically — and each duplicate became a
+	// separate tool_call, i.e. two identical subtasks for the client.
+	seen := make(map[string]bool, len(envelope.Calls))
+	for _, c := range envelope.Calls {
 		fn := toolFunction(c.Name, tools)
 		if fn == nil || c.Arguments == nil || !toolChoiceAllows(choice, c.Name) || schemaValid(c.Arguments, fn) != nil {
 			continue
 		}
 		b, _ := json.Marshal(c.Arguments)
-		out = append(out, detectedToolCall{ID: callID(c.Name, string(b), i), Type: toolType(c.Name, tools), Name: c.Name, Arguments: b})
+		key := c.Name + "\x00" + string(b)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, detectedToolCall{ID: callID(c.Name, string(b), len(out)), Type: toolType(c.Name, tools), Name: c.Name, Arguments: b})
 	}
 	return out, true
 }

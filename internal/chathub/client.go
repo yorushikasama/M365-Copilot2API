@@ -300,7 +300,6 @@ type Request struct {
 	Attachments           []Attachment
 	Tools                 []Tool
 	ToolChoice            any
-	MCPServerURL          string
 	Started               bool
 	ConversationSignature string
 	PreviousMessages      []ContextMessage
@@ -1636,8 +1635,8 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 		deviceOS = "Windows"
 	}
 	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, protocolCapabilities{
-		HasPlugins: len(clientPlugins(req.Tools, req.MCPServerURL)) > 0,
-		CanExecute: callerCanExecute(req.Tools, req.MCPServerURL),
+		HasPlugins: len(clientPlugins(req.Tools)) > 0,
+		CanExecute: callerCanExecute(req.Tools),
 	}, req.ExecutionAnchor)
 	federatedConns := req.ConnectedFederatedIDs
 	if len(federatedConns) == 0 {
@@ -1812,7 +1811,7 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 		"streamingMode":    "ConciseWithPadding",
 		"message":          message,
 
-		"plugins":                   clientPlugins(req.Tools, req.MCPServerURL),
+		"plugins":                   clientPlugins(req.Tools),
 		"extraExtensionParameters":  map[string]any{},
 		"isSbsSupported":            true,
 		"renderReferencesBehindEOS": true,
