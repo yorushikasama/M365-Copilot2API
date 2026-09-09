@@ -106,3 +106,22 @@ func TestParseModelToolDecisionRejectsBadSchema(t *testing.T) {
 		t.Fatalf("calls=%v ok=%v", calls, ok)
 	}
 }
+
+// The router picks one next step, so "the call that does the most work" is
+// structurally always the subagent launcher — fresh conversations opened an
+// Agent as their very first decision for tasks direct tools could do. The
+// prompt must counter this bias and offer the parallel envelope instead.
+func TestModelToolRouterPromptCountersDelegationBias(t *testing.T) {
+	tools := append(testTools(), map[string]any{"type": "function", "function": map[string]any{"name": "Agent", "description": "launch a subagent", "parameters": map[string]any{"type": "object", "properties": map[string]any{"prompt": map[string]any{"type": "string"}}}}})
+	p := modelToolRouterPrompt("request", tools, "auto")
+	if !strings.Contains(p, "Do the immediate work yourself with direct tools") {
+		t.Fatalf("delegation-bias rule missing: %s", p)
+	}
+	if !strings.Contains(p, `{"calls":[{"name":"...","arguments":{...}}]}`) {
+		t.Fatalf("parallel envelope hint missing: %s", p)
+	}
+	plain := modelToolRouterPrompt("request", testTools(), "auto")
+	if strings.Contains(plain, "Do the immediate work yourself") {
+		t.Fatal("bias rule must not appear without a delegation tool")
+	}
+}

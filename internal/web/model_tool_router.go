@@ -16,6 +16,17 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, an
 - Only use tools from the available list above
 - Validate all arguments against the tool's schema
 - Do not invent tools that are not in the list`
+	// The router decides ONE next step, which structurally biases the model
+	// toward the delegation tool: "the single call that does the most work"
+	// is always the subagent launcher, so fresh conversations routinely opened
+	// an Agent as their very first decision for tasks direct tools could do.
+	// Counter the bias explicitly and teach the parallel envelope so several
+	// direct steps stay direct calls instead of being bundled into a subagent.
+	if hasDelegationTool(tools) {
+		rules += `
+- Do the immediate work yourself with direct tools; a subagent/orchestrator tool must only be chosen when the user explicitly asked for delegation or direct tools genuinely cannot accomplish the task
+- Several independent direct steps must be parallel direct calls, never bundled into a subagent: respond with one JSON code block {"calls":[{"name":"...","arguments":{...}}]}`
+	}
 	// Multi-turn: completed tool evidence (tool[...], tool_calls:) was already
 	// acted upon, so re-invoking those tools would duplicate work.
 	if strings.Contains(prompt, "tool_calls:") || strings.Contains(prompt, "tool[call_") {
@@ -48,6 +59,25 @@ User request and evidence:
 		result = appendExecutionAnchor(result, anchors[0])
 	}
 	return result
+}
+
+// hasDelegationTool reports whether the tool list contains an orchestrator /
+// subagent launcher (Agent, Task, *subagent*, *delegate*, *spawn*). These
+// names follow the OpenAI/Codex conventions; anything else is treated as a
+// direct tool.
+func hasDelegationTool(tools []map[string]any) bool {
+	for _, t := range tools {
+		f, _ := t["function"].(map[string]any)
+		n, _ := f["name"].(string)
+		low := strings.ToLower(n)
+		if low == "" {
+			continue
+		}
+		if low == "agent" || low == "task" || strings.Contains(low, "subagent") || strings.Contains(low, "delegate") || strings.Contains(low, "spawn") {
+			return true
+		}
+	}
+	return false
 }
 
 func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
