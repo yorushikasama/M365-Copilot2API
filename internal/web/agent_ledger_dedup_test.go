@@ -1,6 +1,10 @@
 package web
 
-import "testing"
+import (
+	"strconv"
+	"strings"
+	"testing"
+)
 
 func TestCanonicalToolArgumentsDeduplicateEquivalentJSON(t *testing.T) {
 	ledger := agentLedger{Completed: []toolEvidence{{
@@ -37,5 +41,34 @@ func TestRouterContextStaysCompact(t *testing.T) {
 	}
 	if len(ctx) == 0 {
 		t.Fatal("router context is empty")
+	}
+}
+
+// The ledger keeps every completed call for duplicate filtering, but the
+// ROUTER PROMPT rendering must stay bounded: 30 completed calls at up to 4KB
+// of result each used to produce ~120KB evidence blocks that dominated the
+// route prompt even after window slimming.
+func TestRouterContextBoundedUnderManyEntries(t *testing.T) {
+	var completed []toolEvidence
+	for i := 0; i < 30; i++ {
+		completed = append(completed, toolEvidence{
+			ID:        "call_" + strconv.Itoa(i),
+			Name:      "Bash",
+			Arguments: `{"command":"echo ` + strconv.Itoa(i) + `"}`,
+			Result:    strings.Repeat("x", 4000),
+		})
+	}
+	ledger := agentLedger{Completed: completed}
+	ctx := ledger.RouterContext()
+	if len(ctx) > 8000 {
+		t.Fatalf("router context not bounded: %d bytes", len(ctx))
+	}
+	if !strings.Contains(ctx, "older") {
+		t.Fatal("omitted-entry note missing")
+	}
+	// Duplicate filtering must still see the FULL ledger, not the bounded view.
+	calls := []detectedToolCall{{Name: "Bash", Arguments: []byte(`{"command":"echo 3"}`)}}
+	if got := filterCompletedCalls(calls, ledger); len(got) != 0 {
+		t.Fatalf("bounded rendering must not weaken dedup: %d calls survived", len(got))
 	}
 }

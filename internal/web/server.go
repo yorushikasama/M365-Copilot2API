@@ -1987,9 +1987,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// to avoid re-processing full system prompt + history each request (latency
 	// drops from 3-5s to ~1s). Only kicks in when no explicit conversation ID
 	// was provided by client, session key, user session, or session resolver.
+	//
+	// Routed tool requests skip the cache entirely: their router turns run in
+	// throwaway conversations that are dropped after every decision, so the
+	// cache can never hit for them (observed 2026-09-09: 93 lookups, 0 hits in
+	// 2.5h) and every lookup paid a full system-prompt hash for nothing.
 	convReused := false
 	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
-	if body.ConversationID == "" && len(body.Messages) > 1 &&
+	routedToolTurn := s.settings.get().ToolPlanningMode == "router" && len(body.Tools) > 0
+	if body.ConversationID == "" && len(body.Messages) > 1 && !routedToolTurn &&
 		(body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		sysHash := systemPromptHash(body.Messages)
 		if cached := s.convCache.Lookup(acc.ID, convCacheModel, body.Messages); cached != nil && cached.SystemPrompt == sysHash {
@@ -2007,7 +2013,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if !convReused && body.ConversationID == "" {
+	if !convReused && body.ConversationID == "" && !routedToolTurn {
 		log.Printf("[conv-cache] miss account=%s model=%s", acc.ID, convCacheModel)
 	}
 

@@ -69,21 +69,27 @@ func routerWindowMessages(msgs []oaiMsg, tail int) []oaiMsg {
 // routerWindowNeedsFullHistory reports whether the recent window contains
 // deictic/reference markers, in which case routing quality depends on the
 // older history and the full prompt is used.
+//
+// Only the most recent user message is scanned. Scanning every user message
+// in the window made the upgrade fire on 72% of real agent requests (words
+// like "continue"/"above" are ubiquitous in task instructions), erasing the
+// slimming benefit. Deixis is inherently a property of the current turn; the
+// ledger's tool evidence plus the tail window carry the rest.
 func routerWindowNeedsFullHistory(window []oaiMsg) bool {
+	latest := ""
 	for _, m := range window {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
 		if role != "user" {
 			continue
 		}
-		txt, _ := parseContent(m.Content)
-		if txt == "" {
-			continue
+		if txt, _ := parseContent(m.Content); txt != "" {
+			latest = txt
 		}
-		low := strings.ToLower(txt)
-		for _, hint := range routerReferenceHints {
-			if strings.Contains(low, hint) {
-				return true
-			}
+	}
+	low := strings.ToLower(latest)
+	for _, hint := range routerReferenceHints {
+		if strings.Contains(low, hint) {
+			return true
 		}
 	}
 	return false

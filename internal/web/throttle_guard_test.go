@@ -457,3 +457,22 @@ func TestThrottleMetricsSnapshot(t *testing.T) {
 		t.Fatal("reset must clear counters and events")
 	}
 }
+
+// Deixis is a property of the CURRENT user turn. Scanning every user message
+// in the window made the upgrade fire on 72% of real agent requests because
+// words like "continue" appear in older instructions, erasing the slimming
+// benefit.
+func TestRouterWindowNeedsFullHistoryOnlyLatestUserMessage(t *testing.T) {
+	window := []oaiMsg{
+		{Role: "user", Content: "继续刚才的任务，先读取配置文件"},
+		{Role: "assistant", Content: "done"},
+		{Role: "user", Content: "现在检查输出目录里的文件列表"},
+	}
+	if routerWindowNeedsFullHistory(window) {
+		t.Fatal("hint only in an older message must not upgrade")
+	}
+	window = append(window, oaiMsg{Role: "user", Content: "继续"})
+	if !routerWindowNeedsFullHistory(window) {
+		t.Fatal("hint in the latest user message must upgrade")
+	}
+}

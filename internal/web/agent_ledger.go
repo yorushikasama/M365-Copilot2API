@@ -133,17 +133,45 @@ func normalizeFailure(s string) string {
 	return s
 }
 func (l agentLedger) RouterContext() string {
-	type compact struct {
-		Completed    []toolEvidence `json:"completed"`
-		Pending      []toolEvidence `json:"pending"`
-		RepeatedCall bool           `json:"repeated_call"`
+	// Bounded rendering: the ledger itself keeps every completed call for
+	// duplicate filtering (hasCompleted/filterCompletedCalls), but rendering
+	// the full history into the router prompt made the "slim" route prompt
+	// grow without bound — 30 completed calls at up to 4KB of result each
+	// produced ~120KB evidence blocks that dominated the prompt even after
+	// router window slimming. Recent entries carry the current task state;
+	// older ones collapse to a count.
+	const (
+		maxRenderedEntries = 10
+		maxResultChars     = 300
+	)
+	completed := l.Completed
+	omitted := 0
+	if len(completed) > maxRenderedEntries {
+		omitted = len(completed) - maxRenderedEntries
+		completed = completed[len(completed)-maxRenderedEntries:]
 	}
-	b, _ := json.Marshal(compact{l.Completed, l.Pending, l.RepeatedCall})
+	rendered := make([]toolEvidence, len(completed))
+	for i, e := range completed {
+		e.Result = compactToolResult(e.Result, maxResultChars)
+		rendered[i] = e
+	}
+	type compactView struct {
+		Completed []toolEvidence `json:"completed"`
+		Pending   []toolEvidence `json:"pending"`
+		// OlderCompleted reports completed calls omitted from this view; they
+		// remain final evidence and must not be re-issued.
+		OlderCompleted int  `json:"older_completed,omitempty"`
+		RepeatedCall   bool `json:"repeated_call,omitempty"`
+	}
+	view := compactView{Completed: rendered, Pending: l.Pending, OlderCompleted: omitted, RepeatedCall: l.RepeatedCall}
 	hint := "Use only this compact evidence. A completed call is final evidence; do not issue the same name and arguments again."
 	if l.RepeatedFailure {
 		hint += " The same call failed repeatedly; change strategy instead of retrying unchanged."
 	}
-	return hint + "\nEVIDENCE_LEDGER: " + string(b)
+	if omitted > 0 {
+		hint += fmt.Sprintf(" %d older completed calls are summarized by count only.", omitted)
+	}
+	return hint + "\nEVIDENCE_LEDGER: " + string(mustJSON(view))
 }
 func canonicalToolArguments(s string) string {
 	s = strings.TrimSpace(s)
