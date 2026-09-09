@@ -132,9 +132,9 @@ func (s *Server) probeAccount(accountID string) bool {
 		req := chathub.Request{
 			// "ping": the smallest payload that still produces a real
 			// upstream metering verdict for the chat capability.
-			Text:        "ping",
-			LicenseType: cfg.LicenseType,
-			Scenario:    cfg.Scenario,
+			Text:         "ping",
+			LicenseType:  cfg.LicenseType,
+			Scenario:     cfg.Scenario,
 			FeatureFlags: s.featureFlags(),
 		}
 		res, err := s.chatWithAccount(ctx, accountID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, req)

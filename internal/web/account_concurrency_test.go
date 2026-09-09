@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"m365-copilot2api/internal/chathub"
 )
 
 func TestAccountConcurrencyLimitsAndReleasesSlots(t *testing.T) {
@@ -101,5 +103,51 @@ func TestAccountConcurrencyAcceptsLegacyEnvAlias(t *testing.T) {
 	limiter := newAccountConcurrency()
 	if got := limiter.currentLimit(); got != 5 {
 		t.Fatalf("currentLimit() = %d, want 5 from legacy alias", got)
+	}
+}
+
+// Connection-level faults are retried on a fresh connection for the same
+// account; account-level faults (quota, auth) are not, and neither is anything
+// that already streamed content to the client.
+func TestRetryableTransportErrorClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"ws protocol corruption", &chathub.DialError{Kind: "WS_PROTOCOL"}, true},
+		{"handshake failure", &chathub.DialError{Kind: "WS_HANDSHAKE"}, true},
+		{"tcp reset", &chathub.DialError{Kind: "TCP"}, true},
+		{"tls failure", &chathub.DialError{Kind: "TLS"}, true},
+		{"quota is an account fault", &chathub.DialError{Kind: "QUOTA_429", Status: 429}, false},
+		{"auth is an account fault", &chathub.DialError{Kind: "AUTH_EXPIRED_401", Status: 401}, false},
+		{"read timeout after first token", &chathub.DialError{Kind: "WS_READ_TIMEOUT", Streamed: true}, false},
+		{"read timeout before first token", &chathub.DialError{Kind: "WS_READ_TIMEOUT"}, false},
+		{"protocol error after streaming", &chathub.DialError{Kind: "WS_PROTOCOL", Streamed: true}, false},
+		{"plain error", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryableTransportError(tt.err); got != tt.want {
+				t.Fatalf("retryableTransportError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// A transport retry must not mutate the caller's request, and must force a
+// freshly dialed connection instead of reusing a parked one.
+func TestFreshConnectionRequestCopiesRequest(t *testing.T) {
+	original := chathub.Request{Text: "hello", ConversationID: "conv-1"}
+	retry := freshConnectionRequest(original)
+	if !retry.BypassPool {
+		t.Fatal("retry request must bypass the pool")
+	}
+	if original.BypassPool {
+		t.Fatal("freshConnectionRequest must not mutate the caller's request")
+	}
+	if retry.Text != "hello" || retry.ConversationID != "conv-1" {
+		t.Fatalf("retry request lost fields: %+v", retry)
 	}
 }

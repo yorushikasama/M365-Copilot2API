@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"errors"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -168,6 +170,41 @@ func (s *Server) recordAllowanceConsumption(accountID string, request chathub.Re
 	s.accountPool.RecordAllowanceConsumption(accountID, capability)
 }
 
+// retryableTransportError reports whether a failure is a connection-level fault
+// worth one immediate retry on a brand-new connection, for the SAME account.
+//
+// These are infrastructure faults, not account faults: a dead or corrupt
+// WebSocket says nothing about the account's quota or credentials. new-api
+// draws the same line — the error class decides the retry, and the channel is
+// penalised separately from the request. Retrying here instead of failing over
+// also keeps a pinned conversation on its account.
+//
+// Only pre-stream failures qualify. Once content has been delivered, the caller
+// has already seen part of the answer and a retry would duplicate it, along
+// with any side effects of tool calls the turn already made.
+func retryableTransportError(err error) bool {
+	var dialErr *chathub.DialError
+	if !errors.As(err, &dialErr) {
+		return false
+	}
+	if dialErr.Streamed {
+		return false
+	}
+	switch dialErr.Kind {
+	case "WS_PROTOCOL", "WS_HANDSHAKE", "TCP", "SOCKS5", "DNS", "TLS":
+		return true
+	}
+	return false
+}
+
+// freshConnectionRequest marks a retry as needing a brand-new WebSocket instead
+// of a parked one, so it cannot land on the connection that just failed (or a
+// sibling parked in the same state).
+func freshConnectionRequest(request chathub.Request) chathub.Request {
+	request.BypassPool = true
+	return request
+}
+
 func (s *Server) chatWithAccount(ctx context.Context, accountID string, account chathub.Account, request chathub.Request) (chathub.Result, error) {
 	release, err := s.accountConcurrency.Acquire(ctx, accountID)
 	if err != nil {
@@ -178,6 +215,10 @@ func (s *Server) chatWithAccount(ctx context.Context, accountID string, account 
 		s.accountPool.MarkCall(accountID)
 	}
 	result, err := s.accountClient(accountID).Chat(ctx, account, request)
+	if err != nil && retryableTransportError(err) && ctx.Err() == nil {
+		log.Printf("[conn-retry] account=%s kind=%s retrying once on a fresh connection", accountID, err)
+		result, err = s.accountClient(accountID).Chat(ctx, account, freshConnectionRequest(request))
+	}
 	s.recordAccountResultForCapability(accountID, result, err, request.Capability)
 	if err == nil {
 		s.recordAllowanceConsumption(accountID, request)
@@ -198,6 +239,10 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 		s.accountPool.MarkCall(accountID)
 	}
 	result, err := s.accountClient(accountID).ChatWithEvents(ctx, account, request, onEvent)
+	if err != nil && retryableTransportError(err) && ctx.Err() == nil {
+		log.Printf("[conn-retry] account=%s kind=%s retrying once on a fresh connection (events)", accountID, err)
+		result, err = s.accountClient(accountID).ChatWithEvents(ctx, account, freshConnectionRequest(request), onEvent)
+	}
 	s.recordAccountResultForCapability(accountID, result, err, request.Capability)
 	if err == nil {
 		s.recordAllowanceConsumption(accountID, request)

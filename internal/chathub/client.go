@@ -316,6 +316,11 @@ type Request struct {
 	DeviceOS              string
 	Capability            string
 	ExecutionAnchor       string
+	// BypassPool forces a freshly dialed WebSocket connection instead of
+	// reusing a parked one. It is set by the web layer when it retries a
+	// request that just failed at the transport level, so the retry cannot
+	// land on the same (possibly corrupt) parked connection.
+	BypassPool bool
 }
 
 type FeatureFlags struct {
@@ -596,7 +601,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var poolErrs <-chan error
 	if c.Pool != nil {
 		var poolErr error
-		conn, connWriteMu, poolFrames, poolErrs, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL)
+		conn, connWriteMu, poolFrames, poolErrs, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL, req.BypassPool)
 		if poolErr != nil {
 			if errors.Is(poolErr, context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: poolErr}
@@ -659,28 +664,33 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return conn.WriteMessage(msgType, data)
 	}
 
-	returnConn := false
+	// A connection is never handed back to the pool from here.
+	//
+	// A pooled connection keeps the park pump as its single reader for life, so
+	// it is dropped after one use rather than re-parked. A freshly dialed
+	// connection is read by this request's own reader goroutine, and parking it
+	// would start a SECOND reader (the park pump) on the same connection.
+	// gorilla forbids concurrent readers: both share one frame parser, and the
+	// corruption does not show up here — it surfaces on the next request that
+	// takes the connection, as "RSV2 set, bad opcode" protocol errors. That was
+	// the source of ~12% of all upstream failures.
 	defer func() {
-		if returnConn && conn != nil && c.Pool != nil {
-			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			c.Pool.Return(acc.OID, acc.TID, conn)
-		} else if conn != nil {
-			if c.Pool != nil && reused {
-				// A pooled lease that failed must leave the leased set now;
-				// waiting for the GC safety net would pin a dead entry for
-				// minutes. Discard also closes the connection.
-				c.Pool.Discard(acc.OID, acc.TID, conn)
-			} else {
-				conn.Close()
-			}
+		if conn == nil {
+			return
 		}
+		if c.Pool != nil && reused {
+			// A pooled lease must leave the leased set now; waiting for the GC
+			// safety net would pin a dead entry for minutes. Discard also
+			// closes the connection.
+			c.Pool.Discard(acc.OID, acc.TID, conn)
+			return
+		}
+		conn.Close()
 	}()
 
 	phase = PhaseUpload
 	if len(req.Attachments) > 0 {
 		if attachErr := <-attachCh; attachErr != nil {
-			returnConn = false
 			return Result{}, fmt.Errorf("upload attachment: %w", attachErr)
 		}
 	}
@@ -690,14 +700,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 	if !reused {
 		if err := wsWrite(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
-			returnConn = false
 			if errors.Is(err, context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
 			}
 			return Result{}, &DialError{Status: 0, Kind: "WS_HANDSHAKE", cause: fmt.Errorf("handshake send: %w", err)}
 		}
 		if _, _, err := conn.ReadMessage(); err != nil {
-			returnConn = false
 			if errors.Is(err, context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
 			}
@@ -724,7 +732,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	payloadSentAt := time.Now()
 	ts := Timestamps{RequestSent: payloadSentAt.UTC().Format(time.RFC3339Nano)}
 	if err := wsWrite(websocket.TextMessage, []byte(payload)); err != nil {
-		returnConn = false
 		if errors.Is(err, context.Canceled) {
 			return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
 		}
@@ -933,7 +940,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		var read wsRead
 		select {
 		case <-ctx.Done():
-			returnConn = false
 			_ = conn.Close()
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
@@ -942,19 +948,16 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		case r, ok := <-readCh:
 			if !ok {
 				if ctx.Err() != nil {
-					returnConn = false
 					if errors.Is(ctx.Err(), context.Canceled) {
 						return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
 					}
 					return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", Streamed: phase >= PhaseStreaming, cause: ctx.Err()}
 				}
-				returnConn = false
 				return Result{}, fmt.Errorf("ws read before completion: %w", io.ErrUnexpectedEOF)
 			}
 			read = r
 		}
 		if read.err != nil {
-			returnConn = false
 			if errors.Is(read.err, context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: fmt.Errorf("ws read before completion: %w", read.err)}
 			}
@@ -1013,7 +1016,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						beforeTools := len(seenStreamTools)
 						for _, ev := range extractToolEvents(arg, seenStreamTools) {
 							if err := onEvent(ev); err != nil {
-								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -1030,7 +1032,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						ev.Raw = eventRaw(arg)
 						if ev.Kind != "text" && onEvent != nil {
 							if err := onEvent(ev); err != nil {
-								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -1072,11 +1073,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						// 33-47 upstream frames into 2-3 giant SSE chunks.
 						if streamed.Len() > 0 {
 							if err := emitDelta(w); err != nil {
-								returnConn = false
 								return Result{}, err
 							}
 						} else if err := emitSnapshot(w); err != nil {
-							returnConn = false
 							return Result{}, err
 						}
 					}
@@ -1189,7 +1188,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 								// ChatHub often sends the first visible text as a full snapshot,
 								// followed by cursor deltas. Emit only the unseen suffix.
 								if err := emitSnapshot(text); err != nil {
-									returnConn = false
 									return Result{}, err
 								}
 							}
@@ -1227,32 +1225,26 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							log.Printf("[chathub] result.value=%q (non-Success)", rawResult)
 							low := strings.ToLower(rawResult)
 							if strings.Contains(low, "throttl") {
-								returnConn = false
 								return Result{}, &MeteringError{Cause: ErrMeteringThrottled, Throttling: throttling, Metering: meteringInformation}
 							}
-							returnConn = false
 							return Result{}, fmt.Errorf("upstream result error: %s", rawResult)
 						}
 						if mi, ok := res["meteringInformation"]; ok && mi != nil {
 							meteringInformation = mi
 							if meterErr := checkMeteringError(mi); meterErr != nil {
 								log.Printf("[chathub] meteringError in type:2 frame: %v", meterErr)
-								returnConn = false
 								return Result{}, &MeteringError{Cause: meterErr, Throttling: throttling, Metering: meteringInformation}
 							}
 						}
 						if msg, ok := res["message"].(string); ok {
 							final = msg
 							if imageLimitDetected(final) {
-								returnConn = false
 								return Result{}, &MeteringError{Cause: ErrImageLimit, Throttling: throttling, Metering: meteringInformation}
 							}
 							if rateLimited(final) {
-								returnConn = false
 								return Result{}, ErrRateLimitNotice
 							}
 							if IsContentPolicyBlock(final) {
-								returnConn = false
 								return Result{}, ErrOffensiveContent
 							}
 						}
@@ -1264,7 +1256,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 			if int(t) == 3 {
 				if errObj, ok := obj["error"].(map[string]any); ok {
-					returnConn = false
 					errCode, _ := errObj["code"].(string)
 					errMsg, _ := errObj["message"].(string)
 					switch errCode {
@@ -1287,35 +1278,28 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				// handler already rejects notice finals, so this only fires
 				// on frame-order anomalies.
 				if rateLimited(final) {
-					returnConn = false
 					return Result{}, ErrRateLimitNotice
 				}
 				text, ferr := finalizeText(streamed.String(), final, skippedSnapshots, emitDelta)
 				if ferr != nil {
-					returnConn = false
 					return Result{}, ferr
 				}
 				if text == "" {
 					text = strings.Join(deltas, "")
 				}
 				if imageLimitDetected(text) {
-					returnConn = false
 					return Result{}, &MeteringError{Cause: ErrImageLimit, Throttling: throttling, Metering: meteringInformation}
 				}
 				if rateLimited(text) {
-					returnConn = false
 					return Result{}, ErrRateLimitNotice
 				}
 				if text == "" {
-					returnConn = false
 					return Result{}, ErrEmptyCompletion
 				}
 				if offense != "" {
-					returnConn = false
 					return Result{}, ErrOffensiveContent
 				}
 				if IsContentPolicyBlock(text) {
-					returnConn = false
 					return Result{}, ErrOffensiveContent
 				}
 				result := Result{
@@ -1342,7 +1326,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				// The turn completed cleanly, so the socket is safe to re-park.
 				// Every failure path above clears this flag; without setting it
 				// here the pool could only ever be filled by Warm.
-				returnConn = true
 				return result, nil
 			}
 		}
@@ -1351,7 +1334,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// Reaching the overall deadline without a SignalR completion frame is
 	// an incomplete upstream response. Do not return accumulated deltas as if
 	// they were a successful, finished answer.
-	returnConn = false
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
 }
 

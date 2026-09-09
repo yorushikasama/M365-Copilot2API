@@ -167,7 +167,11 @@ func removePooledLocked(conns map[string][]*pooledConn, key string, target *pool
 	}
 }
 
-func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*websocket.Conn, *sync.Mutex, <-chan []byte, <-chan error, bool, error) {
+// Take hands out a connection for one request. bypassPool forces a fresh dial
+// even when a healthy connection is parked: after a transport-level failure the
+// request is retried on a brand-new connection instead of reusing one whose
+// parked siblings may be in the same bad state.
+func (p *ConnPool) Take(ctx context.Context, oid, tid, wsURL string, bypassPool bool) (*websocket.Conn, *sync.Mutex, <-chan []byte, <-chan error, bool, error) {
 	p.mu.Lock()
 	key := p.key(oid, tid)
 	conns := p.conns[key]
@@ -175,7 +179,7 @@ func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*we
 	var stale []*pooledConn
 	kept := conns[:0]
 	for _, pc := range conns {
-		if picked == nil && pc.handshook && time.Since(pc.created) < poolConnTTL {
+		if picked == nil && !bypassPool && pc.handshook && time.Since(pc.created) < poolConnTTL {
 			picked = pc
 			continue
 		}
@@ -257,57 +261,25 @@ func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	pc := newPooledConn(conn)
-	pc.handshook = true
-	p.mu.Lock()
-	if len(p.conns[key]) >= maxPoolPerKey {
-		p.mu.Unlock()
-		conn.Close()
-		return
-	}
-	p.conns[key] = append(p.conns[key], pc)
-	p.mu.Unlock()
-	p.startPark(key, pc)
+	p.park(key, conn)
 
 	log.Printf("[connpool] warmed connection oid=%s tid=%s", acc.OID, acc.TID)
 }
 
-func (p *ConnPool) WarmWithProbe(ctx context.Context, acc Account, wsURL string) {
-	p.Warm(ctx, acc, wsURL)
-}
-
-// Return re-parks a healthy connection so the next request for the same account
-// can skip the WebSocket handshake.
+// park is the ONLY way a connection enters the pool, and it is the only place
+// the pump is started. It exists as a single chokepoint because the caller must
+// not have read from the connection itself: startPark makes the pump the
+// connection's permanent sole reader, and any second reader (a request-scoped
+// one, for example) would share gorilla's frame parser with it and corrupt it.
 //
-// Only freshly dialed connections are re-parked. A connection taken from the
-// pool already owns a permanent reader goroutine, and gorilla forbids concurrent
-// readers, so parking it again would either race that reader or risk handing a
-// frame from one request to another. Those are closed instead.
-func (p *ConnPool) Return(oid, tid string, conn *websocket.Conn) {
-	if conn == nil {
-		return
-	}
-	key := p.key(oid, tid)
-
-	p.mu.Lock()
-	_, wasPooled := p.leased[conn]
-	delete(p.leased, conn)
-	full := len(p.conns[key]) >= maxPoolPerKey
-	p.mu.Unlock()
-
-	if wasPooled || full || oid == "" {
-		conn.Close()
-		return
-	}
-
-	// Callers arm short deadlines before handing the connection back; a parked
-	// connection must have none, otherwise the read pump trips immediately and
-	// evicts what we just parked. Clear them BEFORE publishing: a concurrent
-	// Take could otherwise hand out a connection whose pump dies on the stale
-	// deadline.
-	_ = conn.SetReadDeadline(time.Time{})
-	_ = conn.SetWriteDeadline(time.Time{})
-
+// The corruption is deferred, which is what made it hard to trace: the two
+// readers only tear the parser state apart, and the damage is observed by the
+// NEXT request that takes the connection, as "RSV2 set, bad opcode" — long
+// after the code that caused it has returned successfully.
+//
+// The caller must publish with no read deadline armed: startPark reads
+// immediately, and a stale deadline would evict what was just parked.
+func (p *ConnPool) park(key string, conn *websocket.Conn) {
 	pc := newPooledConn(conn)
 	pc.handshook = true
 	p.mu.Lock()
@@ -319,7 +291,10 @@ func (p *ConnPool) Return(oid, tid string, conn *websocket.Conn) {
 	p.conns[key] = append(p.conns[key], pc)
 	p.mu.Unlock()
 	p.startPark(key, pc)
-	log.Printf("[connpool] parked returned connection oid=%s", oid)
+}
+
+func (p *ConnPool) WarmWithProbe(ctx context.Context, acc Account, wsURL string) {
+	p.Warm(ctx, acc, wsURL)
 }
 
 // Discard drops a connection that must not be reused.
