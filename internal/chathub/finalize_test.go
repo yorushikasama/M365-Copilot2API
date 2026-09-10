@@ -118,6 +118,27 @@ func TestFinalizeTextPrefersFinalOnDivergence(t *testing.T) {
 	}
 }
 
+func TestFinalizeTextPrefersFinalAfterMidStreamRewrite(t *testing.T) {
+	// Regression for the 2026-09-10 07:33 incident: upstream rewrote streamed
+	// content mid-answer (three throttled regenerations), and the glued
+	// streamed text grew LONGER than the authoritative final message. The
+	// rewrite must win the result back to final — length alone must not
+	// keep a Frankenstein hybrid of several generations.
+	streamed := "clean start\n<File>v1</File>\n具栏空间不足" // glued hybrid, longer than final
+	final := "clean start\n## 具体改动方案\n\n- `.hist-chart` 使用 `flex: 1`"
+	var emitted []string
+	got, err := finalizeText(streamed, final, 3, collectEmit(&emitted))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != final {
+		t.Fatalf("got %q, want the authoritative final %q", got, final)
+	}
+	if len(emitted) != 0 {
+		t.Fatalf("expected no emitted deltas on rewrite divergence, got %v", emitted)
+	}
+}
+
 func TestFinalizeTextPropagatesEmitError(t *testing.T) {
 	wantErr := errors.New("client went away")
 	_, err := finalizeText("prefix ", "prefix and tail", 0, func(string) error { return wantErr })

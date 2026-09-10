@@ -825,6 +825,8 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// reconciled against the authoritative final message on completion
 	// (see finalizeText). Logged once as a summary instead of per frame.
 	skippedSnapshots := 0
+	rewriteLogged := false
+	streamSuppressed := false
 	emitSnapshot := func(snapshot string) error {
 		if snapshot == "" {
 			return nil
@@ -848,16 +850,22 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if strings.HasPrefix(snapshot, cur) {
 			return emitDelta(snapshot[len(cur):])
 		}
-		if len(snapshot) <= len(cur) {
-			return nil
-		}
-		overlap := commonPrefixLen(cur, snapshot)
-		if overlap > 0 {
-			return emitDelta(snapshot[overlap:])
-		}
+		// Non-prefix snapshot: upstream revised content it had already sent
+		// (mid-stream regeneration, e.g. after an internal throttle retry).
+		// Splicing the divergent tail onto the emitted text fabricates a
+		// hybrid of two generations — duplicated sections with words cut at
+		// every revision boundary — which surfaced as an answer mixing three
+		// rewritten variants of the same list (2026-09-10 07:33 incident).
+		// The snapshot protocol's newest full snapshot and the type-2 final
+		// message are authoritative; stop emitting here and let finalizeText
+		// reconcile the result from `final`.
 		skippedSnapshots++
-		if chTrace {
-			log.Printf("[trace:emitSnapshot] skip: cur=%d snapshot=%d (non-prefix rewrite)", len(cur), len(snapshot))
+		streamSuppressed = true
+		if !rewriteLogged {
+			rewriteLogged = true
+			log.Printf("[chathub] upstream rewrote streamed content; suppressing further deltas (cur=%d snapshot=%d)", len(cur), len(snapshot))
+		} else if chTrace {
+			log.Printf("[trace:emitSnapshot] skip: cur=%d snapshot=%d (rewrite)", len(cur), len(snapshot))
 		}
 		return nil
 	}
@@ -1076,7 +1084,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							suggestions = append(suggestions, parseSuggestedResponse(sr))
 						}
 					}
-					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame {
+					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame && !streamSuppressed {
 						// HAR report 05 §3: writeAtCursor is a pure append
 						// fragment (cursor p=-1, 12/12 samples). Once a text
 						// baseline exists, forward it as a delta immediately
@@ -1084,6 +1092,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						// cumulative snapshot prefix-matches and dedupes.
 						// Treating it as a snapshot (old behavior) collapsed
 						// 33-47 upstream frames into 2-3 giant SSE chunks.
+						// Once upstream has rewritten streamed content, the
+						// cursor fragments belong to the stale generation and
+						// must not reach the client either (see emitSnapshot).
 						if streamed.Len() > 0 {
 							if err := emitDelta(w); err != nil {
 								return Result{}, err
@@ -1358,7 +1369,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 // prefix check, diverged from the real answer (issue #51). The final message
 // is upstream's source of truth, so:
 //
-//   - final no longer than streamed → keep the streamed text;
+//   - final no longer than streamed → keep the streamed text, unless the
+//     stream was poisoned by a mid-stream upstream rewrite (skipped > 0), in
+//     which case the authoritative final message wins;
 //   - streamed is a proper prefix of final → the stream missed the tail;
 //     emit the missing part so streaming clients also receive the complete
 //     answer, then return final;
@@ -1366,17 +1379,20 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 //     be retracted, but final is returned as the Result text so non-stream
 //     callers and conversation history stay correct.
 func finalizeText(streamedText, final string, skipped int, emit func(string) error) (string, error) {
-	if final == "" || len(final) <= len(streamedText) {
-		if streamedText == "" {
-			return final, nil
-		}
+	if final == "" {
 		return streamedText, nil
+	}
+	if final == streamedText {
+		return final, nil
 	}
 	if strings.HasPrefix(final, streamedText) {
 		if err := emit(final[len(streamedText):]); err != nil {
 			return "", err
 		}
 		return final, nil
+	}
+	if skipped == 0 && len(final) <= len(streamedText) {
+		return streamedText, nil
 	}
 	log.Printf("[emitSnapshot] streamed text diverged from final result (streamed=%d final=%d skipped_snapshots=%d); using final", len(streamedText), len(final), skipped)
 	return final, nil
