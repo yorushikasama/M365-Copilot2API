@@ -617,7 +617,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 			return Result{}, wrapDialError(poolErr, 0, 0)
 		}
-		if reused {
+		// Top the pool up after a hit AND after a miss. Warming only on a hit
+		// deadlocks it: parked connections expire after poolConnTTL, so once the
+		// pool drains there is no hit left to trigger the next warm and every
+		// request pays a fresh dial forever.
+		if reused || c.Pool.ShouldWarm(acc.OID, acc.TID) {
 			go func() {
 				warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()

@@ -46,17 +46,20 @@ type ConnPool struct {
 	leased map[*websocket.Conn]time.Time
 	dialer *websocket.Dialer
 	header http.Header
-	stop   chan struct{}
-	closed bool
+	// lastWarm throttles top-ups after a pool miss (see ShouldWarm).
+	lastWarm map[string]time.Time
+	stop     chan struct{}
+	closed   bool
 }
 
 func NewConnPool(dialer *websocket.Dialer, header http.Header) *ConnPool {
 	p := &ConnPool{
-		conns:  make(map[string][]*pooledConn),
-		leased: make(map[*websocket.Conn]time.Time),
-		dialer: dialer,
-		header: header,
-		stop:   make(chan struct{}),
+		conns:    make(map[string][]*pooledConn),
+		leased:   make(map[*websocket.Conn]time.Time),
+		dialer:   dialer,
+		header:   header,
+		lastWarm: make(map[string]time.Time),
+		stop:     make(chan struct{}),
 	}
 	go p.gcLoop()
 	return p
@@ -222,6 +225,33 @@ func (p *ConnPool) Take(ctx context.Context, oid, tid, wsURL string, bypassPool 
 		return nil, nil, nil, nil, false, err
 	}
 	return conn, nil, nil, nil, false, nil
+}
+
+// warmMinInterval throttles post-miss top-ups so that a burst of parallel
+// requests cannot double the upstream dial rate.
+const warmMinInterval = 10 * time.Second
+
+// ShouldWarm reports whether the pool should top a key up after a miss.
+//
+// Warming only when a connection was reused deadlocks the pool: parked
+// connections expire after poolConnTTL, and with no hits there is no warm, so
+// the pool never refills and every later request pays a fresh dial. Observed
+// 2026-09-10: 137 requests after start-up, 137 with reused=false, 0 pool hits —
+// the start-up warm batch had already aged past its TTL before the first
+// request arrived, and nothing ever warmed again.
+func (p *ConnPool) ShouldWarm(oid, tid string) bool {
+	key := p.key(oid, tid)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	now := time.Now()
+	if now.Sub(p.lastWarm[key]) < warmMinInterval {
+		return false
+	}
+	p.lastWarm[key] = now
+	return true
 }
 
 func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) {

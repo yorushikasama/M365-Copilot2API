@@ -274,13 +274,21 @@ func TestBuildRoutePromptSlimming(t *testing.T) {
 		t.Fatal("slim prompt must still contain the most recent message")
 	}
 
-	// Deictic input in the recent window upgrades to the full prompt.
+	// Deictic input in the recent window upgrades to a wider window: strictly
+	// more history than the slim tail, but still bounded well below the full
+	// prompt (the full prompt reached 208KB on real agent sessions).
 	deictic := msgs[:len(msgs)-1]
 	deictic = append(deictic, oaiMsg{Role: "user", Content: "继续用上面第一个工具"})
 	bodyDeictic := &oaiReq{Messages: deictic, ToolChoice: "auto"}
 	upgraded := s.buildRoutePrompt(bodyDeictic, flatAll, flatAll, agentLedger{}, "", toolMaps)
-	if len(upgraded) < len(full) {
-		t.Fatalf("deictic routing must use the full prompt (%d < %d)", len(upgraded), len(full))
+	if len(upgraded) <= len(slim) {
+		t.Fatalf("deictic routing must widen the window (upgraded=%d <= slim=%d)", len(upgraded), len(slim))
+	}
+	if len(upgraded) >= len(full) {
+		t.Fatalf("deictic routing must stay bounded (upgraded=%d >= full=%d)", len(upgraded), len(full))
+	}
+	if !strings.Contains(upgraded, "继续用上面第一个工具") {
+		t.Fatal("upgraded prompt must contain the deictic user message")
 	}
 }
 

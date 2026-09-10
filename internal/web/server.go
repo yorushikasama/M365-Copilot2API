@@ -2100,6 +2100,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+		// Keep a copy of the raw decision: filterCompletedCalls filters in
+		// place, and the answer turn needs the originals to explain itself when
+		// every call is dropped as a duplicate.
+		rawCalls := append([]detectedToolCall(nil), calls...)
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
 		if !parsed {
@@ -2110,6 +2114,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
+				rawCalls = append([]detectedToolCall(nil), calls...)
 				calls = filterCompletedCalls(calls, ledger)
 				calls, _ = validateCalls("router", calls)
 			}
@@ -2118,7 +2123,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// Observability: a silent empty router decision is the hardest
 			// failure mode to diagnose after the fact (the client just sees a
 			// chatty answer instead of tool calls). Record the decision.
-			log.Printf("[router-nocalls] id=%s stream=true route_prompt_len=%d parsed=%t upstream_text=%q", requestID, len(routePrompt), parsed, compactToolResult(routeRes.Text, 300))
+			log.Printf("[router-nocalls] id=%s stream=true route_prompt_len=%d parsed=%t raw_calls=%d upstream_text=%q", requestID, len(routePrompt), parsed, len(rawCalls), compactToolResult(routeRes.Text, 300))
+		}
+		if len(calls) == 0 && len(rawCalls) > 0 {
+			// Every parsed call was dropped as already-completed. Hand the
+			// answer turn the recorded result instead of letting the model
+			// discover its own call vanished and fill the gap with invention.
+			if notice := duplicateCallNotice(rawCalls, ledger); notice != "" {
+				log.Printf("[router-dedup] id=%s dropped=%d notice_len=%d", requestID, len(rawCalls), len(notice))
+				answerPrompt += notice
+			}
 		}
 		if parsed && len(calls) > 0 {
 			scope := fmt.Sprintf("%d:%v:stream", len(body.Messages), completedCallIDs(ledger))
@@ -2407,12 +2421,22 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// Keep a copy of the raw decision: filterCompletedCalls filters in
+		// place, and the answer turn needs the originals to explain itself when
+		// every call is dropped as a duplicate.
+		rawCalls := append([]detectedToolCall(nil), calls...)
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
 		if len(calls) == 0 {
 			// Observability: record why the request fell through to the plain
 			// answer turn (see the streaming twin of this log line).
-			log.Printf("[router-nocalls] id=%s stream=false route_prompt_len=%d parsed=%t upstream_text=%q", requestID, len(routePrompt), parsed, compactToolResult(routeRes.Text, 300))
+			log.Printf("[router-nocalls] id=%s stream=false route_prompt_len=%d parsed=%t raw_calls=%d upstream_text=%q", requestID, len(routePrompt), parsed, len(rawCalls), compactToolResult(routeRes.Text, 300))
+		}
+		if len(calls) == 0 && len(rawCalls) > 0 {
+			if notice := duplicateCallNotice(rawCalls, ledger); notice != "" {
+				log.Printf("[router-dedup] id=%s dropped=%d notice_len=%d", requestID, len(rawCalls), len(notice))
+				answerPrompt += notice
+			}
 		}
 		if len(calls) > 0 {
 			scope := fmt.Sprintf("%d:%v", len(body.Messages), completedCallIDs(ledger))

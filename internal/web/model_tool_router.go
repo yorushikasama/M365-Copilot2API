@@ -3,18 +3,113 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"sort"
 	"strings"
 
 	"m365-copilot2api/internal/chathub"
 )
 
+// maxRouterToolDescChars caps one tool's description in the router catalogue.
+const maxRouterToolDescChars = 300
+
+// routerToolCatalogue renders the tool list for the router turn.
+//
+// A coding-agent toolset ships 50+ complete JSON schemas; marshalled, that is
+// 100KB+ uploaded on every single tool decision — on 2026-09-10 it was the
+// larger half of a 213KB route prompt (the flattened history was 98KB), and it
+// is re-uploaded for every router turn of every request. Routing only needs the
+// tool's name, what it does, and which arguments it takes: the model still
+// emits concrete arguments, and validateDetectedToolCalls checks them against
+// the real schemas afterwards.
+//
+// Set M365_ROUTER_FULL_TOOL_SCHEMAS=true to restore the verbose catalogue.
+func routerToolCatalogue(tools []map[string]any) []map[string]any {
+	if len(tools) == 0 || os.Getenv("M365_ROUTER_FULL_TOOL_SCHEMAS") == "true" {
+		return tools
+	}
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		f, _ := t["function"].(map[string]any)
+		if f == nil {
+			f = t
+		}
+		name, _ := f["name"].(string)
+		if name == "" {
+			// Nothing to route without a name; keep the original entry.
+			out = append(out, t)
+			continue
+		}
+		entry := map[string]any{"name": name}
+		if d, _ := f["description"].(string); d != "" {
+			d = strings.TrimSpace(strings.Join(strings.Fields(d), " "))
+			if len(d) > maxRouterToolDescChars {
+				d = d[:maxRouterToolDescChars] + "…"
+			}
+			entry["desc"] = d
+		}
+		if args := routerToolArgs(f["parameters"]); len(args) > 0 {
+			entry["args"] = args
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// routerToolArgs reduces a JSON schema to "argument name -> type", marking
+// required arguments with a trailing "*" and listing the fields of object
+// arguments so the model can still build them.
+func routerToolArgs(params any) map[string]string {
+	p, _ := params.(map[string]any)
+	if p == nil {
+		return nil
+	}
+	props, _ := p["properties"].(map[string]any)
+	if len(props) == 0 {
+		return nil
+	}
+	required := map[string]bool{}
+	if list, ok := p["required"].([]any); ok {
+		for _, v := range list {
+			if s, ok := v.(string); ok {
+				required[s] = true
+			}
+		}
+	}
+	args := make(map[string]string, len(props))
+	for k, v := range props {
+		typ := "any"
+		if m, ok := v.(map[string]any); ok {
+			if tv, ok := m["type"].(string); ok && tv != "" {
+				typ = tv
+			}
+			if nested, ok := m["properties"].(map[string]any); ok && len(nested) > 0 {
+				keys := make([]string, 0, len(nested))
+				for k2 := range nested {
+					keys = append(keys, k2)
+				}
+				sort.Strings(keys)
+				if len(keys) > 8 {
+					keys = keys[:8]
+				}
+				typ += "{" + strings.Join(keys, ",") + "}"
+			}
+		}
+		if required[k] {
+			typ += "*"
+		}
+		args[k] = typ
+	}
+	return args
+}
+
 func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, anchors ...string) string {
-	defs, _ := json.Marshal(tools)
+	defs, _ := json.Marshal(routerToolCatalogue(tools))
 	mode := normalizedToolChoiceMode(choice)
 	rules := `- If a tool is needed, respond with: CALL_TOOL: tool_name({"arg1":"value1"})
 - If no tool is needed, respond with: NO_TOOL_NEEDED
 - Only use tools from the available list above
-- Validate all arguments against the tool's schema
+- Use exactly the argument names listed for the tool (a trailing * marks a required argument)
 - Do not invent tools that are not in the list`
 	// The router decides ONE next step, which structurally biases the model
 	// toward the delegation tool: "the single call that does the most work"

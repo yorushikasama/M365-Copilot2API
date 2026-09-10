@@ -134,6 +134,21 @@ func (s *Server) buildRoutePrompt(body *oaiReq, fullPrompt, answerPrompt string,
 	}
 	window := routerWindowMessages(body.Messages, cfg.RouterPromptTailMessages)
 	if routerWindowNeedsFullHistory(window) {
+		// Deictic input needs more history than the tail, but "full" is
+		// unbounded: on a long agent session it reached 208KB and cost 12-17s
+		// per router turn (2026-09-10). Widen the window instead — the ledger
+		// already carries the executed-tool evidence that anaphora usually
+		// points at, so the oldest turns rarely change the decision.
+		if os.Getenv("M365_ROUTER_FULL_ON_REFERENCE") != "true" {
+			wide := routerWindowMessages(body.Messages, cfg.RouterPromptTailMessages*4)
+			wideFlat, _ := flattenPromptMessages(wide, nil)
+			wideFlat = trimRouterWindowHead(wideFlat, cfg.RouterPromptMaxBytes*6)
+			bounded := modelToolRouterPrompt(wideFlat+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, executionAnchor)
+			log.Printf("[router-slim] upgrade_to_bounded reason=reference_hint full=%d bounded=%d", len(full), len(bounded))
+			if len(bounded) < len(full) {
+				return bounded
+			}
+		}
 		log.Printf("[router-slim] upgrade_to_full reason=reference_hint prompt_len=%d", len(full))
 		return modelToolRouterPrompt(fullPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, executionAnchor)
 	}

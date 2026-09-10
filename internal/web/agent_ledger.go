@@ -192,14 +192,86 @@ func (l agentLedger) hasCompleted(name, args string) bool {
 	}
 	return false
 }
+// readOnlyToolNames are tools whose re-execution is harmless: their result can
+// legitimately change between calls (a file may have been edited in between)
+// and re-reading costs the user nothing.
+//
+// De-duplicating them by name+arguments was the single cause of a silent empty
+// router decision observed 2026-09-10 01:14Z: the model asked to Read a file it
+// had already read, the router dropped the call as "already completed", and the
+// request fell through to the plain answer turn where the model — never told
+// its call had been dropped — produced prose instead of the tool result.
+var readOnlyToolNames = map[string]bool{
+	"read": true, "readfile": true, "read_file": true, "readfiles": true,
+	"notebookread": true, "notebook_read": true, "notebookreadoutput": true,
+	"glob": true, "globfiles": true, "glob_files": true,
+	"grep": true, "search": true, "searchcontent": true, "search_content": true,
+	"codesearch": true, "code_search": true,
+	"ls": true, "list": true, "listdir": true, "list_dir": true, "list_directory": true,
+	"tree": true, "cat": true, "view": true, "show": true, "stat": true, "fileinfo": true,
+	"webfetch": true, "web_fetch": true, "fetch": true, "websearch": true, "web_search": true,
+	"get": true, "describe": true, "inspect": true, "gitstatus": true, "git_status": true,
+}
+
+// isRepeatableTool reports whether a tool may be issued again with identical
+// arguments. Read-only inspection tools may; anything that mutates state
+// (Write/Edit/Bash/...) stays de-duplicated, because repeating it is either
+// wasted work or actively harmful.
+func isRepeatableTool(name string) bool {
+	key := strings.ToLower(strings.TrimSpace(name))
+	key = strings.ReplaceAll(key, "-", "_")
+	key = strings.ReplaceAll(key, " ", "_")
+	if readOnlyToolNames[key] {
+		return true
+	}
+	// Naming variants of the same operation (ReadManyFiles, MultiRead, ...).
+	if strings.HasPrefix(key, "read") || strings.HasPrefix(key, "glob") ||
+		strings.HasPrefix(key, "grep") || strings.HasPrefix(key, "list") {
+		return true
+	}
+	return false
+}
+
 func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToolCall {
 	out := calls[:0]
 	for _, c := range calls {
+		// Repeatable (read-only) calls are never dropped: their result may have
+		// changed, and dropping them silently degrades the turn into prose.
+		if isRepeatableTool(c.Name) {
+			out = append(out, c)
+			continue
+		}
 		if !l.hasCompleted(c.Name, string(c.Arguments)) {
 			out = append(out, c)
 		}
 	}
 	return out
+}
+
+// duplicateCallNotice renders the calls the router de-duplicated away, together
+// with the result they already produced, so the answer turn can use the real
+// evidence instead of guessing. It is the safety net for the (now narrower) case
+// where a non-repeatable call is dropped: without it the model is asked to
+// answer a turn whose only tool decision vanished with no explanation.
+func duplicateCallNotice(calls []detectedToolCall, l agentLedger) string {
+	var b strings.Builder
+	for _, c := range calls {
+		want := canonicalToolArguments(string(c.Arguments))
+		for _, e := range l.Completed {
+			if e.Name != c.Name || canonicalToolArguments(e.Arguments) != want {
+				continue
+			}
+			b.WriteString("\n[already-executed call] ")
+			b.WriteString(c.Name)
+			b.WriteString("(")
+			b.WriteString(compactToolResult(string(c.Arguments), 400))
+			b.WriteString(") was already executed in this session; its recorded result is final:\n")
+			b.WriteString(compactToolResult(e.Result, 3000))
+			b.WriteString("\nDo not repeat this call and do not claim you lack access to it. Use the recorded result, or choose different arguments/a different tool if new work genuinely remains.")
+			break
+		}
+	}
+	return b.String()
 }
 func recordMetering(l *agentLedger, meterError string, hasAccess bool, remaining map[string]int) {
 	if l == nil {
