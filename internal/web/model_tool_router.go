@@ -103,6 +103,38 @@ func routerToolArgs(params any) map[string]string {
 	return args
 }
 
+// answerToolProtocol appends a compact tool-execution contract to the ANSWER
+// turn prompt. new-api never needs an equivalent: its upstreams do native
+// function calling, so the model that reads the history is also the model that
+// decides tool calls. Our Copilot upstream has no tool channel, so the answer
+// turn was text-only and the router alone decided whether work happened — a
+// router misjudgment (2026-09-10: a compacted "继续完成未完成的内容" turn answered
+// NO_TOOL_NEEDED) structurally produced a status report instead of execution.
+// Giving the answering brain the same CALL_TOOL protocol restores the new-api
+// convergence: it can execute the next step itself, and the router degrades
+// to a latency optimization instead of a correctness gate.
+func answerToolProtocol(tools []chathub.Tool) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	maps := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		var f map[string]any
+		_ = json.Unmarshal(tool.Function, &f)
+		maps = append(maps, map[string]any{"type": tool.Type, "function": f})
+	}
+	defs, _ := json.Marshal(routerToolCatalogue(maps))
+	return fmt.Sprintf(`
+
+TOOL EXECUTION PROTOCOL: The tools below are REAL and execute on the caller's machine. When the user's request needs an action performed (reading, searching, running, editing, building), execute it — never reply with a description or status report of what could be done.
+Available tools: %s
+- To execute, your ENTIRE reply must be exactly one call starting at the very first character: CALL_TOOL: tool_name({"arg":"value"}) — no prose before or after it
+- Several independent steps: reply with only one JSON block {"calls":[{"name":"...","arguments":{...}}]}
+- Use exactly the argument names listed (a trailing * marks a required argument); never invent tools that are not listed
+- If the user asks to continue, finish, or complete work and a tool can advance it, emit the tool call — do not answer with a list of unverified items
+- If you answer in prose instead, NEVER mention CALL_TOOL, {"calls" or any protocol marker in the text`, string(defs))
+}
+
 func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, anchors ...string) string {
 	defs, _ := json.Marshal(routerToolCatalogue(tools))
 	mode := normalizedToolChoiceMode(choice)
@@ -173,6 +205,36 @@ func hasDelegationTool(tools []map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// classifyAnswerOutputPrefix inspects the opening bytes of an answer-turn
+// stream to decide whether the model is emitting the tool protocol (a
+// CALL_TOOL line or the {"calls":[...]} envelope) or prose. It returns
+// decided=false while the prefix is still ambiguous (blank, a fence opener, a
+// bare "{"), so the caller keeps buffering, and decided=true with isCall when
+// the disposition is known. Leading whitespace, a ``` fence and an optional
+// "json" tag are skipped before matching.
+func classifyAnswerOutputPrefix(s string) (decided, isCall bool) {
+	t := strings.TrimSpace(s)
+	t = strings.TrimPrefix(t, "```")
+	t = strings.TrimSpace(t)
+	t = strings.TrimPrefix(t, "json")
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return false, false
+	}
+	low := strings.ToLower(t)
+	if strings.HasPrefix(low, "call_tool:") || strings.HasPrefix(low, "call_tool：") {
+		return true, true
+	}
+	if strings.HasPrefix(t, "{") {
+		comp := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(t)
+		if strings.HasPrefix(comp, `{"calls"`) {
+			return true, true
+		}
+		return false, false // could still become the envelope; keep buffering
+	}
+	return true, false
 }
 
 func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {

@@ -1733,6 +1733,12 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 	if len(ledger.Completed) > 0 {
 		answerPrompt += "\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed."
 	}
+	// Answer-turn tool protocol (see answerToolProtocol): in native mode the
+	// schemas already ride along as req.Tools, so the epilogue would duplicate
+	// the catalogue.
+	if planningMode != "native" {
+		answerPrompt += answerToolProtocol(body.Tools)
+	}
 	anchor := ""
 	if len(anchors) > 0 {
 		anchor = anchors[0]
@@ -2203,14 +2209,43 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		var streamedTools []detectedToolCall
 		first := true
 		identityFilter := newPublicIdentityStreamFilter(model)
+		// Answer-turn tool protocol (answerToolProtocol): hold back the opening
+		// bytes until the stream's disposition is known. If the model chose the
+		// CALL_TOOL protocol, nothing may reach the content channel — the tail
+		// parses the accumulated text into tool calls instead. Prose flushes
+		// the holdback and streams on with unchanged granularity.
+		answerToolArmed := planningMode != "native" && len(toolMaps) > 0
+		var toolHold strings.Builder
+		toolHoldDecided, toolHoldMode, textEmitted := false, false, false
 		emitText := func(part string) error {
 			if part == "" {
 				return nil
+			}
+			if answerToolArmed {
+				if toolHoldMode {
+					return nil
+				}
+				if !toolHoldDecided {
+					toolHold.WriteString(part)
+					decided, isCall := classifyAnswerOutputPrefix(toolHold.String())
+					if !decided && toolHold.Len() < 512 {
+						return nil
+					}
+					toolHoldDecided = true
+					if isCall {
+						toolHoldMode = true
+						log.Printf("[answer-tool] id=%s decision=deferred_call stream_suppressed=true", requestID)
+						return nil
+					}
+					part = toolHold.String()
+					toolHold.Reset()
+				}
 			}
 			part = identityFilter.Push(part)
 			if part == "" {
 				return nil
 			}
+			textEmitted = true
 			if err := r.Context().Err(); err != nil {
 				return err
 			}
@@ -2349,6 +2384,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			text.WriteString(res.Text)
 		}
 		rawCalls := streamedTools
+		if len(rawCalls) == 0 && answerToolArmed {
+			// The answer turn carries the tool protocol (answerToolProtocol);
+			// parse its CALL_TOOL/{"calls"} output before the looser fenced
+			// scan. Completed-call dedup keeps the answer brain from redoing
+			// work the ledger already recorded.
+			if parsed, ok := parseModelToolDecision(text.String(), toolMaps, body.ToolChoice); ok && len(parsed) > 0 {
+				parsed = filterCompletedCalls(parsed, ledger)
+				log.Printf("[answer-tool] id=%s decision=call count=%d text_emitted=%t", requestID, len(parsed), textEmitted)
+				rawCalls = parsed
+			}
+		}
 		if len(rawCalls) == 0 {
 			rawCalls = fencedToolCalls(text.String(), toolMaps, body.ToolChoice)
 		}
@@ -2396,6 +2442,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
 			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
+		}
+		if toolHoldMode && len(calls) == 0 && text.Len() > 0 {
+			// The answer turn tried the protocol but produced no valid call;
+			// surface its text rather than an empty message.
+			toolHoldMode = false
+			toolHoldDecided = true
+			log.Printf("[answer-tool] id=%s protocol output failed validation; surfacing as text", requestID)
+			_ = emitText(text.String())
 		}
 		finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
 		if res.Throttling != nil {
@@ -2570,7 +2624,33 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		contentFilter := newPublicIdentityStreamFilter(firstNonEmpty(body.Model, defaultPublicModelName))
 		reasoningFilter := newPublicReasoningStreamFilter()
+		// Answer-turn tool protocol holdback (see the chat-stream twin): keep
+		// the opening bytes back until the disposition is known, so a
+		// CALL_TOOL answer never reaches the content channel.
+		answerToolArmed := planningMode != "native" && len(toolMaps) > 0
+		var answerHold strings.Builder
+		answerHoldDecided, answerHoldMode := false, false
 		onDelta := func(content string) error {
+			if answerToolArmed {
+				if answerHoldMode {
+					return nil
+				}
+				if !answerHoldDecided {
+					answerHold.WriteString(content)
+					decided, isCall := classifyAnswerOutputPrefix(answerHold.String())
+					if !decided && answerHold.Len() < 512 {
+						return nil
+					}
+					answerHoldDecided = true
+					if isCall {
+						answerHoldMode = true
+						log.Printf("[answer-tool] id=%s decision=deferred_call stream_suppressed=true", requestID)
+						return nil
+					}
+					content = answerHold.String()
+					answerHold.Reset()
+				}
+			}
 			if content = contentFilter.Push(content); content != "" {
 				return writeChunk(map[string]any{"content": content})
 			}
@@ -2656,6 +2736,36 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if isImageLimitNotice(res.Text) {
 				if s.accountPool != nil {
 					s.accountPool.MarkImageLimited(acc.ID)
+				}
+			}
+			if answerToolArmed && answerHoldMode {
+				// The whole answer was suppressed as a protocol candidate;
+				// decide from the authoritative final text.
+				if parsed, ok := parseModelToolDecision(res.Text, toolMaps, body.ToolChoice); ok && len(parsed) > 0 {
+					parsed = filterCompletedCalls(parsed, ledger)
+					calls, _ := validateCalls("answer", parsed)
+					if len(calls) > 0 {
+						log.Printf("[answer-tool] id=%s decision=call count=%d", requestID, len(calls))
+						calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+						if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
+							calls = calls[:1]
+						}
+						if body.User != "" && res.ConversationID != "" {
+							s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
+						}
+						s.bindConversation(acc, &body, r, res, prompt, startedAt)
+						s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+						_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, res)
+						return
+					}
+				}
+				// Protocol output failed validation → surface it as text
+				// rather than an empty message.
+				answerHoldMode = false
+				answerHoldDecided = true
+				log.Printf("[answer-tool] id=%s protocol output failed validation; surfacing as text", requestID)
+				if fb := contentFilter.Push(res.Text); fb != "" {
+					_ = writeChunk(map[string]any{"content": fb})
 				}
 			}
 		} else {
@@ -2804,6 +2914,25 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor})
 		if err2 == nil && !isSandboxHallucination(res2.Text) {
 			res = res2
+		}
+	}
+	// Answer-turn tool protocol (answerToolProtocol): the authoritative
+	// CALL_TOOL/{"calls"} parse runs before the looser fenced scan. Without
+	// this the answering brain could only talk, so a router NO_TOOL_NEEDED
+	// misjudgment structurally produced a status report instead of execution.
+	if planningMode != "native" && len(toolMaps) > 0 {
+		if parsed, ok := parseModelToolDecision(res.Text, toolMaps, body.ToolChoice); ok && len(parsed) > 0 {
+			parsed = filterCompletedCalls(parsed, ledger)
+			calls, _ := validateCalls("answer", parsed)
+			if len(calls) > 0 {
+				log.Printf("[answer-tool] id=%s decision=call count=%d", requestID, len(calls))
+				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+				if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
+					calls = calls[:1]
+				}
+				_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, res)
+				return
+			}
 		}
 	}
 	invalidDetectedTool := false

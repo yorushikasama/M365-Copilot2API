@@ -25,8 +25,14 @@ func TestBuildAnswerRequestRouterOmitsNativePlugins(t *testing.T) {
 	if len(req.Tools) != 0 || req.ToolChoice != nil {
 		t.Fatalf("router answer leaked native tools: tools=%d choice=%#v", len(req.Tools), req.ToolChoice)
 	}
-	if req.Text != "[user]\nhello" {
-		t.Fatalf("empty ledger changed answer prompt: %q", req.Text)
+	// The user content must stay intact at the head; the tool protocol
+	// epilogue (answerToolProtocol) is appended because the body declares
+	// tools — the answer brain must keep its own CALL_TOOL channel.
+	if !strings.HasPrefix(req.Text, "[user]\nhello") {
+		t.Fatalf("empty ledger changed answer prompt head: %q", req.Text)
+	}
+	if !strings.Contains(req.Text, "TOOL EXECUTION PROTOCOL") {
+		t.Fatalf("tool-bearing answer turn must carry the tool protocol: %q", req.Text)
 	}
 }
 

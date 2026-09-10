@@ -1,8 +1,11 @@
 package web
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"m365-copilot2api/internal/chathub"
 )
 
 func TestParseModelToolDecisionAutoAndParallel(t *testing.T) {
@@ -123,5 +126,61 @@ func TestModelToolRouterPromptCountersDelegationBias(t *testing.T) {
 	plain := modelToolRouterPrompt("request", testTools(), "auto")
 	if strings.Contains(plain, "your own judgment call") {
 		t.Fatal("bias rule must not appear without a delegation tool")
+	}
+}
+
+// answerToolProtocol gives the ANSWER turn the same CALL_TOOL contract the
+// router has, so a router NO_TOOL_NEEDED misjudgment can no longer structurally
+// force a text-only "status report" answer (2026-09-10).
+func TestAnswerToolProtocolContent(t *testing.T) {
+	schema, _ := json.Marshal(map[string]any{
+		"name":        "get_weather",
+		"description": "weather lookup",
+		"parameters":  map[string]any{"type": "object", "required": []any{"city"}, "properties": map[string]any{"city": map[string]any{"type": "string"}}},
+	})
+	tools := []chathub.Tool{{Type: "function", Function: schema}}
+	ep := answerToolProtocol(tools)
+	if ep == "" {
+		t.Fatal("expected an epilogue for a tool-bearing answer turn")
+	}
+	for _, want := range []string{"TOOL EXECUTION PROTOCOL", "CALL_TOOL: ", `{"calls"`, "get_weather", "city"} {
+		if !strings.Contains(ep, want) {
+			t.Fatalf("epilogue missing %q", want)
+		}
+	}
+	// The compact catalogue, not raw JSON schemas: schema keywords must not leak.
+	for _, banned := range []string{`"required"`, `"properties"`} {
+		if strings.Contains(ep, banned) {
+			t.Fatalf("epilogue must carry the compact catalogue, found raw schema key %s", banned)
+		}
+	}
+	if answerToolProtocol(nil) != "" {
+		t.Fatal("no tools must produce no epilogue")
+	}
+}
+
+func TestClassifyAnswerOutputPrefix(t *testing.T) {
+	cases := []struct {
+		in                 string
+		decided, isCall    bool
+	}{
+		{"", false, false},
+		{"   \n", false, false},
+		{"```", false, false},
+		{"```json\n", false, false},
+		{"{", false, false},
+		{`{"name":"x"`, false, false},
+		{`CALL_TOOL: get_weather({"city":"Paris"})`, true, true},
+		{`call_tool: get_weather({"city":"Paris"})`, true, true},
+		{"```json\n{\"calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}]}\n```", true, true},
+		{`{"calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}`, true, true},
+		{"好的，我来总结一下当前的进度……", true, false},
+		{`The result is {"x":1} and more`, true, false},
+	}
+	for i, c := range cases {
+		decided, isCall := classifyAnswerOutputPrefix(c.in)
+		if decided != c.decided || (decided && isCall != c.isCall) {
+			t.Fatalf("case %d %q: got decided=%v isCall=%v, want decided=%v isCall=%v", i, c.in, decided, isCall, c.decided, c.isCall)
+		}
 	}
 }
