@@ -82,6 +82,16 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 			content, _ := m["content"].([]any)
 			if len(content) > 0 {
 				c, _ := content[0].(map[string]any)
+				// OpenAI emits response.content_part.added before the first
+				// output_text.delta; conforming clients (the AI-SDK responses
+				// adapter among them) create the text part from that event, so
+				// skipping it makes the opening delta land nowhere — an answer
+				// that starts mid-sentence, with its first line missing.
+				part := map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
+				if pid, ok := c["id"].(string); ok && pid != "" {
+					part["id"] = pid
+				}
+				emit("response.content_part.added", map[string]any{"type": "response.content_part.added", "output_index": i, "content_index": 0, "item_id": m["id"], "part": part})
 				emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": i, "content_index": 0, "delta": c["text"]})
 			}
 		} else if m["type"] == "function_call" {

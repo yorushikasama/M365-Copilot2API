@@ -2183,12 +2183,22 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if err := r.Context().Err(); err != nil {
 				return err
 			}
-			delta := map[string]any{"content": part}
 			if first {
-				delta["role"] = "assistant"
 				first = false
+				// The first chunk declares the role with an EMPTY content, and
+				// the text is sent as its own chunk afterwards — the same order
+				// OpenAI emits and the same order new-api's ensureStart() uses.
+				// Packing the role and the first text fragment into one chunk
+				// makes any client/middleware that reads only `role` off the
+				// first chunk drop that fragment, which surfaces as an answer
+				// truncated at the very beginning (a lost list number, a missing
+				// first word).
+				roleChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil}}}
+				if err := sw.data(mustJSON(roleChunk)); err != nil {
+					return err
+				}
 			}
-			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
+			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": part}, "finish_reason": nil}}}
 			if err := sw.data(mustJSON(chunk)); err != nil {
 				return err
 			}
@@ -2507,15 +2517,16 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if err := r.Context().Err(); err != nil {
 				return err
 			}
-			// The first SSE chunk must carry the assistant role; subsequent
-			// chunks carry content or reasoning deltas.
+			// The first SSE chunk declares the role with empty content; the
+			// text itself is emitted as its own chunk (OpenAI/new-api order).
+			// Merging role and content into one chunk loses the first fragment
+			// on clients that only read `role` from chunk #1.
 			if firstDelta {
 				firstDelta = false
-				withRole := map[string]any{"role": "assistant", "content": nil}
-				for k, v := range delta {
-					withRole[k] = v
+				roleChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}}}}
+				if err := sw2.data(mustJSON(roleChunk)); err != nil {
+					return err
 				}
-				delta = withRole
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}}
 			return sw2.data(mustJSON(chunk))
@@ -2849,7 +2860,21 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 			}
 		}()
-		// one-shot "stream" — emit full content then done
+		// one-shot "stream" — emit role, then the full content, then done.
+		// The role is its own chunk for the same reason as the incremental
+		// paths: a client that only reads `role` off the first chunk would
+		// otherwise lose the entire answer.
+		roleChunk := map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{
+				"index": 0,
+				"delta": map[string]any{"role": "assistant", "content": ""},
+			}},
+		}
+		_ = sw3.data(string(mustJSON(roleChunk)))
 		chunk := map[string]any{
 			"id":      id,
 			"object":  "chat.completion.chunk",
@@ -2857,7 +2882,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			"model":   model,
 			"choices": []map[string]any{{
 				"index": 0,
-				"delta": map[string]any{"role": "assistant", "content": res.Text},
+				"delta": map[string]any{"content": res.Text},
 			}},
 		}
 		b, _ := json.Marshal(chunk)

@@ -218,6 +218,10 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			if !textStarted {
 				textStarted = true
 				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
+				// content_part.added must precede the first delta: clients
+				// build the text part from it, and without it the opening
+				// delta can be dropped (answer truncated at the start).
+				emit("response.content_part.added", map[string]any{"type": "response.content_part.added", "output_index": 0, "content_index": 0, "item_id": messageID, "part": map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}})
 			}
 			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": content})
 		}
