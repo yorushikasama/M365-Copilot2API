@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -86,6 +87,20 @@ func CachePath() string {
 // 并将主密钥接入 OS DPAPI/keyring (Windows DPAPI, macOS Keychain, Linux libsecret)，见 TODO 后续。
 const encPrefix = "enc:v1:"
 
+const fallbackPepperRaw = "m365-copilot2api-fallback-pepper-v1-TODO-DPAPI-keyring"
+
+func deriveKey(raw string) []byte {
+	pepper := []byte("m365-copilot2api-pepper-v1")
+	mac := hmac.New(sha256.New, pepper)
+	_, _ = mac.Write([]byte(raw))
+	return mac.Sum(nil)
+}
+
+// fallbackKey is the pepper derived from the built-in public fallback secret.
+// It is only used to decrypt token caches written before M365_MASTER_KEY was
+// configured, so a newly configured master key can transparently migrate them.
+func fallbackKey() []byte { return deriveKey(fallbackPepperRaw) }
+
 func masterKey() []byte {
 	raw := strings.TrimSpace(os.Getenv("M365_MASTER_KEY"))
 	if raw == "" {
@@ -93,12 +108,9 @@ func masterKey() []byte {
 	}
 	if raw == "" {
 		log.Printf("[security] WARNING: M365_MASTER_KEY not set; refresh tokens are encrypted with a built-in public fallback key. Set M365_MASTER_KEY to protect accounts.json at rest.")
-		raw = "m365-copilot2api-fallback-pepper-v1-TODO-DPAPI-keyring"
+		raw = fallbackPepperRaw
 	}
-	pepper := []byte("m365-copilot2api-pepper-v1")
-	mac := hmac.New(sha256.New, pepper)
-	_, _ = mac.Write([]byte(raw))
-	return mac.Sum(nil)
+	return deriveKey(raw)
 }
 
 func isEncrypted(s string) bool { return strings.HasPrefix(s, encPrefix) }
@@ -128,11 +140,20 @@ func encryptRefreshToken(plain string) (string, error) {
 }
 
 func decryptRefreshToken(enc string) (string, error) {
+	pt, _, err := decryptRefreshTokenEx(enc)
+	return pt, err
+}
+
+// decryptRefreshTokenEx decrypts a stored refresh token. legacy=true means the
+// ciphertext was produced by the built-in fallback key (i.e. written before
+// M365_MASTER_KEY was configured); callers should re-encrypt with the current
+// master key on the next save.
+func decryptRefreshTokenEx(enc string) (string, bool, error) {
 	if enc == "" {
-		return "", nil
+		return "", false, nil
 	}
 	if !isEncrypted(enc) {
-		return enc, nil
+		return enc, false, nil
 	}
 	raw := strings.TrimPrefix(enc, encPrefix)
 	b, err := base64.StdEncoding.DecodeString(raw)
@@ -140,27 +161,40 @@ func decryptRefreshToken(enc string) (string, error) {
 		if b2, err2 := base64.RawStdEncoding.DecodeString(raw); err2 == nil {
 			b = b2
 		} else {
-			return "", err
+			return "", false, err
 		}
 	}
-	key := masterKey()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
+	open := func(key []byte) (string, error) {
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return "", err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return "", err
+		}
+		if len(b) < gcm.NonceSize() {
+			return "", errors.New("ciphertext too short")
+		}
+		nonce, ct := b[:gcm.NonceSize()], b[gcm.NonceSize():]
+		pt, err := gcm.Open(nil, nonce, ct, nil)
+		if err != nil {
+			return "", err
+		}
+		return string(pt), nil
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
+	current := masterKey()
+	if pt, err := open(current); err == nil {
+		return pt, false, nil
 	}
-	if len(b) < gcm.NonceSize() {
-		return "", errors.New("ciphertext too short")
+	// Legacy migration path: the cache was encrypted with the built-in
+	// fallback key. Only try it when a real master key is configured.
+	if fb := fallbackKey(); !bytes.Equal(fb, current) {
+		if pt, err := open(fb); err == nil {
+			return pt, true, nil
+		}
 	}
-	nonce, ct := b[:gcm.NonceSize()], b[gcm.NonceSize():]
-	pt, err := gcm.Open(nil, nonce, ct, nil)
-	if err != nil {
-		return "", err
-	}
-	return string(pt), nil
+	return "", false, err
 }
 
 func OpenStore(path string) (*Store, error) {
@@ -179,12 +213,19 @@ func OpenStore(path string) (*Store, error) {
 	if err := json.Unmarshal(b, &s.data); err != nil {
 		return nil, err
 	}
+	legacyMigrated := false
 	for i := range s.data.Accounts {
 		a := &s.data.Accounts[i]
-		if dec, err := decryptRefreshToken(a.RefreshToken); err == nil {
-			a.RefreshToken = dec
-		} else if isEncrypted(a.RefreshToken) {
-			log.Printf("[security] WARNING: failed to decrypt refresh token for account %s (email=%s): %v. Token kept as-is; refresh will fail until M365_MASTER_KEY matches the encryption key.", a.ID, a.Email, err)
+		if isEncrypted(a.RefreshToken) {
+			dec, wasLegacy, err := decryptRefreshTokenEx(a.RefreshToken)
+			if err == nil {
+				a.RefreshToken = dec
+				if wasLegacy {
+					legacyMigrated = true
+				}
+			} else {
+				log.Printf("[security] WARNING: failed to decrypt refresh token for account %s (email=%s): %v. Token kept as-is; refresh will fail until M365_MASTER_KEY matches the encryption key.", a.ID, a.Email, err)
+			}
 		}
 		if a.OID == "" {
 			a.OID = a.ID
@@ -192,6 +233,16 @@ func OpenStore(path string) (*Store, error) {
 		if a.ID == "" {
 			a.ID = a.OID
 		}
+	}
+	if legacyMigrated {
+		// Tokens written under a previous key (e.g. the built-in fallback)
+		// were decrypted via the legacy path. Re-persist the cache so they
+		// are re-encrypted with the currently configured master key.
+		s.mu.Lock()
+		if err := s.saveLocked(); err != nil {
+			log.Printf("[security] WARNING: failed to re-encrypt token cache with current master key: %v", err)
+		}
+		s.mu.Unlock()
 	}
 	return s, nil
 }
