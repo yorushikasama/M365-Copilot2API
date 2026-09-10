@@ -16,8 +16,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// sessionBinding 璁板綍涓€娆″唴瀹归敭澶嶇敤鐨勪細璇濄€侷dentity 瀛楁锛圛P/user锛変粎浣?
-// 璇婃柇鍏冩暟鎹繚鐣欙紝鍖归厤鍒ゅ畾鍙緷璧栦笂涓嬫枃鍐呭锛岃 Resolve 鐨勫唴瀹归敭閫昏緫銆?
+// sessionBinding records one content-keyed conversation reuse. The identity
+// fields (IP/user) are kept for diagnostics only: matching depends on the
 type sessionBinding struct {
 	SessionID      string    `json:"sessionId"`
 	ConversationID string    `json:"conversationId"`
@@ -28,8 +28,8 @@ type sessionBinding struct {
 	ClientIP       string    `json:"clientIp,omitempty"`
 	UserField      string    `json:"userField,omitempty"`
 	ContextFinger  string    `json:"contextFinger,omitempty"`
-	// ContextHistory 鎸佷箙鍖栦繚瀛樻渶杩戜竴娆″崗璁殑瀹屾暣娑堟伅锛屼緵閲嶅惎鍚庣户缁仛
-	// 鍐呭鍓嶇紑鍖归厤锛岄伩鍏嶈繘绋嬮噸鍚鑷存墍鏈変細璇濋敭鍏ㄩ儴澶辨晥銆?
+	// ContextHistory persists the full message list of the most recent exchange
+	// so content-prefix matching survives a restart instead of losing every key
 	ContextHistory []oaiMsg `json:"contextHistory,omitempty"`
 	// Tenant isolates a binding to the API key that created it. Every read,
 	// match, resume, and delete is scoped to the caller's tenant so one key can
@@ -59,8 +59,8 @@ type sessionResolver struct {
 const defaultMaxSessions = 1000
 
 func openSessionResolver() *sessionResolver {
-	// 闂茬疆 2 灏忔椂鍗宠涓鸿繃鏈燂紙鐢ㄦ埛锛? 灏忔椂涓嶆椿璺冨凡缁忕畻涔咃級銆備細璇濊繃鏈熷悗
-	// 浠?sessions.json 鍓旈櫎锛屼簯绔璇濅氦缁?auto_cleanup 鎸夌浉鍚岀獥鍙ｅ洖鏀躲€?
+	// Idle for two hours counts as expired (users never stay active that long).
+	// Expired sessions are removed from sessions.json, and the cloud conversation
 	ttl := 2 * time.Hour
 	if v := os.Getenv("M365_SESSION_TTL_MINUTES"); v != "" {
 		if d, err := time.ParseDuration(v + "m"); err == nil {
@@ -183,8 +183,8 @@ type ResolveResult struct {
 	AccountID      string
 	MatchedBy      string
 	IsNew          bool
-	// HistoryLen 鏄鐢ㄥ懡涓椂"浜戠瀵硅瘽宸插寘鍚殑娑堟伅鏉℃暟"锛?
-	// 鍗冲閲忓彂閫佺殑璧风偣涓嬫爣锛坆ody.Messages[HistoryLen:] 鍙彂鏂板閮ㄥ垎锛夈€?
+	// HistoryLen is the number of messages the cloud conversation is believed
+	// to already hold, i.e. the start index for an incremental send
 	HistoryLen int
 }
 
@@ -222,8 +222,8 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	tenant := tenantFromRequest(r)
 	explicitID := r.Header.Get("X-M365-Session-Id")
 
-	// 瀹㈡埛绔樉寮忔寚瀹氱殑浼氳瘽 ID 鏄渶楂樹紭鍏堢殑缁帴璇箟锛氫笉鍙備笌浠讳綍韬唤鍒ゅ畾锛?
-	// 鐢辫皟鐢ㄦ柟涓诲姩鍐冲畾瑕佺户缁摢涓簯绔璇濄€?
+	// An explicitly supplied session id is the strongest continuation hint: it
+	// bypasses every identity heuristic so the caller picks the conversation.
 	if explicitID != "" {
 		if sessID, ok := sr.byExplicit[explicitKey(tenant, explicitID)]; ok {
 			if sess, ok := sr.sessions[sessID]; ok && sess.Tenant == tenant {
@@ -242,9 +242,9 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		}
 	}
 
-	// 鍐呭閿細鍗忚娑堟伅鍚嶅簭鍒椾弗鏍肩瓑浜庢煇涓凡璁板綍浼氳瘽鐨勫巻鍙叉椂鐩存帴澶嶇敤杩欎釜
-	// 浜戠瀵硅瘽锛屼絾鍙湪鍚屼竴 IP/UA 鎸囩汗涓嬶紝閬垮厤鐭秷鎭湪涓嶅悓鐢ㄦ埛闂翠簰绔?
-	// HistoryLen 杩斿洖璇ュ墠缂€闀垮害锛屼笂灞傛嵁姝ゅ彧鍙戦€?messages[HistoryLen:] 澧為噺銆?
+	// Content key: when the protocol messages exactly equal a recorded session
+	// history, reuse that cloud conversation directly — but only under the same
+	// IP/UA fingerprint, so short messages cannot collide across users.
 	ipFinger := clientIPFingerprint(r)
 	if bestID, n := sr.matchContextLocked(tenant, ipFinger, body.Messages); bestID != "" {
 		sess := sr.sessions[bestID]
@@ -261,8 +261,8 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		}
 	}
 
-	// 寮辩害鏉熷厹搴曪細鍐呭涓嶆瀯鎴愪弗鏍煎墠缂€锛屼絾涓庢煇涓巻鍙查珮搴︾浉浼硷紙濡傚鎴风
-	// 鏈湴鎴柇浜嗗巻鍙诧級锛屼粛澶嶇敤璇ヤ細璇濄€傛鏃跺閲忚竟鐣屾湭鐭ワ紝涓婂眰鍙戦€佸叏閲忋€?
+	// Weak fallback: the content is not a strict prefix but closely matches
+	// some history (e.g. the client truncated locally). Reuse that session
 	suffixID, suffixN := sr.matchSuffixLocked(tenant, ipFinger, body.Messages)
 	if suffixID != "" {
 		sess := sr.sessions[suffixID]
@@ -356,9 +356,9 @@ func suffixMatchLen(hist, msgs []oaiMsg) int {
 	return n
 }
 
-// matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
-// 閭ｄ釜浼氳瘽锛涘彧閫夊墠缂€鏈€闀跨殑涓€涓紝閬垮厤鐭墠缂€鍦ㄤ笉鍚屼細璇濋棿浜掓挒銆傝繑鍥?
-// (sessionID, 鍖归厤鍒扮殑娑堟伅鏉℃暟)銆?
+// matchContextLocked finds, across all sessions, the one whose contextHistory
+// is a strict prefix of the messages; only the longest such prefix wins so
+// short prefixes cannot collide between sessions.
 // prefixHoldsExchange reports whether the matched prefix carries at least one
 // non-system message (a real conversational exchange, not just shared setup).
 func prefixHoldsExchange(msgs []oaiMsg) bool {
@@ -402,9 +402,9 @@ func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages 
 	return best.id, best.n
 }
 
-// contextPrefixLen 杩斿洖 hist 鏄惁涓ユ牸鏄?msgs 鐨勫墠缂€銆俬ist 涓虹┖鎴栦笉鏄墠缂€
-// 鏃惰繑鍥?0锛涘懡涓椂杩斿洖 len(hist)锛屽嵆澧為噺鍙戦€佽捣鐐广€?
-// atom 杈圭晫妫€鏌ワ細hist 蹇呴』鍦?msgs 鐨勫師瀛愯竟鐣屼笂缁撴潫锛屽惁鍒欒涓洪潪鍘熷瓙鍒囧壊鑰岃繑鍥?0銆?
+// contextPrefixLen returns whether hist is a strict prefix of msgs. Zero when
+// hist is empty or not a prefix; len(hist) on a match, i.e. the incremental
+// send offset. Atom-boundary check: hist must end on an atom boundary, else 0.
 func contextPrefixLen(hist, msgs []oaiMsg) int {
 	if len(hist) == 0 || len(msgs) < len(hist) {
 		return 0
@@ -431,8 +431,8 @@ func contextPrefixLen(hist, msgs []oaiMsg) int {
 	return len(hist)
 }
 
-// messagesEqual 鍒ゅ畾涓ゆ潯娑堟伅鍦ㄤ細璇濋敭鎰忎箟涓婄瓑浠凤細role 涓庢枃鏈唴瀹逛竴鑷淬€?
-// 蹇界暐 tool_calls 鐨?ID 缁嗚妭锛堜細璇濋敭鍙叧蹇冨唴瀹瑰浣曡妯″瀷娑堝寲锛夈€?
+// messagesEqual decides whether two messages are equivalent for the session
+// key: role and text content must agree; tool_calls IDs are ignored because
 func messagesEqual(a, b oaiMsg) bool {
 	if a.Role != b.Role {
 		return false

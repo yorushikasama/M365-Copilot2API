@@ -10,6 +10,15 @@ import (
 func parseContent(c any) (string, []chathub.Attachment) {
 	var text strings.Builder
 	var files []chathub.Attachment
+	// JSON null arrives as a nil interface: OpenAI emits content=null for
+	// assistant messages that carry tool_calls (the standard shape for every
+	// multi-round tool call), and for genuinely empty user turns. The old
+	// fmt.Sprint fallback turned nil into the literal string "<nil>", which
+	// rode into the upstream prompt as a bogus turn — 2026-09-10 live audit
+	// matched prompt_len=12 against len("[user]\n<nil>").
+	if c == nil {
+		return "", nil
+	}
 	if s, ok := c.(string); ok {
 		return s, nil
 	}

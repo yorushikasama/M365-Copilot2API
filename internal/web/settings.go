@@ -75,6 +75,23 @@ type runtimeSettings struct {
 	EnableDesignerImageGen4o   bool           `json:"enableDesignerImageGen4o"`
 	EnableCodeCanvas           bool           `json:"enableCodeCanvas"`
 	EnableSydneyReconnect      bool           `json:"enableSydneyReconnect"`
+	// EnableUpstreamMemory lets the signed-in account's server-side memory
+	// (personalization plus insights learned from earlier conversations)
+	// participate in answers. Default OFF: callers of this gateway ship their
+	// own conversation history, and account memory was observed to override
+	// exactly that history (2026-09-10 live audit — a caller-supplied vault
+	// code was answered with an unrelated value recalled from account memory).
+	// Env: M365_ENABLE_UPSTREAM_MEMORY=true restores the previous behavior.
+	EnableUpstreamMemory bool `json:"enableUpstreamMemory"`
+	// EnableIncrementalPrompt re-enables dispatching only the messages the
+	// cloud conversation is believed to be missing. Default OFF — the caller's
+	// full history is always sent. 2026-09-10 live audit: a request carrying
+	// [user, assistant, user] had its first two messages trimmed (flattened
+	// prompt 109 chars, dispatched 29) on the assumption that the cloud
+	// conversation would replay them; it did not, so the model answered from
+	// unrelated account memory instead of the request's own context. Env:
+	// M365_ENABLE_INCREMENTAL_PROMPT=true restores trimming.
+	EnableIncrementalPrompt bool `json:"enableIncrementalPrompt"`
 	// FailoverMaxAttempts caps account failover inside one request (router and
 	// answer turns) so a widely-degraded pool cannot spin a request until its
 	// timeout. Env: M365_FAILOVER_MAX_ATTEMPTS.
@@ -127,6 +144,8 @@ func defaultRuntimeSettings() runtimeSettings {
 		LicenseType:                firstNonEmptySetting(os.Getenv("M365_LICENSE_TYPE"), "Starter"),
 		AccountConcurrencyLimit:    envIntAny(defaultAccountConcurrency, accountConcurrencyEnvVars...),
 		EnableMemoryV2:             os.Getenv("M365_ENABLE_MEMORY_V2") == "true",
+		EnableUpstreamMemory:       os.Getenv("M365_ENABLE_UPSTREAM_MEMORY") == "true",
+		EnableIncrementalPrompt:    os.Getenv("M365_ENABLE_INCREMENTAL_PROMPT") == "true",
 		EnableDeepWork:             os.Getenv("M365_ENABLE_DEEP_WORK") == "true",
 		EnableComputerUse:          os.Getenv("M365_ENABLE_COMPUTER_USE") == "true",
 		EnableRealtimeVoice:        os.Getenv("M365_ENABLE_REALTIME_VOICE") == "true",

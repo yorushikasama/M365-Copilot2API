@@ -87,3 +87,23 @@ func TestAdaptiveToolCallLimitAllowsIndependentReadOnlyCalls(t *testing.T) {
 		t.Fatalf("got %d, want 4", got)
 	}
 }
+
+// Context fidelity defaults (2026-09-10 live audit): the gateway must trust the
+// caller's own history rather than account memory or a cloud conversation that
+// is assumed to still hold it.
+func TestContextFidelityDefaults(t *testing.T) {
+	v := defaultRuntimeSettings()
+	if v.EnableUpstreamMemory {
+		t.Fatal("upstream account memory must be off by default")
+	}
+	if v.EnableIncrementalPrompt {
+		t.Fatal("incremental prompt dispatch must be off by default")
+	}
+	for _, name := range []string{"M365_ENABLE_UPSTREAM_MEMORY", "M365_ENABLE_INCREMENTAL_PROMPT"} {
+		t.Setenv(name, "true")
+	}
+	on := defaultRuntimeSettings()
+	if !on.EnableUpstreamMemory || !on.EnableIncrementalPrompt {
+		t.Fatal("opt-in env vars must restore the previous behavior")
+	}
+}

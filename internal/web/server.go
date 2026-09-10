@@ -1779,7 +1779,13 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 		anchor = anchors[0]
 	}
 	answerPrompt = appendExecutionAnchor(answerPrompt, anchor)
-	req := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, FeatureFlags: flags, Locale: locale.Locale, Market: locale.Market, TimeZone: locale.TimeZone, TimeZoneOffset: locale.TimeZoneOffset, DeviceOS: locale.DeviceOS, DisableMemory: disableMemory, ExecutionAnchor: anchor}
+	// Upstream account memory stays off unless the operator opts back in: a
+	// caller of this gateway already carries its own history, and server-side
+	// memory was observed beating that history outright (2026-09-10 live
+	// audit: a vault code present in the request's own messages was answered
+	// with a stale value recalled from account memory). A caller-requested
+	// one-shot session (copilot_temp_session) still forces it off.
+	req := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, FeatureFlags: flags, Locale: locale.Locale, Market: locale.Market, TimeZone: locale.TimeZone, TimeZoneOffset: locale.TimeZoneOffset, DeviceOS: locale.DeviceOS, DisableMemory: disableMemory || !cfg.EnableUpstreamMemory, ExecutionAnchor: anchor}
 	if planningMode == "native" {
 		req.Tools = body.Tools
 		req.ToolChoice = body.ToolChoice
@@ -1995,7 +2001,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			body.SessionID = resolved.SessionID
 			body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
 			log.Printf("[session-resolver] matched=%s conversation=%s history=%d total=%d", resolved.MatchedBy, resolved.ConversationID, resolved.HistoryLen, len(body.Messages))
-			if resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
+			// Incremental dispatch assumes the matched cloud conversation still
+			// holds the prefix it was credited with. The 2026-09-10 live audit
+			// proved that assumption unsafe: a caller sending [user, assistant,
+			// user] was trimmed from a 109-char flattened prompt down to 29
+			// chars of increment, the cloud conversation never replayed the
+			// trimmed turns, and the model answered from unrelated account
+			// memory instead of the caller's own context. Send the caller's
+			// full history unless the operator explicitly re-enables trimming.
+			if s.settings.get().EnableIncrementalPrompt && resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
 				incPrompt, incAtt := flattenPromptMessages(body.Messages[resolved.HistoryLen:], nil)
 				incPrompt = strings.TrimSpace(incPrompt)
 				if incPrompt != "" {
