@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1695,6 +1696,36 @@ func normalizeLegacyTools(body *oaiReq) {
 	}
 }
 
+// routerTurnRequest builds the chathub request for the synchronous tool-router
+// and its repair turn. These are stateless protocol calls: they run on a fresh
+// conversation (no ConversationID), must not read or write the account's
+// server-side memory/personalization (2026-09-10 08:27: a leftover account
+// memory "？" hijacked a 95KB router turn into Indonesian small talk,
+// raw_calls=0), and cap the silent pre-token wait far below the client's
+// ~125s patience so a hung upstream fails fast instead of stranding the
+// caller (same morning: seven 499s at ~124s while our budget allowed 150s+).
+func routerTurnRequest(text, tone string, attachments []chathub.Attachment, licenseType, scenario, executionAnchor string) chathub.Request {
+	return chathub.Request{
+		Text:              text,
+		Tone:              tone,
+		Attachments:       attachments,
+		LicenseType:       licenseType,
+		Scenario:          scenario,
+		ExecutionAnchor:   executionAnchor,
+		DisableMemory:     true,
+		MaxFirstTokenWait: routerFirstTokenCap(),
+	}
+}
+
+func routerFirstTokenCap() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("M365_ROUTER_FIRST_TOKEN_SECONDS")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return 60 * time.Second
+}
+
 func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedger, planningMode string, cfg runtimeSettings, flags chathub.FeatureFlags, locale chathubLocale, disableMemory bool, anchors ...string) chathub.Request {
 	if len(ledger.Completed) > 0 || len(ledger.Pending) > 0 {
 		answerPrompt += "\n" + ledger.RouterContext()
@@ -2063,7 +2094,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// completed assistant turn with the actual call lost.
 		routePrompt := s.buildRoutePrompt(&body, prompt, answerPrompt, ledger, executionAnchor, toolMaps)
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
 		// Router turns run in a throwaway cloud conversation that is never
 		// reused by the answer turn; delete it so the conversation list does
@@ -2087,7 +2118,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 				triedAccountIDs[next.ID] = true
 				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-				routeRes, routeErr = s.chatWithAccount(ctx, next.ID, nextAccount, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+				routeRes, routeErr = s.chatWithAccount(ctx, next.ID, nextAccount, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
 				acc = next
 				account = nextAccount
 			}
@@ -2107,8 +2138,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
 		if !parsed {
-			repairReq := chathub.Request{Text: appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n`+compactToolResult(routeRes.Text, 6000), executionAnchor), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor}
-			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, repairReq)
+			repReq := routerTurnRequest(appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n`+compactToolResult(routeRes.Text, 6000), executionAnchor), tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, executionAnchor)
+			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, repReq)
 			if repairErr == nil && repairRes.ConversationID != "" {
 				s.dropTransientConversation(repairRes.ConversationID)
 			}
@@ -2288,6 +2319,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if convReused {
 				s.invalidateConvCache(acc.ID, convCacheModel)
 			}
+			// The payload was dispatched upstream before the failure: the cloud
+			// conversation may hold a turn our binding does not know about.
+			// Invalidate the binding so the next request starts fresh instead
+			// of splicing an increment onto a diverged conversation (which made
+			// the model answer the previous question, 2026-09-10).
+			s.sessionResolver.InvalidateMatching(r, &body)
 			ev := streamErrorEvent(requestID, err)
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(ev)+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
@@ -2383,7 +2420,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := s.buildRoutePrompt(&body, prompt, answerPrompt, ledger, executionAnchor, toolMaps)
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
 		if routeErr != nil {
 			triedAccountIDs := map[string]bool{acc.ID: true}
 			maxRouteFailover := s.settings.get().FailoverMaxAttempts
@@ -2397,7 +2434,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				triedAccountIDs[next.ID] = true
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-				routeRes, routeErr = s.chatWithAccount(ctx2, next.ID, nextAccount, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+				routeRes, routeErr = s.chatWithAccount(ctx2, next.ID, nextAccount, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
 				cancel2()
 				acc = next
 				account = nextAccount
@@ -2710,6 +2747,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			s.invalidateConvCache(acc.ID, convCacheModel)
 			log.Printf("[conv-cache] invalidated account=%s model=%s after error: %v", acc.ID, convCacheModel, err)
 		}
+		// See the streaming twin of this block: the dispatched-but-failed turn
+		// may have reached the cloud conversation; drop the matching binding
+		// so the next request re-sends the full history on a fresh conversation.
+		s.sessionResolver.InvalidateMatching(r, &body)
 		s.debounceRememberFailure(debounceKey, err)
 		writeUpstreamErrorWithAccount(w, err, acc.ID)
 		return
@@ -2794,12 +2835,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// structured event that failed the declared-name/schema boundary.
 	if (planningMode == "native" || invalidDetectedTool) && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, executionAnchor)
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
 		if routeErr == nil {
 			calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 			if !parsed {
-				repairReq := chathub.Request{Text: appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n`+compactToolResult(routeRes.Text, 6000), executionAnchor), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor}
-				repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, repairReq)
+				repReq := routerTurnRequest(appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n`+compactToolResult(routeRes.Text, 6000), executionAnchor), tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, executionAnchor)
+				repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, repReq)
 				if repairErr == nil {
 					calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				}

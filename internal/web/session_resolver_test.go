@@ -253,3 +253,59 @@ func TestAutoCleanupDefaultMaxAgeTwoHours(t *testing.T) {
 		t.Error("3h 闲置的会话不应在 2h 保护窗口内")
 	}
 }
+
+func TestInvalidateMatchingDropsStaleBinding(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	t.Setenv("M365_CONVERSATION_CACHE", filepath.Join(t.TempDir(), "conversations.json"))
+	t.Setenv("M365_USER_SESSION_CACHE", filepath.Join(t.TempDir(), "users.json"))
+	sr := openSessionResolver()
+
+	// 云端对话 conv-A 已包含 Q1+A1（成功轮绑定）。
+	sr.Bind("", "conv-A", "acc1",
+		&oaiReq{Messages: []oaiMsg{{Role: "user", Content: "Q1"}, {Role: "assistant", Content: "A1"}}},
+		"",
+		resolverTestRequest("203.0.113.10", "client-a", "alice"))
+
+	// 新请求 Q2 在失败前已派发到 conv-A：绑定必须失效，
+	// 否则下一轮会按旧前缀只发增量，云端顶部的 Q2 被跳过，
+	// 模型回答上一个问题（2026-09-10 事故）。
+	sr.InvalidateMatching(resolverTestRequest("203.0.113.10", "client-a", "alice"),
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "Q1"},
+			{Role: "assistant", Content: "A1"},
+			{Role: "user", Content: "Q2"},
+		}})
+
+	res := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "alice"),
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "user", Content: "Q1"},
+			{Role: "assistant", Content: "A1"},
+			{Role: "user", Content: "Q2"},
+		}})
+	if !res.IsNew {
+		t.Fatalf("失效后仍复用旧会话 conv=%s matched=%s，增量会跳过失败轮的问题", res.ConversationID, res.MatchedBy)
+	}
+}
+
+func TestMatchContextIgnoresSystemOnlyPrefix(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	t.Setenv("M365_CONVERSATION_CACHE", filepath.Join(t.TempDir(), "conversations.json"))
+	t.Setenv("M365_USER_SESSION_CACHE", filepath.Join(t.TempDir(), "users.json"))
+	sr := openSessionResolver()
+
+	// 某会话的历史只有 system（异常绑定）。
+	sr.Bind("", "conv-sys", "acc1",
+		&oaiReq{Messages: []oaiMsg{{Role: "system", Content: "sys"}}, Metadata: &oaiMetadata{CopilotTempSession: false}},
+		"",
+		resolverTestRequest("203.0.113.10", "client-a", "alice"))
+
+	// 另一个全新对话共享同一段 system：不得仅凭 system 前缀绑到 conv-sys。
+	res := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "alice"),
+		&oaiReq{Messages: []oaiMsg{
+			{Role: "system", Content: "sys"},
+			{Role: "user", Content: "全新问题"},
+		}})
+	if !res.IsNew {
+		t.Fatalf("system-only 前缀不应匹配，却复用了 conv=%s", res.ConversationID)
+	}
+}

@@ -134,22 +134,26 @@ func (s *Server) buildRoutePrompt(body *oaiReq, fullPrompt, answerPrompt string,
 	}
 	window := routerWindowMessages(body.Messages, cfg.RouterPromptTailMessages)
 	if routerWindowNeedsFullHistory(window) {
-		// Deictic input needs more history than the tail, but "full" is
-		// unbounded: on a long agent session it reached 208KB and cost 12-17s
-		// per router turn (2026-09-10). Widen the window instead — the ledger
-		// already carries the executed-tool evidence that anaphora usually
-		// points at, so the oldest turns rarely change the decision.
+		// Deictic input needs more history than the tail. The legacy upgrade
+		// to the full flattened history is a latency trap on long agent
+		// sessions: 2026-09-10 08:26 it produced a 95KB route prompt (20-40s
+		// upstream ingest) because the reference hint fired on an 11-message
+		// session. Widen the window instead — the ledger already carries the
+		// executed-tool evidence that anaphora usually points at. The widened
+		// variant is returned unconditionally: it is byte-capped below, and
+		// comparing it against `full` is meaningless because `full` is built
+		// from the INCREMENTAL answerPrompt (the resolver matched and shrank
+		// it) while the legacy fallback re-assembled the FULL history — the
+		// comparison always lost and silently returned the 95KB prompt.
 		if os.Getenv("M365_ROUTER_FULL_ON_REFERENCE") != "true" {
 			wide := routerWindowMessages(body.Messages, cfg.RouterPromptTailMessages*4)
 			wideFlat, _ := flattenPromptMessages(wide, nil)
 			wideFlat = trimRouterWindowHead(wideFlat, cfg.RouterPromptMaxBytes*6)
 			bounded := modelToolRouterPrompt(wideFlat+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, executionAnchor)
 			log.Printf("[router-slim] upgrade_to_bounded reason=reference_hint full=%d bounded=%d", len(full), len(bounded))
-			if len(bounded) < len(full) {
-				return bounded
-			}
+			return bounded
 		}
-		log.Printf("[router-slim] upgrade_to_full reason=reference_hint prompt_len=%d", len(full))
+		log.Printf("[router-slim] upgrade_to_full reason=reference_hint prompt_len=%d", len(fullPrompt))
 		return modelToolRouterPrompt(fullPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, executionAnchor)
 	}
 	budget := cfg.RouterPromptMaxBytes * (cfg.RouterPromptTailMessages + 1)

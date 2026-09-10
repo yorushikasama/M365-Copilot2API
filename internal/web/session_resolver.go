@@ -282,6 +282,31 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	return ResolveResult{IsNew: true}
 }
 
+// InvalidateMatching drops the binding whose ContextHistory Resolve would have
+// matched for this request (strict context prefix, falling back to the suffix
+// heuristic). It must be called when an upstream turn fails AFTER the payload
+// was dispatched: the cloud conversation may still receive and process the
+// failed turn, so its actual history is now AHEAD of the recorded
+// ContextHistory. Keeping the binding would let the next request match the
+// stale prefix and send only the increment — skipping the failed turn's
+// question entirely — after which the model answers whatever older question
+// still sits at the top of the cloud conversation ("asked a new question, got
+// the previous answer", 2026-09-10). Dropping the binding forces the next
+// request to start a fresh conversation carrying the full flattened history.
+func (sr *sessionResolver) InvalidateMatching(r *http.Request, body *oaiReq) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	tenant := tenantFromRequest(r)
+	ipFinger := clientIPFingerprint(r)
+	if bestID, _ := sr.matchContextLocked(tenant, ipFinger, body.Messages); bestID != "" {
+		sr.dropLocked(bestID, sr.sessions[bestID])
+		return
+	}
+	if bestID, _ := sr.matchSuffixLocked(tenant, ipFinger, body.Messages); bestID != "" {
+		sr.dropLocked(bestID, sr.sessions[bestID])
+	}
+}
+
 func (sr *sessionResolver) matchSuffixLocked(tenant, ipFinger string, messages []oaiMsg) (string, int) {
 	if len(messages) < 2 {
 		return "", 0
@@ -334,6 +359,18 @@ func suffixMatchLen(hist, msgs []oaiMsg) int {
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
 // 閭ｄ釜浼氳瘽锛涘彧閫夊墠缂€鏈€闀跨殑涓€涓紝閬垮厤鐭墠缂€鍦ㄤ笉鍚屼細璇濋棿浜掓挒銆傝繑鍥?
 // (sessionID, 鍖归厤鍒扮殑娑堟伅鏉℃暟)銆?
+// prefixHoldsExchange reports whether the matched prefix carries at least one
+// non-system message (a real conversational exchange, not just shared setup).
+func prefixHoldsExchange(msgs []oaiMsg) bool {
+	for _, m := range msgs {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		if role != "" && role != "system" && role != "developer" {
+			return true
+		}
+	}
+	return false
+}
+
 func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages []oaiMsg) (string, int) {
 	if len(messages) == 0 {
 		return "", 0
@@ -355,7 +392,10 @@ func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages 
 			continue
 		}
 		n := contextPrefixLen(sess.ContextHistory, messages)
-		if n >= 1 && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
+		// A system-only prefix belongs to every conversation of the same
+		// client; matching on it alone would splice unrelated conversations
+		// into one cloud session. Require at least one non-system message.
+		if n >= 1 && prefixHoldsExchange(sess.ContextHistory[:n]) && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
 			best = match{id: id, n: n, recent: sess.LastUsedAt}
 		}
 	}

@@ -323,6 +323,13 @@ type Request struct {
 	TimeZone              string
 	TimeZoneOffset        int
 	DeviceOS              string
+	// MaxFirstTokenWait caps the adaptive pre-token idle budget for turns
+	// whose value does not justify a long silent wait — the tool-router and
+	// its repair turn. Without a cap a hung upstream holds the request until
+	// the CLIENT gives up (~125s, 2026-09-10 08:0x: seven 499s while our
+	// budget allowed 150s+60s+payload grace), burning the account slot and
+	// the caller's patience. Zero keeps the adaptive budget untouched.
+	MaxFirstTokenWait time.Duration
 	Capability            string
 	ExecutionAnchor       string
 	// BypassPool forces a freshly dialed WebSocket connection instead of
@@ -905,6 +912,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				budget := c.readFrameTimeout()
 				if !streamStarted.Load() {
 					budget = c.firstTokenTimeout(len(payload))
+					if req.MaxFirstTokenWait > 0 && budget > req.MaxFirstTokenWait {
+						budget = req.MaxFirstTokenWait
+					}
 				}
 				_ = conn.SetReadDeadline(time.Now().Add(budget))
 				var msg []byte
@@ -942,6 +952,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			budget := c.readFrameTimeout()
 			if !streamStarted.Load() {
 				budget = c.firstTokenTimeout(len(payload))
+				if req.MaxFirstTokenWait > 0 && budget > req.MaxFirstTokenWait {
+					budget = req.MaxFirstTokenWait
+				}
 			}
 			_ = conn.SetReadDeadline(time.Now().Add(budget))
 			_, msg, err := conn.ReadMessage()
