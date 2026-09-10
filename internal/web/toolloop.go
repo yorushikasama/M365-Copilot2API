@@ -174,6 +174,44 @@ var toolRefusalPatterns = []string{
 	"工具未暴露",
 }
 
+// toolDenialPhrases cover the sandbox-hallucination refusal family that
+// slipped past toolRefusalPatterns (2026-09-10: gpt-5.6-sol answered an
+// execution request with "当前会话没有可调用的 Windows 工作区文件编辑工具" —
+// none of the legacy patterns matched, and the reply was 780 chars so the
+// short-text cap in isToolRefusal excluded it too).
+var toolDenialPhrases = append(toolRefusalPatterns,
+	"没有可调用",
+	"没有可用的工具",
+	"没有工具",
+	"无工具可用",
+	"无法写入",
+	"无法编辑",
+	"没有文件编辑",
+	"no callable tool",
+	"no tools available",
+	"no available tools",
+	"don't have access to tools",
+	"do not have access to tools",
+	"don't have any tools",
+	"cannot edit files",
+	"unable to edit files",
+	"cannot write files",
+	"no file editing tool",
+)
+
+// containsToolDenial reports whether the text denies that callable tools
+// exist. Unlike isToolRefusal it has no length cap: refusal prose buried in a
+// long status report is exactly the 2026-09-10 failure shape.
+func containsToolDenial(text string) bool {
+	low := strings.ToLower(text)
+	for _, p := range toolDenialPhrases {
+		if strings.Contains(low, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
+}
+
 func isToolRefusal(text string) bool {
 	if len(text) >= 200 {
 		return false

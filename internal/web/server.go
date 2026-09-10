@@ -1568,6 +1568,33 @@ type oaiMsg struct {
 	ReasoningContent string           `json:"reasoning_content,omitempty"`
 }
 
+// lastUserMessageText returns the text of the latest user message, walking
+// backwards over tool/results and assistant turns. Content may be a plain
+// string or an OpenAI-style parts array ([{type:"text",text:"..."}]).
+func lastUserMessageText(messages []oaiMsg) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		switch c := messages[i].Content.(type) {
+		case string:
+			return c
+		case []any:
+			var b strings.Builder
+			for _, part := range c {
+				if m, ok := part.(map[string]any); ok {
+					if t, ok := m["text"].(string); ok {
+						b.WriteString(t)
+					}
+				}
+			}
+			return b.String()
+		}
+		return fmt.Sprint(messages[i].Content)
+	}
+	return ""
+}
+
 type oaiReq struct {
 	Model          string          `json:"model"`
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
@@ -1738,6 +1765,14 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 	// the catalogue.
 	if planningMode != "native" {
 		answerPrompt += answerToolProtocol(body.Tools)
+	}
+	// Execution mandate: when the user's latest message is an execution
+	// request and tools are declared, an answer-turn model that denies having
+	// tools ("当前会话没有可调用的...工具", gpt-5.6-sol 2026-09-10) must be
+	// pre-empted explicitly — the guard inside answerToolProtocol states the
+	// tools exist, this states the expected behavior for THIS message.
+	if lastUser := lastUserMessageText(body.Messages); len(body.Tools) > 0 && userMessageDemandsAction(lastUser) {
+		answerPrompt += "\nEXECUTION MANDATE: The user's latest message is an execution request, and the tool list above is real and sufficient. Answering in prose that you lack tools, cannot edit files, or can only describe what could be done is a factual error and a failed turn. Emit the tool call that advances the work; only if genuinely no listed tool can advance it, state precisely which capability is missing."
 	}
 	anchor := ""
 	if len(anchors) > 0 {
@@ -2385,6 +2420,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		rawCalls := streamedTools
 		if len(rawCalls) == 0 && answerToolArmed {
+			if looksLikeToolRefusal(text.String()) {
+				log.Printf("[answer-refusal] id=%s stream answer denies having tools despite armed protocol — guard/mandate may need strengthening", requestID)
+			}
 			// The answer turn carries the tool protocol (answerToolProtocol);
 			// parse its CALL_TOOL/{"calls"} output before the looser fenced
 			// scan. Completed-call dedup keeps the answer brain from redoing
@@ -2900,11 +2938,16 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		model = "m365-copilot"
 	}
 	id := "chatcmpl-" + uuid.NewString()
-	if len(toolMaps) > 0 && isToolRefusal(res.Text) {
+	// Tool-refusal retry. isToolRefusal covers short denials; when the user's
+	// latest message is an execution request, containsToolDenial drops the
+	// length cap — the 2026-09-10 gpt-5.6-sol refusal was 780 chars of status
+	// report wrapped around "当前会话没有可调用的...工具" and escaped retry.
+	actionDemanded := len(toolMaps) > 0 && userMessageDemandsAction(lastUserMessageText(body.Messages))
+	if len(toolMaps) > 0 && (isToolRefusal(res.Text) || (actionDemanded && containsToolDenial(res.Text))) {
 		log.Printf("[tool-eject] model refused tools, retrying with correction")
 		correction := appendExecutionAnchor("Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller's Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n"+prompt, executionAnchor)
 		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor})
-		if err2 == nil && !isToolRefusal(res2.Text) {
+		if err2 == nil && !isToolRefusal(res2.Text) && !(actionDemanded && containsToolDenial(res2.Text)) {
 			res = res2
 		}
 	}

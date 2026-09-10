@@ -157,6 +157,46 @@ func TestAnswerToolProtocolContent(t *testing.T) {
 	if answerToolProtocol(nil) != "" {
 		t.Fatal("no tools must produce no epilogue")
 	}
+	// The WindowsExecutionGuard must ride on the answer turn: without it a
+	// switched upstream model denied having any tools (2026-09-10).
+	for _, want := range []string{"executed by the caller on its own Windows machine", "NEVER claim that no callable tools exist"} {
+		if !strings.Contains(ep, want) {
+			t.Fatalf("epilogue missing guard clause %q", want)
+		}
+	}
+}
+
+// userMessageDemandsAction + the refusal phrase table: the 2026-09-10
+// gpt-5.6-sol refusal ("当前会话没有可调用的 Windows 工作区文件编辑工具", 780
+// chars) escaped both the legacy short-text isToolRefusal cap and its phrase
+// list. The router rules must also forbid NO_TOOL_NEEDED on action requests.
+func TestToolDenialDetection(t *testing.T) {
+	long := strings.Repeat("需要落地。", 100) + "当前会话没有可调用的 Windows 工作区文件编辑工具，因此我无法安全地把改动写入。"
+	if !containsToolDenial(long) {
+		t.Fatal("containsToolDenial must match denial buried in a long reply")
+	}
+	if isToolRefusal(long) {
+		t.Fatal("legacy isToolRefusal keeps its short-text cap for compat")
+	}
+	if !containsToolDenial("There are no callable tools in this session.") {
+		t.Fatal("english denial not matched")
+	}
+	if containsToolDenial("All tools completed successfully.") {
+		t.Fatal("false positive on a normal completion")
+	}
+	if !userMessageDemandsAction("实现以上未落地的内容") {
+		t.Fatal("chinese execution request not detected")
+	}
+	if !userMessageDemandsAction("Please implement the missing pieces") {
+		t.Fatal("english execution request not detected")
+	}
+	if userMessageDemandsAction("谢谢你，今天辛苦了") {
+		t.Fatal("pure chat must not demand action")
+	}
+	rp := modelToolRouterPrompt("request", testTools(), "auto")
+	if !strings.Contains(rp, "NO_TOOL_NEEDED is forbidden") {
+		t.Fatal("router rules missing action-request ban")
+	}
 }
 
 func TestClassifyAnswerOutputPrefix(t *testing.T) {

@@ -124,16 +124,55 @@ func answerToolProtocol(tools []chathub.Tool) string {
 		maps = append(maps, map[string]any{"type": tool.Type, "function": f})
 	}
 	defs, _ := json.Marshal(routerToolCatalogue(maps))
+	// The WindowsExecutionGuard must ride on the ANSWER turn too, not only the
+	// router turn: 2026-09-10 a switched upstream model (gpt-5.6-sol) answered
+	// an execution request with "当前会话没有可调用的 Windows 工作区文件编辑工具" —
+	// the classic sandbox hallucination the router guard already documents.
+	// The answer prompt has no native tool schemas, so without the guard the
+	// model trusts its own world view over the textual protocol and refuses.
 	return fmt.Sprintf(`
 
-TOOL EXECUTION PROTOCOL: The tools below are REAL and execute on the caller's machine. When the user's request needs an action performed (reading, searching, running, editing, building), execute it — never reply with a description or status report of what could be done.
+%s
+
+TOOL EXECUTION PROTOCOL: The tool list below IS this session's real, complete toolset — the caller (a coding agent on the user's Windows machine) executes whatever you emit here. The absence of native JSON tool schemas in this prompt is a transport detail of the gateway, NOT evidence that tools are missing. NEVER claim that no callable tools exist, that you cannot edit or write files, or that the workspace is unavailable — that statement would be factually wrong in this session.
 Available tools: %s
 - To execute, your ENTIRE reply must be exactly one call starting at the very first character: CALL_TOOL: tool_name({"arg":"value"}) — no prose before or after it
 - Several independent steps: reply with only one JSON block {"calls":[{"name":"...","arguments":{...}}]}
 - Use exactly the argument names listed (a trailing * marks a required argument); never invent tools that are not listed
 - If the user asks to continue, finish, or complete work and a tool can advance it, emit the tool call — do not answer with a list of unverified items
-- If you answer in prose instead, NEVER mention CALL_TOOL, {"calls" or any protocol marker in the text`, string(defs))
+- If you answer in prose instead, NEVER mention CALL_TOOL, {"calls" or any protocol marker in the text`, chathub.WindowsExecutionGuard, string(defs))
 }
+
+// actionDemandMarkers are substrings whose presence in the user's latest
+// message marks it as an execution request rather than a question. Both the
+// router and the answer turn use this to resist answering "I have no tools"
+// or NO_TOOL_NEEDED when the user clearly asked for work to be done.
+var actionDemandMarkers = []string{
+	// English
+	"implement", "fix ", "fix the", "fix it", "write ", "edit ", "create ", "delete ", "remove ", "run ", "execute", "apply ", "update ", "refactor", "modify", "install", "add ", "rename", "move ", "generate", "build ", "clean up", "complete the", "finish the", "continue",
+	// Chinese
+	"实现", "修改", "修复", "写入", "创建", "删除", "移除", "运行", "执行", "落地", "编辑", "更新", "重构", "构建", "安装", "重命名", "清理", "补齐", "完成未完成", "继续完成", "应用", "生成",
+}
+
+// userMessageDemandsAction reports whether the user's latest message is an
+// execution request. It is a bias signal, not a gate: the answer turn may
+// still legitimately answer in prose when no listed tool can advance the work.
+func userMessageDemandsAction(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	low := strings.ToLower(text)
+	for _, m := range actionDemandMarkers {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeToolRefusal is the streaming-path alias for containsToolDenial
+// (toolloop.go owns the phrase table so both paths cannot drift).
+func looksLikeToolRefusal(text string) bool { return containsToolDenial(text) }
 
 func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, anchors ...string) string {
 	defs, _ := json.Marshal(routerToolCatalogue(tools))
@@ -142,7 +181,8 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, an
 - If no tool is needed, respond with: NO_TOOL_NEEDED
 - Only use tools from the available list above
 - Use exactly the argument names listed for the tool (a trailing * marks a required argument)
-- Do not invent tools that are not in the list`
+- Do not invent tools that are not in the list
+- If the user's latest message is an execution request (implement, fix, write, edit, create, run, continue, 实现, 修改, 修复, 写入, 创建, 运行, 继续完成...), NO_TOOL_NEEDED is forbidden unless the whole task is purely conversational: pick the listed tool that advances the work. Denying that tools exist is always wrong — the caller executes your emitted calls on its own machine`
 	// The router decides ONE next step, which structurally biases the model
 	// toward the delegation tool: "the single call that does the most work"
 	// is always the subagent launcher, so fresh conversations routinely opened
