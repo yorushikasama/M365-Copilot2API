@@ -264,6 +264,13 @@ func New() (*Server, error) {
 		convCache:            newConversationCache(),
 		debounce:             newRequestDebounce(30*time.Second, 4096),
 	}
+	// Upstream account memory is opt-in: unless M365_ENABLE_UPSTREAM_MEMORY (or
+	// the matching setting) is on, every upstream dial carries disableMemory=1.
+	// The policy is installed on the client rather than repeated at each call
+	// site because retry, repair, image and streaming turns all build
+	// chathub.Request literals, and any one of them omitting the flag would put
+	// account memory back into an answer.
+	srv.chat.MemoryPolicy = func() bool { return !srv.settings.get().EnableUpstreamMemory }
 	// Let the persisted/console-editable account concurrency drive the gate;
 	// an explicit env override still wins (see bindLimitProvider).
 	srv.accountConcurrency.bindLimitProvider(func() int { return srv.settings.get().AccountConcurrencyLimit })
@@ -293,18 +300,26 @@ func (s *Server) PreheatPool() {
 		if acc.OID == "" {
 			continue
 		}
+		memoryDisabled := !cfg.EnableUpstreamMemory
+		opts := chathub.DialOptions{
+			LicenseType:   cfg.LicenseType,
+			Scenario:      cfg.Scenario,
+			DisableMemory: memoryDisabled,
+		}
 		for i := 0; i < 2; i++ {
 			go func(a auth.AccountToken) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
 				reqID := uuid.NewString()
-				sid := uuid.NewString()
-				cid := uuid.NewString()
-				wsURL, err := chathub.BuildWSURL(chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, sid, cid, reqID, cfg.LicenseType, cfg.Scenario)
+				// Seed the DEFAULT dial identity — empty session and conversation —
+				// because that is what a request with no resolved conversation looks
+				// up. Parking a random identity (the behaviour until 2026-09-11) filed
+				// the connection under a key no request would ever query.
+				wsURL, err := chathub.BuildWSURLWithOptions(chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, "", "", reqID, cfg.LicenseType, cfg.Scenario, memoryDisabled)
 				if err != nil {
 					return
 				}
-				s.chat.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, wsURL)
+				s.chat.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, wsURL, opts)
 			}(acc)
 		}
 	}
@@ -1763,15 +1778,20 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 	// Answer-turn tool protocol (see answerToolProtocol): in native mode the
 	// schemas already ride along as req.Tools, so the epilogue would duplicate
 	// the catalogue.
+	// Plan-mode entry is withheld on execution requests in both modes (see
+	// withoutPlanModeEntry): the answer turn is the fallback when the router
+	// said NO_TOOL_NEEDED, and offering it a tool that halts execution lets a
+	// misjudged turn still end as a plan with nothing executed.
+	lastUser := lastUserMessageText(body.Messages)
 	if planningMode != "native" {
-		answerPrompt += answerToolProtocol(body.Tools)
+		answerPrompt += answerToolProtocol(planModeEligibleToolDefs(body.Tools, lastUser))
 	}
 	// Execution mandate: when the user's latest message is an execution
 	// request and tools are declared, an answer-turn model that denies having
 	// tools ("当前会话没有可调用的...工具", gpt-5.6-sol 2026-09-10) must be
 	// pre-empted explicitly — the guard inside answerToolProtocol states the
 	// tools exist, this states the expected behavior for THIS message.
-	if lastUser := lastUserMessageText(body.Messages); len(body.Tools) > 0 && userMessageDemandsAction(lastUser) {
+	if len(body.Tools) > 0 && userMessageDemandsAction(lastUser) {
 		answerPrompt += "\nEXECUTION MANDATE: The user's latest message is an execution request, and the tool list above is real and sufficient. Answering in prose that you lack tools, cannot edit files, or can only describe what could be done is a factual error and a failed turn. Emit the tool call that advances the work; only if genuinely no listed tool can advance it, state precisely which capability is missing."
 	}
 	anchor := ""
@@ -1787,7 +1807,7 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 	// one-shot session (copilot_temp_session) still forces it off.
 	req := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, FeatureFlags: flags, Locale: locale.Locale, Market: locale.Market, TimeZone: locale.TimeZone, TimeZoneOffset: locale.TimeZoneOffset, DeviceOS: locale.DeviceOS, DisableMemory: disableMemory || !cfg.EnableUpstreamMemory, ExecutionAnchor: anchor}
 	if planningMode == "native" {
-		req.Tools = body.Tools
+		req.Tools = planModeEligibleToolDefs(body.Tools, lastUser)
 		req.ToolChoice = body.ToolChoice
 	}
 	// The caller declared tools, so the caller executes on its machine — the

@@ -15,6 +15,18 @@ import time
 
 import requests
 
+# Loopback traffic must never ride the shell's HTTP_PROXY: this workstation
+# exports HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:63489, and whenever that
+# local proxy is down every audit call turns into a 502 ProxyError that is
+# indistinguishable from a real gateway failure. Strip the proxy env vars
+# unless the operator explicitly opts in with AUDIT_USE_ENV_PROXY=1.
+if os.environ.get("AUDIT_USE_ENV_PROXY") != "1":
+    for _pv in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"):
+        os.environ.pop(_pv, None)
+os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
+
+
 BASE = os.environ.get("AUDIT_BASE", "http://127.0.0.1:14141")
 KEY = os.environ.get("AUDIT_KEY", "")
 MODEL = os.environ.get("AUDIT_MODEL", "gpt-5.6-sol")

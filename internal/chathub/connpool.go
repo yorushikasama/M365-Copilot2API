@@ -3,6 +3,7 @@ package chathub
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -27,6 +28,48 @@ const (
 	maxPoolPerKey = 2
 	poolConnTTL   = 300 * time.Second
 )
+
+// DialOptions are the connection-level knobs that ride on the upstream
+// websocket URL. They are NOT interchangeable between connections: upstream
+// resolves memory behaviour from the URL at dial time, and the chat payload has
+// no equivalent — so a connection dialed with disableMemory unset runs WITH
+// account memory no matter which request later reuses it.
+//
+// Keying the pool on oid|tid alone (the behaviour until 2026-09-11) meant every
+// request served from a parked connection silently ran with the dial-time
+// options: memory came back on despite M365_ENABLE_UPSTREAM_MEMORY=false and
+// copilot_temp_session had no effect. A live probe returned the same stale
+// account facts to three unrelated sessions and to an explicit temp-session
+// control. Signature() is what makes reuse safe.
+type DialOptions struct {
+	ConversationID string
+	SessionID      string
+	LicenseType    string
+	Scenario       string
+	DisableMemory  bool
+}
+
+// Signature renders the options that a parked connection CANNOT be re-dialed
+// for later, as a stable pool-key fragment.
+//
+// Only the transport-level flags join the key. Conversation and session ids are
+// deliberately excluded, because they are per-request values: including them
+// would make every agent turn a unique key, which both destroys the pool hit
+// rate and lets parked connections accumulate without bound. Excluding them is
+// safe because the gateway ships the caller's complete history inside the chat
+// payload (incremental dispatch is off by default), so a connection dialed for
+// one conversation still answers another correctly. The memory flag is the
+// opposite case: it exists only as a dial-time URL query parameter with no
+// payload equivalent, so it can never be corrected after the dial.
+//
+// Fields are length-prefixed so a value containing the separator cannot alias a
+// different combination.
+func (o DialOptions) Signature() string {
+	return fmt.Sprintf("%d:%s|%d:%s|%t",
+		len(o.LicenseType), o.LicenseType,
+		len(o.Scenario), o.Scenario,
+		o.DisableMemory)
+}
 
 // parkForwardTTL bounds how long the read pump waits for a consumer to accept a
 // frame before declaring the lease dead. It is a var so tests can shorten it.
@@ -65,7 +108,11 @@ func NewConnPool(dialer *websocket.Dialer, header http.Header) *ConnPool {
 	return p
 }
 
-func (p *ConnPool) key(oid, tid string) string { return oid + "|" + tid }
+// key scopes a parked connection to one account AND one dial identity. The
+// signature must be part of the key: upstream binds session, conversation and
+// memory behaviour at dial time, so a connection dialed for one identity must
+// never be handed to a request with another.
+func (p *ConnPool) key(oid, tid, sig string) string { return oid + "|" + tid + "|" + sig }
 
 // newPooledConn builds a parked-connection record with its frame channels
 // already allocated. The channels must exist before the entry is published to
@@ -170,13 +217,15 @@ func removePooledLocked(conns map[string][]*pooledConn, key string, target *pool
 	}
 }
 
-// Take hands out a connection for one request. bypassPool forces a fresh dial
-// even when a healthy connection is parked: after a transport-level failure the
-// request is retried on a brand-new connection instead of reusing one whose
-// parked siblings may be in the same bad state.
-func (p *ConnPool) Take(ctx context.Context, oid, tid, wsURL string, bypassPool bool) (*websocket.Conn, *sync.Mutex, <-chan []byte, <-chan error, bool, error) {
+// Take hands out a connection for one request. A parked connection is eligible
+// only when its dial identity (DialOptions) matches the caller's exactly;
+// bypassPool forces a fresh dial even when a matching connection is parked:
+// after a transport-level failure the request is retried on a brand-new
+// connection instead of reusing one whose parked siblings may be in the same
+// bad state.
+func (p *ConnPool) Take(ctx context.Context, oid, tid, wsURL string, opts DialOptions, bypassPool bool) (*websocket.Conn, *sync.Mutex, <-chan []byte, <-chan error, bool, error) {
 	p.mu.Lock()
-	key := p.key(oid, tid)
+	key := p.key(oid, tid, opts.Signature())
 	conns := p.conns[key]
 	var picked *pooledConn
 	var stale []*pooledConn
@@ -213,7 +262,7 @@ func (p *ConnPool) Take(ctx context.Context, oid, tid, wsURL string, bypassPool 
 	}
 
 	if picked != nil {
-		log.Printf("[connpool] hit oid=%s age_ms=%d", oid, time.Since(picked.created).Milliseconds())
+		log.Printf("[connpool] hit oid=%s age_ms=%d memory=%t conv=%s", oid, time.Since(picked.created).Milliseconds(), !opts.DisableMemory, shortID(opts.ConversationID))
 		return picked.conn, &picked.writeMu, picked.frames, picked.errs, true, nil
 	}
 
@@ -239,8 +288,8 @@ const warmMinInterval = 10 * time.Second
 // 2026-09-10: 137 requests after start-up, 137 with reused=false, 0 pool hits —
 // the start-up warm batch had already aged past its TTL before the first
 // request arrived, and nothing ever warmed again.
-func (p *ConnPool) ShouldWarm(oid, tid string) bool {
-	key := p.key(oid, tid)
+func (p *ConnPool) ShouldWarm(oid, tid string, opts DialOptions) bool {
+	key := p.key(oid, tid, opts.Signature())
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -254,11 +303,16 @@ func (p *ConnPool) ShouldWarm(oid, tid string) bool {
 	return true
 }
 
-func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) {
+// Warm dials and parks one connection for the given dial identity. The wsURL
+// MUST have been built with the same DialOptions, otherwise the parked entry is
+// filed under a key no request will ever look up (and, before the signature was
+// part of the key, would have been handed to a request that never asked for
+// those options).
+func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string, opts DialOptions) {
 	if wsURL == "" {
 		return
 	}
-	key := p.key(acc.OID, acc.TID)
+	key := p.key(acc.OID, acc.TID, opts.Signature())
 
 	p.mu.Lock()
 	if len(p.conns[key]) >= maxPoolPerKey {
@@ -293,7 +347,19 @@ func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) {
 
 	p.park(key, conn)
 
-	log.Printf("[connpool] warmed connection oid=%s tid=%s", acc.OID, acc.TID)
+	log.Printf("[connpool] warmed oid=%s tid=%s memory=%t conv=%s", acc.OID, acc.TID, !opts.DisableMemory, shortID(opts.ConversationID))
+}
+
+// shortID trims an identifier for logging without losing the ability to tell
+// two identities apart.
+func shortID(s string) string {
+	if s == "" {
+		return "-"
+	}
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
 }
 
 // park is the ONLY way a connection enters the pool, and it is the only place
@@ -323,8 +389,8 @@ func (p *ConnPool) park(key string, conn *websocket.Conn) {
 	p.startPark(key, pc)
 }
 
-func (p *ConnPool) WarmWithProbe(ctx context.Context, acc Account, wsURL string) {
-	p.Warm(ctx, acc, wsURL)
+func (p *ConnPool) WarmWithProbe(ctx context.Context, acc Account, wsURL string, opts DialOptions) {
+	p.Warm(ctx, acc, wsURL, opts)
 }
 
 // Discard drops a connection that must not be reused.

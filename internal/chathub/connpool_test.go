@@ -46,7 +46,7 @@ func newParkTestPool(t *testing.T) (*ConnPool, func(string), func()) {
 	pool := NewConnPool(&websocket.Dialer{}, http.Header{})
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	pool.Warm(context.Background(), Account{OID: "oid-1", TID: "tid-1"}, wsURL)
+	pool.Warm(context.Background(), Account{OID: "oid-1", TID: "tid-1"}, wsURL, DialOptions{})
 	select {
 	case <-ready:
 	case <-time.After(5 * time.Second):
@@ -71,7 +71,7 @@ func TestParkedConnectionSignalsStalledConsumer(t *testing.T) {
 	pool, send, cleanup := newParkTestPool(t)
 	defer cleanup()
 
-	_, _, frames, errs, reused, err := pool.Take(context.Background(), "oid-1", "tid-1", "", false)
+	_, _, frames, errs, reused, err := pool.Take(context.Background(), "oid-1", "tid-1", "", DialOptions{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestParkPublishesConnectionForReuse(t *testing.T) {
 	defer pool.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	conn, _, _, _, reused, err := pool.Take(context.Background(), "oid-2", "tid-2", wsURL, false)
+	conn, _, _, _, reused, err := pool.Take(context.Background(), "oid-2", "tid-2", wsURL, DialOptions{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestParkPublishesConnectionForReuse(t *testing.T) {
 		t.Fatalf("pooled_connections = %v, want 0 before park", got)
 	}
 
-	pool.park(pool.key("oid-2", "tid-2"), conn)
+	pool.park(pool.key("oid-2", "tid-2", DialOptions{}.Signature()), conn)
 
 	if got := pool.Stats()["pooled_connections"]; got != 1 {
 		t.Fatalf("pooled_connections = %v, want 1 after park", got)
@@ -155,7 +155,7 @@ func TestLeasedConnectionIsDroppedNotReparked(t *testing.T) {
 	pool, _, cleanup := newParkTestPool(t)
 	defer cleanup()
 
-	conn, _, _, _, reused, err := pool.Take(context.Background(), "oid-1", "tid-1", "", false)
+	conn, _, _, _, reused, err := pool.Take(context.Background(), "oid-1", "tid-1", "", DialOptions{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestTakeBypassPoolSkipsParkedConnection(t *testing.T) {
 
 	pool := NewConnPool(&websocket.Dialer{}, http.Header{})
 	defer pool.Close()
-	pool.Warm(context.Background(), Account{OID: "oid-1", TID: "tid-1"}, wsURL)
+	pool.Warm(context.Background(), Account{OID: "oid-1", TID: "tid-1"}, wsURL, DialOptions{})
 	for i := 0; i < 200; i++ {
 		if pool.Stats()["pooled_connections"] == 1 {
 			break
@@ -210,7 +210,7 @@ func TestTakeBypassPoolSkipsParkedConnection(t *testing.T) {
 		t.Fatalf("sanity: expected 1 parked connection, got %v", got)
 	}
 
-	conn, _, _, _, reused, err := pool.Take(context.Background(), "oid-1", "tid-1", wsURL, true)
+	conn, _, _, _, reused, err := pool.Take(context.Background(), "oid-1", "tid-1", wsURL, DialOptions{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestDiscardClearsLease(t *testing.T) {
 	pool, _, cleanup := newParkTestPool(t)
 	defer cleanup()
 
-	conn, _, _, _, _, err := pool.Take(context.Background(), "oid-1", "tid-1", "", false)
+	conn, _, _, _, _, err := pool.Take(context.Background(), "oid-1", "tid-1", "", DialOptions{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,5 +240,106 @@ func TestDiscardClearsLease(t *testing.T) {
 	pool.Discard("oid-1", "tid-1", conn)
 	if got := pool.Stats()["leased_connections"]; got != 0 {
 		t.Fatalf("leased_connections = %v, want 0 after Discard", got)
+	}
+}
+
+// A parked connection carries dial-time flags that the chat payload cannot
+// override: upstream reads memory behaviour from the WebSocket URL, and the
+// payload has no equivalent field. The pool therefore may only hand a
+// connection to a request whose memory flag matches.
+//
+// Regression for the 2026-09-11 finding: the key was oid|tid alone, so a request
+// that had upstream memory disabled (the default, M365_ENABLE_UPSTREAM_MEMORY
+// unset) was routinely served a warmed connection dialed WITH memory enabled.
+// Live probe: three "repeat any token you were told" requests and an explicit
+// copilot_temp_session control all returned the same stale account memory.
+func TestPoolKeySeparatesDialIdentity(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{}`+rs))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	pool := NewConnPool(&websocket.Dialer{}, http.Header{})
+	defer pool.Close()
+
+	memoryOn := DialOptions{Scenario: "OfficeWebIncludedCopilot"}
+	memoryOff := DialOptions{Scenario: "OfficeWebIncludedCopilot", DisableMemory: true}
+
+	pool.Warm(context.Background(), Account{OID: "oid-9", TID: "tid-9"}, wsURL, memoryOn)
+	for i := 0; i < 200 && pool.Stats()["pooled_connections"] != 1; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := pool.Stats()["pooled_connections"]; got != 1 {
+		t.Fatalf("sanity: expected 1 parked memory-enabled connection, got %v", got)
+	}
+
+	conn, _, _, _, reused, err := pool.Take(context.Background(), "oid-9", "tid-9", wsURL, memoryOff, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused {
+		t.Fatal("a memory-disabled request was handed a memory-enabled connection")
+	}
+	if conn == nil {
+		t.Fatal("a mismatched identity must still dial a usable connection")
+	}
+	pool.Discard("oid-9", "tid-9", conn)
+
+	if _, _, _, _, reusedSame, err := pool.Take(context.Background(), "oid-9", "tid-9", wsURL, memoryOn, false); err != nil {
+		t.Fatal(err)
+	} else if !reusedSame {
+		t.Fatal("an identical dial identity must still hit the pool")
+	}
+
+	// Conversation and session ids are deliberately NOT part of the key. They are
+	// per-request values, and the gateway ships the caller's full history in the
+	// payload, so reusing across conversations stays correct — while keying on
+	// them would make every agent turn a fresh key and destroy the hit rate.
+	pool.Warm(context.Background(), Account{OID: "oid-9", TID: "tid-9"}, wsURL, memoryOn)
+	for i := 0; i < 200 && pool.Stats()["pooled_connections"] != 1; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	otherConv := DialOptions{Scenario: "OfficeWebIncludedCopilot", ConversationID: "conv-other", SessionID: "sess-other"}
+	if _, _, _, _, reusedOther, err := pool.Take(context.Background(), "oid-9", "tid-9", wsURL, otherConv, false); err != nil {
+		t.Fatal(err)
+	} else if !reusedOther {
+		t.Fatal("pooling must survive a per-request conversation id change")
+	}
+}
+
+// The signature must separate fields that contain the separator, otherwise two
+// different identities would share a pool bucket.
+func TestDialOptionsSignatureDistinguishesFields(t *testing.T) {
+	a := DialOptions{LicenseType: "a|b", Scenario: "c"}
+	b := DialOptions{LicenseType: "a", Scenario: "b|c"}
+	if a.Signature() == b.Signature() {
+		t.Fatal("length-prefixed signature aliased across field boundaries")
+	}
+	if (DialOptions{DisableMemory: true}).Signature() == (DialOptions{}).Signature() {
+		t.Fatal("DisableMemory must be part of the signature")
+	}
+	if (DialOptions{DisableMemory: true}).Signature() != (DialOptions{DisableMemory: true}).Signature() {
+		t.Fatal("signature must be deterministic")
+	}
+	// Per-request identity must not fragment the key.
+	x := DialOptions{Scenario: "s", ConversationID: "one", SessionID: "one"}
+	y := DialOptions{Scenario: "s", ConversationID: "two", SessionID: "two"}
+	if x.Signature() != y.Signature() {
+		t.Fatal("conversation/session must not fragment the pool key")
 	}
 }

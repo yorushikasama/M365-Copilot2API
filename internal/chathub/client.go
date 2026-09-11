@@ -330,8 +330,8 @@ type Request struct {
 	// budget allowed 150s+60s+payload grace), burning the account slot and
 	// the caller's patience. Zero keeps the adaptive budget untouched.
 	MaxFirstTokenWait time.Duration
-	Capability            string
-	ExecutionAnchor       string
+	Capability        string
+	ExecutionAnchor   string
 	// BypassPool forces a freshly dialed WebSocket connection instead of
 	// reusing a parked one. It is set by the web layer when it retries a
 	// request that just failed at the transport level, so the retry cannot
@@ -445,6 +445,18 @@ type Client struct {
 	// ResponseDeadline bounds the whole exchange on one WebSocket, as a
 	// backstop against a silently dead upstream.
 	ResponseDeadline time.Duration
+
+	// MemoryPolicy reports whether upstream account memory must be disabled for
+	// every request on this client. It is consulted on each Chat call and ORed
+	// with Request.DisableMemory.
+	//
+	// The policy lives here, not at the call sites, because memory is a
+	// dial-time URL flag with no payload equivalent: a Request literal that
+	// simply omits DisableMemory silently re-enables account memory for that
+	// turn. Retry, repair, image and streaming turns all build such literals,
+	// so an opt-in default enforced per call site is one omission away from
+	// leaking account memory into an answer.
+	MemoryPolicy func() bool
 }
 
 const (
@@ -536,6 +548,20 @@ func (c *Client) responseDeadline() time.Duration {
 	return defaultResponseDeadline
 }
 
+// disableMemoryFor resolves the effective upstream-memory flag for one request:
+// the caller's explicit choice, ORed with the client-wide MemoryPolicy.
+//
+// Memory is a dial-time URL parameter, so this value decides both the WebSocket
+// URL and the connection-pool key. Resolving it here — rather than at each call
+// site — is what keeps a Request literal that simply omits the field from
+// silently re-enabling account memory.
+func (c *Client) disableMemoryFor(req Request) bool {
+	if req.DisableMemory {
+		return true
+	}
+	return c.MemoryPolicy != nil && c.MemoryPolicy()
+}
+
 func (c *Client) Chat(ctx context.Context, acc Account, req Request) (Result, error) {
 	return c.ChatWithDelta(ctx, acc, req, nil)
 }
@@ -596,7 +622,18 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		firstTurn = true
 	}
 	requestID := uuid.NewString()
-	wsURL, err := BuildWSURLWithOptions(acc, req.SessionID, req.ConversationID, requestID, req.LicenseType, req.Scenario, req.DisableMemory)
+	disableMemory := c.disableMemoryFor(req)
+	// The dial identity must be captured before the URL is built: it is both
+	// what the URL encodes and what the pool keys on, and the two must agree or
+	// a reused connection would carry a different identity than the caller's.
+	dialOpts := DialOptions{
+		ConversationID: req.ConversationID,
+		SessionID:      req.SessionID,
+		LicenseType:    req.LicenseType,
+		Scenario:       req.Scenario,
+		DisableMemory:  disableMemory,
+	}
+	wsURL, err := BuildWSURLWithOptions(acc, req.SessionID, req.ConversationID, requestID, req.LicenseType, req.Scenario, disableMemory)
 	if err != nil {
 		return Result{}, err
 	}
@@ -617,7 +654,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var poolErrs <-chan error
 	if c.Pool != nil {
 		var poolErr error
-		conn, connWriteMu, poolFrames, poolErrs, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL, req.BypassPool)
+		conn, connWriteMu, poolFrames, poolErrs, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL, dialOpts, req.BypassPool)
 		if poolErr != nil {
 			if errors.Is(poolErr, context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: poolErr}
@@ -628,15 +665,18 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		// deadlocks it: parked connections expire after poolConnTTL, so once the
 		// pool drains there is no hit left to trigger the next warm and every
 		// request pays a fresh dial forever.
-		if reused || c.Pool.ShouldWarm(acc.OID, acc.TID) {
+		if reused || c.Pool.ShouldWarm(acc.OID, acc.TID, dialOpts) {
 			go func() {
 				warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				warmReqID := uuid.NewString()
-				warmSID := uuid.NewString()
-				warmCID := uuid.NewString()
-				warmURL, _ := BuildWSURL(acc, warmSID, warmCID, warmReqID, req.LicenseType, req.Scenario)
-				c.Pool.Warm(warmCtx, acc, warmURL)
+				// Warm with the SAME dial identity as the live request. A connection
+				// dialed with different options is filed under a pool key no later
+				// request can look up, and — the bug fixed on 2026-09-11 — used to be
+				// handed out anyway, silently restoring upstream memory and another
+				// conversation's context for the caller.
+				warmURL, _ := BuildWSURLWithOptions(acc, req.SessionID, req.ConversationID, warmReqID, req.LicenseType, req.Scenario, disableMemory)
+				c.Pool.Warm(warmCtx, acc, warmURL, dialOpts)
 			}()
 		}
 	}
@@ -742,7 +782,10 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	payload := chatPayload(req, requestID, firstTurn)
 	log.Printf("chathub prompt-trace text=%d tools=%d payload=%d", len(req.Text), len(req.Tools), len(payload))
 	if c.Trace != nil {
-		meta := map[string]any{"stage": "chathub_payload", "attachment_count": len(req.Attachments), "payload_has_attachments": strings.Contains(payload, `"attachments"`), "attachments": []map[string]any{}}
+		// chatPayload emits the "attachments" key unconditionally (an empty array
+		// when there are none), so probing the serialized payload for the key
+		// always reported true. Report the actual attachment count instead.
+		meta := map[string]any{"stage": "chathub_payload", "attachment_count": len(req.Attachments), "payload_has_attachments": len(req.Attachments) > 0, "attachments": []map[string]any{}}
 		for _, a := range req.Attachments {
 			meta["attachments"] = append(meta["attachments"].([]map[string]any), map[string]any{"type": a.Type, "mime_type": a.MimeType, "url_length": len(a.URL), "data_url": strings.HasPrefix(a.URL, "data:"), "name": a.Name})
 		}
