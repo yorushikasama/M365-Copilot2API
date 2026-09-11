@@ -54,10 +54,16 @@ func usageMaxFileBytes() int64 {
 }
 
 type usageSnapshotCache struct {
-	at    time.Time
-	days  int
-	stats map[string]any
-	ips   []map[string]any
+	// Each view carries its own freshness stamp. A single shared `at` meant
+	// whichever view was computed last decided when the OTHER one expired, so
+	// a console that polls the stats endpoint every second kept refreshing the
+	// stamp and the IP aggregation was served from an entry that never aged
+	// out on its own.
+	statsAt time.Time
+	ipsAt   time.Time
+	days    int
+	stats   map[string]any
+	ips     []map[string]any
 }
 
 type usageLog struct {
@@ -285,7 +291,7 @@ func (s *usageLog) rotateIfNeeded() error {
 
 func (s *usageLog) snapshot(days int) map[string]any {
 	s.cacheMu.Lock()
-	if s.cache.stats != nil && s.cache.days == days && time.Since(s.cache.at) < usageSnapshotTTL {
+	if s.cache.stats != nil && s.cache.days == days && time.Since(s.cache.statsAt) < usageSnapshotTTL {
 		cached := s.cache.stats
 		s.cacheMu.Unlock()
 		return cached
@@ -297,10 +303,11 @@ func (s *usageLog) snapshot(days int) map[string]any {
 	s.cacheMu.Lock()
 	if s.cache.days != days {
 		s.cache.ips = nil
+		s.cache.ipsAt = time.Time{}
 	}
 	s.cache.days = days
 	s.cache.stats = stats
-	s.cache.at = time.Now()
+	s.cache.statsAt = time.Now()
 	s.cacheMu.Unlock()
 	return stats
 }
@@ -426,7 +433,7 @@ func (s *usageLog) ipSnapshot(days int) []map[string]any {
 		days = 30
 	}
 	s.cacheMu.Lock()
-	if s.cache.ips != nil && s.cache.days == days && time.Since(s.cache.at) < usageSnapshotTTL {
+	if s.cache.ips != nil && s.cache.days == days && time.Since(s.cache.ipsAt) < usageSnapshotTTL {
 		cached := s.cache.ips
 		s.cacheMu.Unlock()
 		return cached
@@ -438,10 +445,11 @@ func (s *usageLog) ipSnapshot(days int) []map[string]any {
 	s.cacheMu.Lock()
 	if s.cache.days != days {
 		s.cache.stats = nil
+		s.cache.statsAt = time.Time{}
 		s.cache.days = days
-		s.cache.at = time.Now()
 	}
 	s.cache.ips = out
+	s.cache.ipsAt = time.Now()
 	s.cacheMu.Unlock()
 	return out
 }

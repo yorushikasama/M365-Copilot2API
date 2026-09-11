@@ -49,7 +49,9 @@ func openIPManager() *ipManager {
 	b, err := os.ReadFile(path)
 	if err == nil {
 		var data ipRulesFile
-		if json.Unmarshal(b, &data) == nil {
+		// Report the decode failure, not the (nil) read error: this branch is
+		// only reached once the file was read successfully.
+		if decErr := json.Unmarshal(b, &data); decErr == nil {
 			for _, rule := range data.Rules {
 				if _, err := parseIPPrefix(rule.Prefix); err == nil {
 					if rule.ID == "" {
@@ -59,7 +61,7 @@ func openIPManager() *ipManager {
 				}
 			}
 		} else {
-			log.Printf("[ip-management] ignored invalid rules file: %v", err)
+			log.Printf("[ip-management] ignored invalid rules file: %v", decErr)
 		}
 	}
 	return m
@@ -132,8 +134,17 @@ func (m *ipManager) remove(id string) error {
 	defer m.mu.Unlock()
 	for i, r := range m.rules {
 		if r.ID == id {
-			m.rules = append(m.rules[:i], m.rules[i+1:]...)
+			// Build the new slice separately instead of splicing in place. The
+			// in-place append overwrote m.rules' backing array, so a failed save
+			// left the rule dropped from memory (unblocked) while the file still
+			// listed it — the block silently came back on the next restart.
+			kept := make([]IPRule, 0, len(m.rules)-1)
+			kept = append(kept, m.rules[:i]...)
+			kept = append(kept, m.rules[i+1:]...)
+			prev := m.rules
+			m.rules = kept
 			if err := m.saveLocked(); err != nil {
+				m.rules = prev
 				return err
 			}
 			return nil
@@ -214,18 +225,28 @@ func (s *Server) ipManagement(w http.ResponseWriter, r *http.Request) {
 		if n, err := strconv.Atoi(r.URL.Query().Get("days")); err == nil && n > 0 && n <= 365 {
 			days = n
 		}
-		ips := s.usage.ipSnapshot(days)
-		for _, item := range ips {
-			ip, _ := item["ip"].(string)
-			rule, blocked := s.ipManager.match(ip)
-			item["blocked"] = blocked
-			if blocked {
-				item["matched_rule"] = rule
-				item["matchedRule"] = rule
-			} else {
-				item["matched_rule"] = nil
-				item["matchedRule"] = nil
+		// ipSnapshot hands back the cached maps themselves, shared by every
+		// request that hits the 3s TTL. Annotating them in place both raced
+		// concurrent readers and let one request's block verdict persist into
+		// later responses, so decorate copies instead.
+		cached := s.usage.ipSnapshot(days)
+		ips := make([]map[string]any, 0, len(cached))
+		for _, item := range cached {
+			row := make(map[string]any, len(item)+3)
+			for k, v := range item {
+				row[k] = v
 			}
+			ip, _ := row["ip"].(string)
+			rule, blocked := s.ipManager.match(ip)
+			row["blocked"] = blocked
+			if blocked {
+				row["matched_rule"] = rule
+				row["matchedRule"] = rule
+			} else {
+				row["matched_rule"] = nil
+				row["matchedRule"] = nil
+			}
+			ips = append(ips, row)
 		}
 		jsonOut(w, map[string]any{"days": days, "rules": s.ipManager.list(), "ips": ips})
 	case http.MethodPost:
