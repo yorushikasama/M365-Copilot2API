@@ -3125,7 +3125,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	res.Text = sanitizePublicAssistantTextForModel(res.Text, body.Model)
 	res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
-	log.Printf("[debug] res.Text bytes=%d content=%q", len(res.Text), res.Text)
+	// Length only: this used to log content=%q, writing every non-stream answer
+	// verbatim into the system journal. That is the user's prompt-derived text
+	// sitting in a log any operator can read, and it dominated the journal for
+	// no diagnostic gain — the size is what actually distinguishes an empty
+	// completion from a real one.
+	log.Printf("[chat] response bytes=%d reasoning_bytes=%d", len(res.Text), len(res.Reasoning))
 	created := time.Now().Unix()
 
 	if body.Stream {
