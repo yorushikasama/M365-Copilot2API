@@ -17,7 +17,7 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sen
 	}
 	pt := EstimateTokens(res.Text)
 	for _, tc := range calls {
-		pt += EstimateTokens(string(tc.Arguments))
+		pt += EstimateTokens(stripInternalCitationMarkers(string(tc.Arguments)))
 	}
 	ct := EstimateTokens(res.Text)
 	if stream {
@@ -46,7 +46,9 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sen
 			}
 			isLast := i == len(calls)-1
 			emit(base(map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": tc.ID, "type": typ, "function": map[string]any{"name": tc.Name, "arguments": ""}}}}, nil))
-			args := string(tc.Arguments)
+			// Strip before chunking: the sentinels must not be split across two
+			// chunks, and the byte offsets below have to match what is emitted.
+			args := stripInternalCitationMarkers(string(tc.Arguments))
 			for off := 0; off < len(args); {
 				end := off + chunkSize
 				if end > len(args) {

@@ -96,6 +96,73 @@ func TestWriteToolResponseChunksAreIndividuallyValidUTF8(t *testing.T) {
 	}
 }
 
+// citedArgs builds an arguments blob whose prose carries an upstream citation
+// sentinel span, the exact shape that reached clients as "citecall_<uuid>".
+func citedArgs(payload string) string {
+	marker := string(citationMarkerOpen) + "cite" + "\ue202" + payload + string(citationMarkerClose)
+	return `{"plan":"未提交、未推送 ` + marker + `"}`
+}
+
+func TestToolCallArgumentsStripCitationMarkers(t *testing.T) {
+	// Only assistant content ran through the sanitizer, so a sentinel that landed
+	// inside tool-call arguments was forwarded verbatim. U+E200/U+E201/U+E202 are
+	// private-use characters a terminal renders as nothing, so the user saw the
+	// bare payload glued to the prose: "未提交、未推送 citecall_4eb000ff-...".
+	args := citedArgs("call_4eb000ff-93be-4817-baf2-7165d513ca72")
+	calls := []detectedToolCall{{ID: "call_1", Type: "function", Name: "plan", Arguments: json.RawMessage(args)}}
+
+	got := toolCallMaps(calls)
+	if len(got) != 1 {
+		t.Fatalf("toolCallMaps returned %d calls, want 1", len(got))
+	}
+	fn := got[0].(map[string]any)["function"].(map[string]any)
+	out, _ := fn["arguments"].(string)
+	if strings.ContainsRune(out, citationMarkerOpen) || strings.Contains(out, "citecall_") {
+		t.Fatalf("citation marker survived in tool-call arguments: %q", out)
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("stripped arguments are no longer valid JSON: %v (%q)", err, out)
+	}
+	if decoded["plan"] != "未提交、未推送 " {
+		t.Fatalf("unexpected plan value after stripping: %q", decoded["plan"])
+	}
+}
+
+func TestStreamedToolCallArgumentsStripCitationMarkers(t *testing.T) {
+	// The streaming path chunks the arguments itself, so it needs the same strip
+	// — and it has to strip before chunking, otherwise a sentinel split across
+	// two 512-byte deltas would survive reassembly on the client.
+	args := `{"note":"` + strings.Repeat("验收闭环", 100) + string(citationMarkerOpen) + "cite\ue202call_abc" + string(citationMarkerClose) + `"}`
+	calls := []detectedToolCall{{ID: "call_1", Type: "function", Name: "plan", Arguments: json.RawMessage(args)}}
+
+	rec := httptest.NewRecorder()
+	if err := writeToolResponse(rec, "chatcmpl-test", "m365-copilot", true, false, calls, chathub.Result{}); err != nil {
+		t.Fatalf("writeToolResponse: %v", err)
+	}
+
+	got := collectStreamedArguments(t, rec.Body.String())
+	if strings.ContainsRune(got, citationMarkerOpen) || strings.Contains(got, "citecall_") {
+		t.Fatalf("citation marker survived the streamed arguments: %q", got)
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+		t.Fatalf("reassembled arguments are not valid JSON: %v", err)
+	}
+	if decoded["note"] != strings.Repeat("验收闭环", 100) {
+		t.Fatalf("stripping damaged the surrounding prose")
+	}
+}
+
+func TestToolCallArgumentsWithoutMarkersAreUnchanged(t *testing.T) {
+	args := `{"path":"D:\\repo","note":"ordinary 参数"}`
+	calls := []detectedToolCall{{ID: "call_1", Type: "function", Name: "edit", Arguments: json.RawMessage(args)}}
+	fn := toolCallMaps(calls)[0].(map[string]any)["function"].(map[string]any)
+	if out, _ := fn["arguments"].(string); out != args {
+		t.Fatalf("clean arguments were rewritten: %q", out)
+	}
+}
+
 func TestWriteToolResponseStreamsFinishReasonExactlyOnce(t *testing.T) {
 	// isLastArgChunk was derived from off+chunkSize, which no longer matches the
 	// rune-aligned advance; the terminal chunk must still be the one that
