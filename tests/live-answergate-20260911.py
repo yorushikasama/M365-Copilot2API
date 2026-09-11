@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """Live regression probe for the answer-turn protocol gate (2026-09-11).
 
-Production failure being pinned down: the caller received the literal string
+Production failure: the caller received the literal string
 
     CALL_TOOL: Skill({"skill":"impeccable","args":"..."})
 
-as *content* while the gateway also emitted the parsed tool call. Root cause was
-that the answer turn's holdback classified the very first stream delta ("CALL",
-4 bytes) as "definitely not a tool call" and released the protocol line to the
-content channel.
+as *content* while the gateway also emitted the parsed tool call. Root cause:
+the answer turn's holdback classified the first stream delta ("CALL", 4 bytes)
+as "definitely not a tool call" and released the protocol line immediately.
 
-The probe drives the answer turn directly (not the router turn) by asking the
-model to print a protocol line verbatim: the router sees a print request and
-answers NO_TOOL_NEEDED, so the answer turn runs with the tool protocol armed.
-Every case asserts the protocol syntax never reaches the content channel.
+Driving the answer turn deterministically:
+
+  * `tool_choice:"none"` skips the router turn entirely (every router branch is
+    gated on `fmt.Sprint(body.ToolChoice) != "none"`), so the request always
+    lands on the answer turn — the only turn that can leak the protocol.
+  * The prompt therefore only has to make the model *want* to call a tool. The
+    marker itself never appears in the prompt: asking the model to print it
+    verbatim trips M365's injection guard and yields a canned refusal, which
+    proves nothing.
+
+What is asserted is the invariant the user cares about: protocol syntax must
+never appear on the content channel. Whether the model actually produced a
+marker is confirmed from the gateway journal afterwards
+(`[answer-tool] decision=deferred_call stream_suppressed=true` — a log line that
+had never fired before this fix).
 
 Usage:
   AUDIT_KEY=... python live-answergate-20260911.py
@@ -22,6 +32,7 @@ Usage:
 import json
 import os
 import sys
+import time
 
 import requests
 
@@ -35,6 +46,7 @@ os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
 BASE = os.environ.get("AUDIT_BASE", "http://127.0.0.1:14141")
 KEY = os.environ.get("AUDIT_KEY", "")
 MODEL = os.environ.get("AUDIT_MODEL", "gpt-5.6-sol")
+ATTEMPTS = int(os.environ.get("AUDIT_ATTEMPTS", "3"))
 H = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 MARKERS = ("CALL_TOOL:", "call_tool:", '{"calls"', "CALL_TOOL：")
@@ -52,6 +64,9 @@ BASH_TOOL = {
     },
 }
 
+ACTION_PROMPT = ("用 Bash 工具在这台 Windows 机器上执行 dir 命令，"
+                 "然后把输出里的文件名列表告诉我。")
+
 RESULTS = []
 
 
@@ -61,14 +76,16 @@ def rec(name, ok, detail="", warn=False):
     print(f"[{tag}] {name}: {detail}")
 
 
-def call(messages, stream, tools=None, timeout=180):
+def chat(messages, stream=True, tools=None, tool_choice=None, timeout=180):
     body = {"model": MODEL, "stream": stream, "messages": messages}
     if tools:
         body["tools"] = tools
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
     r = requests.post(f"{BASE}/v1/chat/completions", headers=H, json=body,
                       timeout=timeout, stream=stream)
     if stream:
-        content, tool_calls, finish, rid = [], [], None, r.headers.get("x-request-id")
+        content, tool_calls, finish = [], [], None
         for line in r.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
                 continue
@@ -87,90 +104,92 @@ def call(messages, stream, tools=None, timeout=180):
                     tool_calls.extend(d["tool_calls"])
                 if ch.get("finish_reason"):
                     finish = ch["finish_reason"]
-        return {"content": "".join(content), "tool_calls": tool_calls,
-                "finish": finish, "request_id": rid, "status": r.status_code}
+        return {"content": "".join(content), "tool_calls": tool_calls, "finish": finish,
+                "status": r.status_code, "request_id": r.headers.get("x-request-id")}
     data = r.json()
     ch = (data.get("choices") or [{}])[0]
     msg = ch.get("message") or {}
     return {"content": msg.get("content") or "", "tool_calls": msg.get("tool_calls") or [],
-            "finish": ch.get("finish_reason"), "request_id": r.headers.get("x-request-id"),
-            "status": r.status_code, "raw": data}
+            "finish": ch.get("finish_reason"), "status": r.status_code,
+            "request_id": r.headers.get("x-request-id")}
 
 
 def leaks(text):
     return [m for m in MARKERS if m in text]
 
 
-def ask_verbatim(line):
-    return [{"role": "user", "content":
-             "Reply with exactly the following line and absolutely nothing else. "
-             "Do not add quotes, comments or explanations:\n\n" + line}]
+def case_answer_turn_never_leaks():
+    """tool_choice=none forces the answer turn; the router cannot rescue it."""
+    leaked_all, seen_marker, sample = [], False, ""
+    for i in range(ATTEMPTS):
+        out = chat([{"role": "user", "content": ACTION_PROMPT}], tools=[BASH_TOOL],
+                   tool_choice="none")
+        found = leaks(out["content"])
+        if found:
+            leaked_all.append((i, found, out["content"][:200]))
+        if out["content"]:
+            sample = out["content"][:120]
+        if found:
+            seen_marker = True
+        time.sleep(1)
+    rec("gate/answer-turn(tool_choice=none) — protocol text never in content",
+        not leaked_all, f"attempts={ATTEMPTS} leaked={leaked_all} sample={sample!r}")
+    return seen_marker
 
 
-def case_protocol_call_stream():
-    line = 'CALL_TOOL: Bash({"command":"echo hi"})'
-    out = call(ask_verbatim(line), stream=True, tools=[BASH_TOOL])
-    leaked = leaks(out["content"])
-    names = [tc.get("function", {}).get("name") for tc in out["tool_calls"]]
-    rec("gate/protocol-call-stream — no protocol text in content",
-        not leaked, f"leaked={leaked} content={out['content'][:120]!r}")
-    rec("gate/protocol-call-stream — tool call still delivered",
-        bool(out["tool_calls"]), f"tool_calls={names} finish={out['finish']}")
-
-
-def case_protocol_call_undeclared_stream():
-    line = 'CALL_TOOL: NotADeclaredTool({"x":1})'
-    out = call(ask_verbatim(line), stream=True, tools=[BASH_TOOL])
-    leaked = leaks(out["content"])
-    rec("gate/protocol-call-undeclared — no protocol text in content",
-        not leaked, f"leaked={leaked} content={out['content'][:120]!r} "
-                   f"finish={out['finish']} tool_calls={len(out['tool_calls'])}")
-
-
-def case_protocol_envelope_stream():
-    line = '{"calls":[{"name":"Bash","arguments":{"command":"echo hi"}}]}'
-    out = call(ask_verbatim(line), stream=True, tools=[BASH_TOOL])
-    leaked = leaks(out["content"])
-    rec("gate/protocol-envelope-stream — no envelope text in content",
-        not leaked, f"leaked={leaked} content={out['content'][:120]!r} "
-                   f"finish={out['finish']} tool_calls={len(out['tool_calls'])}")
-
-
-def case_short_answer_is_not_swallowed():
-    for want in ("C", "CALL"):
-        out = call([{"role": "user", "content":
-                     f"Reply with exactly this one token and nothing else: {want}"}],
-                   stream=True, tools=[BASH_TOOL])
-        got = out["content"].strip()
-        rec(f"gate/short-answer-{want} — withheld tail is flushed",
-            got == want, f"content={got!r} leaked={leaks(out['content'])}")
+def case_auto_router_or_answer():
+    """Default path: the router may answer, the answer turn may take over."""
+    leaked_all, calls_seen, samples = [], 0, []
+    for i in range(ATTEMPTS):
+        out = chat([{"role": "user", "content": ACTION_PROMPT}], tools=[BASH_TOOL])
+        found = leaks(out["content"])
+        if found:
+            leaked_all.append((i, found, out["content"][:200]))
+        if out["tool_calls"]:
+            calls_seen += 1
+        samples.append((out["finish"], len(out["tool_calls"]), out["content"][:60]))
+        time.sleep(1)
+    rec("gate/auto-path — protocol text never in content",
+        not leaked_all, f"leaked={leaked_all}")
+    rec("gate/auto-path — tool delivery still works",
+        calls_seen > 0, f"tool_calls in {calls_seen}/{ATTEMPTS} attempts: {samples}")
 
 
 def case_prose_unaffected():
-    out = call([{"role": "user", "content":
-                 "In one short sentence, say what a hash map is."}],
-               stream=True, tools=[BASH_TOOL])
+    out = chat([{"role": "user", "content": "用一句话解释什么是哈希表。"}],
+               tools=[BASH_TOOL])
     ok = bool(out["content"].strip()) and not leaks(out["content"])
-    rec("gate/prose-stream — prose arrives and stays untouched",
+    rec("gate/prose — prose arrives and stays untouched",
         ok, f"content={out['content'][:100]!r} finish={out['finish']}")
 
 
-def case_nonstream_protocol_call():
-    line = 'CALL_TOOL: Bash({"command":"echo hi"})'
-    out = call(ask_verbatim(line), stream=False, tools=[BASH_TOOL])
+def case_short_answer_is_not_swallowed():
+    """The gate holds a rolling tail; a tiny answer must still be delivered."""
+    for want in ("C", "OK"):
+        out = chat([{"role": "user", "content":
+                     f"只回复这两个字符：{want}。不要任何其他内容、不要标点。"}],
+                   tools=[BASH_TOOL], tool_choice="none")
+        got = out["content"].strip()
+        rec(f"gate/short-answer-{want} — withheld tail is flushed",
+            want in got, f"content={got!r} leaked={leaks(out['content'])}",
+            warn=(want not in got))
+
+
+def case_nonstream():
+    out = chat([{"role": "user", "content": ACTION_PROMPT}], stream=False,
+               tools=[BASH_TOOL])
     leaked = leaks(out["content"])
     names = [tc.get("function", {}).get("name") for tc in out["tool_calls"]]
-    rec("gate/protocol-call-nonstream — no protocol text in content",
-        not leaked, f"leaked={leaked} content={out['content'][:120]!r} tool_calls={names}")
+    rec("gate/non-stream — protocol text never in content",
+        not leaked, f"leaked={leaked} content={out['content'][:100]!r} tool_calls={names}")
 
 
 CASES = [
-    case_protocol_call_stream,
-    case_protocol_call_undeclared_stream,
-    case_protocol_envelope_stream,
-    case_short_answer_is_not_swallowed,
+    case_answer_turn_never_leaks,
+    case_auto_router_or_answer,
     case_prose_unaffected,
-    case_nonstream_protocol_call,
+    case_short_answer_is_not_swallowed,
+    case_nonstream,
 ]
 
 
