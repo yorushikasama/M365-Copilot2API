@@ -119,6 +119,11 @@ func trimRouterWindowHead(s string, budget int) string {
 // incremental resolver prompt. With slimming disabled this is byte-for-byte
 // the legacy behaviour (answerPrompt-based).
 func (s *Server) buildRoutePrompt(body *oaiReq, fullPrompt, answerPrompt string, ledger agentLedger, executionAnchor string, toolMaps []map[string]any) string {
+	// Plan-mode entry is withheld when the user's latest message demands
+	// execution (see withoutPlanModeEntry): leaving it in the candidate list
+	// invites the router's one decision to be a mode switch that executes
+	// nothing. ExitPlanMode stays available as the escape hatch.
+	toolMaps = planModeEligibleTools(toolMaps, lastUserMessageText(body.Messages))
 	source := answerPrompt + "\n" + ledger.RouterContext()
 	full := modelToolRouterPrompt(source, toolMaps, body.ToolChoice, executionAnchor)
 	cfg := s.settings.get()

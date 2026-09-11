@@ -174,6 +174,128 @@ func userMessageDemandsAction(text string) bool {
 // (toolloop.go owns the phrase table so both paths cannot drift).
 func looksLikeToolRefusal(text string) bool { return containsToolDenial(text) }
 
+// planModeEntryNames are the separator-stripped, lowercased names of "enter
+// plan mode" tools — meta tools that HALT execution and hand the turn back to
+// the caller's planning UI. They are the worst possible answer to an execution
+// request while looking like the most decisive call available.
+var planModeEntryNames = map[string]bool{
+	"enterplanmode": true,
+	"startplanmode": true,
+	"planmode":      true,
+}
+
+// normalizeToolName lowercases a tool name and strips separators so one tool
+// spelled EnterPlanMode / enter_plan_mode / enter-plan-mode matches once.
+func normalizeToolName(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" {
+		return ""
+	}
+	return strings.NewReplacer("_", "", "-", "", " ", "", ".", "").Replace(n)
+}
+
+// isPlanModeEntryTool reports whether name is an "enter plan mode" meta tool.
+func isPlanModeEntryTool(name string) bool {
+	return planModeEntryNames[normalizeToolName(name)]
+}
+
+// toolFunctionName reads a tool's name from either shape the gateway carries:
+// the OpenAI envelope {"type":"function","function":{...,"name":...}} or a bare
+// {"name":...} object.
+func toolFunctionName(t map[string]any) string {
+	f, _ := t["function"].(map[string]any)
+	if f == nil {
+		f = t
+	}
+	name, _ := f["name"].(string)
+	return name
+}
+
+func hasPlanModeEntryTool(tools []map[string]any) bool {
+	for _, t := range tools {
+		if isPlanModeEntryTool(toolFunctionName(t)) {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutPlanModeEntry drops "enter plan mode" tools from a tool list. Entering
+// plan mode is a halt, never a step of the work: the router is asked for the ONE
+// next call that advances the request, and this tool advances nothing.
+//
+// The regression this closes (2026-09-11 00:56 live): the user's message was
+// "实现以上未落地的内容", the router answered CALL_TOOL: EnterPlanMode({}), the
+// caller entered plan mode, and the turn ended as a plan with zero execution —
+// then the router had to spend another 28s turn on ExitPlanMode to escape.
+// ExitPlanMode is deliberately NOT dropped: it is the legitimate escape hatch
+// for an execution request that arrives while the caller is already in plan
+// mode.
+//
+// Set M365_ROUTER_ALLOW_PLAN_MODE=true to disable the filter.
+func withoutPlanModeEntry(tools []map[string]any) []map[string]any {
+	if len(tools) == 0 || os.Getenv("M365_ROUTER_ALLOW_PLAN_MODE") == "true" {
+		return tools
+	}
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		if isPlanModeEntryTool(toolFunctionName(t)) {
+			continue
+		}
+		out = append(out, t)
+	}
+	if len(out) == len(tools) {
+		return tools
+	}
+	return out
+}
+
+// withoutPlanModeEntryTools is the []chathub.Tool twin of withoutPlanModeEntry,
+// used for the answer turn's textual tool protocol (answerToolProtocol).
+func withoutPlanModeEntryTools(tools []chathub.Tool) []chathub.Tool {
+	if len(tools) == 0 || os.Getenv("M365_ROUTER_ALLOW_PLAN_MODE") == "true" {
+		return tools
+	}
+	out := make([]chathub.Tool, 0, len(tools))
+	dropped := false
+	for _, t := range tools {
+		var f struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(t.Function, &f)
+		if isPlanModeEntryTool(f.Name) {
+			dropped = true
+			continue
+		}
+		out = append(out, t)
+	}
+	if !dropped {
+		return tools
+	}
+	return out
+}
+
+// planModeEligibleTools applies the plan-mode-entry policy for one request: when
+// the user's latest message is an execution request, the tool that can only halt
+// the work is withheld from both the router catalogue and the answer turn's
+// CALL_TOOL protocol. When the message is not an execution request (the user
+// really did ask to plan), the toolset is untouched.
+func planModeEligibleTools(tools []map[string]any, lastUserText string) []map[string]any {
+	if !userMessageDemandsAction(lastUserText) {
+		return tools
+	}
+	return withoutPlanModeEntry(tools)
+}
+
+// planModeEligibleToolDefs is the []chathub.Tool twin of planModeEligibleTools,
+// for the answer turn's textual tool protocol.
+func planModeEligibleToolDefs(tools []chathub.Tool, lastUserText string) []chathub.Tool {
+	if !userMessageDemandsAction(lastUserText) {
+		return tools
+	}
+	return withoutPlanModeEntryTools(tools)
+}
+
 func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, anchors ...string) string {
 	defs, _ := json.Marshal(routerToolCatalogue(tools))
 	mode := normalizedToolChoiceMode(choice)
@@ -193,6 +315,13 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any, an
 		rules += `
 - A subagent/orchestrator tool is your own judgment call, made by comparing the work against the tool's own description: delegate only when the task genuinely matches (a large, self-contained subtask); users rarely ask for delegation explicitly, and routine step-by-step work must stay on direct tools
 - Several independent direct steps must be parallel direct calls, never bundled into a subagent: respond with one JSON code block {"calls":[{"name":"...","arguments":{...}}]}`
+	}
+	// Plan-mode entry is a halt, not a step. It reads as "the most decisive
+	// call" while executing nothing, so a request to do work must not spend
+	// its one decision on it.
+	if hasPlanModeEntryTool(tools) {
+		rules += `
+- EnterPlanMode is not work: it halts execution and returns a plan instead. Never select it for an execution request — select the tool that actually reads, edits, writes or runs something. Select it only when the user explicitly asked for a plan before any change`
 	}
 	// Multi-turn: completed tool evidence (tool[...], tool_calls:) was already
 	// acted upon, so re-invoking those tools would duplicate work.

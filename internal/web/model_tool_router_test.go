@@ -201,8 +201,8 @@ func TestToolDenialDetection(t *testing.T) {
 
 func TestClassifyAnswerOutputPrefix(t *testing.T) {
 	cases := []struct {
-		in                 string
-		decided, isCall    bool
+		in              string
+		decided, isCall bool
 	}{
 		{"", false, false},
 		{"   \n", false, false},
@@ -222,5 +222,147 @@ func TestClassifyAnswerOutputPrefix(t *testing.T) {
 		if decided != c.decided || (decided && isCall != c.isCall) {
 			t.Fatalf("case %d %q: got decided=%v isCall=%v, want decided=%v isCall=%v", i, c.in, decided, isCall, c.decided, c.isCall)
 		}
+	}
+}
+
+// toolRouterName extracts the names a router catalogue would show, so tests can
+// assert on presence/absence without depending on catalogue ordering.
+func toolRouterName(t map[string]any) string {
+	f, _ := t["function"].(map[string]any)
+	if f == nil {
+		f = t
+	}
+	n, _ := f["name"].(string)
+	return n
+}
+
+func toolRouterNames(tools []map[string]any) []string {
+	out := make([]string, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, toolRouterName(t))
+	}
+	return out
+}
+
+func hasName(tools []map[string]any, want string) bool {
+	for _, t := range tools {
+		if toolRouterName(t) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func planModeToolset() []map[string]any {
+	return []map[string]any{
+		{"type": "function", "function": map[string]any{"name": "Read", "description": "read a file"}},
+		{"type": "function", "function": map[string]any{"name": "Edit", "description": "edit a file"}},
+		{"type": "function", "function": map[string]any{"name": "EnterPlanMode", "description": "switch the caller into plan mode"}},
+		{"type": "function", "function": map[string]any{"name": "ExitPlanMode", "description": "leave plan mode with a plan"}},
+		{"name": "Agent", "description": "delegation as a bare tool object"},
+	}
+}
+
+// Regression, 2026-09-11 00:56 live traffic: the user typed
+// "实现以上未落地的内容", the router answered CALL_TOOL: EnterPlanMode({}), the
+// caller switched into plan mode, and the turn ended as a plan with zero
+// execution (the router then spent a further 28s turn on ExitPlanMode to
+// escape). An execution request must never spend its single routing decision on
+// the one tool that can only halt the work.
+func TestRouterWithholdsPlanModeEntryOnExecutionRequest(t *testing.T) {
+	filtered := planModeEligibleTools(planModeToolset(), "实现以上未落地的内容")
+	if hasName(filtered, "EnterPlanMode") {
+		t.Fatalf("EnterPlanMode survived an execution request: %v", toolRouterNames(filtered))
+	}
+	// ExitPlanMode is the escape hatch for an execution request that lands
+	// while the caller is already in plan mode — dropping it would trap the
+	// session in the very mode this change is trying to avoid.
+	for _, keep := range []string{"ExitPlanMode", "Read", "Edit", "Agent"} {
+		if !hasName(filtered, keep) {
+			t.Fatalf("%s must stay routable, got %v", keep, toolRouterNames(filtered))
+		}
+	}
+	// The catalogue the router actually reads must agree.
+	p := modelToolRouterPrompt("实现以上未落地的内容", filtered, "auto")
+	if strings.Contains(p, "EnterPlanMode") {
+		t.Fatalf("router prompt still advertises EnterPlanMode: %s", p)
+	}
+	if !strings.Contains(p, "ExitPlanMode") {
+		t.Fatalf("router prompt lost ExitPlanMode: %s", p)
+	}
+}
+
+// The filter is scoped to the router's candidate list only: a request that is
+// not an execution request keeps its full toolset, so a user who really did ask
+// for a plan first can still get plan mode.
+func TestPlanModeEntrySurvivesNonExecutionRequest(t *testing.T) {
+	tools := planModeToolset()
+	kept := planModeEligibleTools(tools, "这个项目的整体架构怎么样？")
+	if !hasName(kept, "EnterPlanMode") {
+		t.Fatalf("non-execution request must keep EnterPlanMode: %v", toolRouterNames(kept))
+	}
+	if len(kept) != len(tools) {
+		t.Fatalf("toolset must be untouched, got %d want %d", len(kept), len(tools))
+	}
+}
+
+func TestPlanModeEntryNameNormalization(t *testing.T) {
+	for _, yes := range []string{"EnterPlanMode", "enter_plan_mode", "ENTER-PLAN-MODE", " planmode ", "StartPlanMode"} {
+		if !isPlanModeEntryTool(yes) {
+			t.Fatalf("%q must be recognised as a plan-mode entry tool", yes)
+		}
+	}
+	for _, no := range []string{"ExitPlanMode", "Plan", "Agent", "Edit", "TodoWrite", "EnterPlanModeX", ""} {
+		if isPlanModeEntryTool(no) {
+			t.Fatalf("%q must not be treated as a plan-mode entry tool", no)
+		}
+	}
+}
+
+// The answer turn is the fallback when the router said NO_TOOL_NEEDED. If its
+// textual CALL_TOOL catalogue still offers EnterPlanMode, a misjudged turn can
+// end as a plan (the exact user-visible symptom) even after the router is fixed.
+func TestAnswerTurnWithholdsPlanModeEntryOnExecutionRequest(t *testing.T) {
+	mk := func(name string) chathub.Tool {
+		raw, _ := json.Marshal(map[string]any{"name": name, "description": name + " tool", "parameters": map[string]any{"type": "object", "properties": map[string]any{}}})
+		return chathub.Tool{Type: "function", Function: raw}
+	}
+	defs := []chathub.Tool{mk("Read"), mk("EnterPlanMode"), mk("ExitPlanMode")}
+
+	filtered := planModeEligibleToolDefs(defs, "实现以上未落地的内容")
+	ep := answerToolProtocol(filtered)
+	if ep == "" {
+		t.Fatal("expected a tool protocol epilogue")
+	}
+	if strings.Contains(ep, "EnterPlanMode") {
+		t.Fatalf("answer-turn protocol still advertises EnterPlanMode: %s", ep)
+	}
+	if !strings.Contains(ep, "ExitPlanMode") || !strings.Contains(ep, "Read") {
+		t.Fatalf("answer-turn protocol dropped a legitimate tool: %s", ep)
+	}
+	// Non-execution requests keep the full protocol.
+	full := answerToolProtocol(planModeEligibleToolDefs(defs, "这个项目的整体架构怎么样？"))
+	if !strings.Contains(full, "EnterPlanMode") {
+		t.Fatalf("non-execution request must keep the plan-mode tool: %s", full)
+	}
+}
+
+func TestPlanModeFilterKillSwitch(t *testing.T) {
+	t.Setenv("M365_ROUTER_ALLOW_PLAN_MODE", "true")
+	kept := planModeEligibleTools(planModeToolset(), "实现以上未落地的内容")
+	if !hasName(kept, "EnterPlanMode") {
+		t.Fatalf("M365_ROUTER_ALLOW_PLAN_MODE=true must restore the previous behaviour: %v", toolRouterNames(kept))
+	}
+}
+
+func TestRouterPromptWarnsPlanModeIsNotWork(t *testing.T) {
+	p := modelToolRouterPrompt("request", planModeToolset(), "auto")
+	if !strings.Contains(p, "EnterPlanMode is not work") {
+		t.Fatalf("plan-mode counter-bias rule missing: %s", p)
+	}
+	// The rule names a tool, so it must not appear when that tool is absent.
+	plain := modelToolRouterPrompt("request", testTools(), "auto")
+	if strings.Contains(plain, "EnterPlanMode is not work") {
+		t.Fatal("plan-mode rule must not appear without a plan-mode tool")
 	}
 }
