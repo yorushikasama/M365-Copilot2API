@@ -28,6 +28,11 @@ const (
 	maxImageEditRequestBytes = maxGeneratedImageBytes + (2 << 20)
 	generatedImageTTL        = 15 * time.Minute
 	maxGeneratedImages       = 128
+	// maxGeneratedImageCacheBytes caps what the whole cache may hold. The count
+	// limit alone allowed maxGeneratedImages * maxGeneratedImageBytes (128 x 20
+	// MiB = 2.5 GiB) of image bytes to be pinned in RAM, which is several times
+	// the memory the service actually runs in.
+	maxGeneratedImageCacheBytes = 128 << 20
 	// imageAccountAttempts bounds how many accounts one image request may try
 	// before the throttle is reported to the caller.
 	imageAccountAttempts = 3
@@ -118,7 +123,21 @@ func imageURLsFromResult(res chathub.Result) []string {
 	if len(res.Images) > 0 {
 		return res.Images
 	}
-	return imageURLsFromText(res.Text)
+	// Only a Designer-hosted URL is an image this gateway can actually fetch.
+	// The prose scan accepts any https URL whose path or query looks image-ish,
+	// so a citation or a reference thumbnail the model merely mentioned counted
+	// as success: the rotation loop broke out with a non-empty list, and
+	// downloadDesignerImage then refused the host as a non-retryable 502. An
+	// unusable URL has to fall through to errImageNoResource instead, which is
+	// the path that does try the next account.
+	found := imageURLsFromText(res.Text)
+	kept := found[:0]
+	for _, candidate := range found {
+		if isDesignerImageURL(candidate) {
+			kept = append(kept, candidate)
+		}
+	}
+	return kept
 }
 
 // textURLPattern matches an https URL inside prose. The character class is the
@@ -795,7 +814,16 @@ func (s *Server) storeGeneratedImage(data []byte, contentType string) string {
 			delete(s.generatedImages, key)
 		}
 	}
-	if len(s.generatedImages) >= maxGeneratedImages {
+	// Evict oldest-first until the new entry fits under BOTH limits. A single
+	// eviction per store kept the count at 128 but let total bytes reach the
+	// per-image limit times that count, so a run of large images could pin far
+	// more memory than the process has.
+	cached := 0
+	for _, item := range s.generatedImages {
+		cached += len(item.Data)
+	}
+	for len(s.generatedImages) > 0 &&
+		(len(s.generatedImages) >= maxGeneratedImages || cached+len(data) > maxGeneratedImageCacheBytes) {
 		var oldestID string
 		var oldest time.Time
 		for key, item := range s.generatedImages {
@@ -803,9 +831,11 @@ func (s *Server) storeGeneratedImage(data []byte, contentType string) string {
 				oldestID, oldest = key, item.ExpiresAt
 			}
 		}
-		if oldestID != "" {
-			delete(s.generatedImages, oldestID)
+		if oldestID == "" {
+			break
 		}
+		cached -= len(s.generatedImages[oldestID].Data)
+		delete(s.generatedImages, oldestID)
 	}
 	s.generatedImages[id] = generatedImage{Data: append([]byte(nil), data...), ContentType: contentType, ExpiresAt: now.Add(generatedImageTTL)}
 	return id
