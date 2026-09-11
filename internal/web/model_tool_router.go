@@ -140,6 +140,7 @@ Available tools: %s
 - Several independent steps: reply with only one JSON block {"calls":[{"name":"...","arguments":{...}}]}
 - Use exactly the argument names listed (a trailing * marks a required argument); never invent tools that are not listed
 - If the user asks to continue, finish, or complete work and a tool can advance it, emit the tool call — do not answer with a list of unverified items
+- NEVER answer an execution request with a promise of future work ("我会…", "I will…", "let me…"): announcing a step executes nothing, and the caller has no way to act on it. Emit the tool call for the first step in this very reply
 - If you answer in prose instead, NEVER mention CALL_TOOL, {"calls" or any protocol marker in the text`, chathub.WindowsExecutionGuard, string(defs))
 }
 

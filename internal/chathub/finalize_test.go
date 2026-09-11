@@ -101,8 +101,9 @@ func TestFinalizeTextEmitsWholeFinalWhenNothingStreamed(t *testing.T) {
 
 func TestFinalizeTextPrefersFinalOnDivergence(t *testing.T) {
 	// A poisoned early delta means streamed is not a prefix of final.
-	// Already-sent deltas cannot be retracted, so nothing more is emitted,
-	// but the returned Result text must be the authoritative final message.
+	// Already-sent deltas cannot be retracted, so nothing already on the wire
+	// is repeated — but the authoritative final message's tail is still
+	// delivered, otherwise a streaming caller keeps only the stale fragment.
 	streamed := "**"
 	final := "好的，这是完整的答案。"
 	var emitted []string
@@ -113,8 +114,8 @@ func TestFinalizeTextPrefersFinalOnDivergence(t *testing.T) {
 	if got != final {
 		t.Fatalf("got %q, want %q", got, final)
 	}
-	if len(emitted) != 0 {
-		t.Fatalf("expected no emitted deltas on divergence, got %v", emitted)
+	if len(emitted) != 1 || emitted[0] != final {
+		t.Fatalf("expected the final message to be re-emitted on divergence, got %v", emitted)
 	}
 }
 
@@ -123,7 +124,9 @@ func TestFinalizeTextPrefersFinalAfterMidStreamRewrite(t *testing.T) {
 	// content mid-answer (three throttled regenerations), and the glued
 	// streamed text grew LONGER than the authoritative final message. The
 	// rewrite must win the result back to final — length alone must not
-	// keep a Frankenstein hybrid of several generations.
+	// keep a Frankenstein hybrid of several generations. Only the part of
+	// final the caller has not seen is emitted, so the shared opening is not
+	// duplicated on the wire.
 	streamed := "clean start\n<File>v1</File>\n具栏空间不足" // glued hybrid, longer than final
 	final := "clean start\n## 具体改动方案\n\n- `.hist-chart` 使用 `flex: 1`"
 	var emitted []string
@@ -134,8 +137,74 @@ func TestFinalizeTextPrefersFinalAfterMidStreamRewrite(t *testing.T) {
 	if got != final {
 		t.Fatalf("got %q, want the authoritative final %q", got, final)
 	}
+	wantTail := "## 具体改动方案\n\n- `.hist-chart` 使用 `flex: 1`"
+	if len(emitted) != 1 || emitted[0] != wantTail {
+		t.Fatalf("expected only the unseen tail %q, got %v", wantTail, emitted)
+	}
+}
+
+func TestFinalizeTextDivergenceReemitCanBeDisabled(t *testing.T) {
+	t.Setenv("M365_STREAM_DIVERGENCE_REEMIT", "0")
+	// The rewrite must actually diverge — a streamed prefix of final takes the
+	// "missing tail" branch and is unaffected by this switch.
+	streamed := "我会把缺失的日期逻辑、表单状态、响应式浮岛一起补齐"
+	final := "我会把缺失的日期逻辑全部补齐，然后跑定向构建验收。"
+	var emitted []string
+	got, err := finalizeText(streamed, final, 22, collectEmit(&emitted))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != final {
+		t.Fatalf("got %q, want %q", got, final)
+	}
 	if len(emitted) != 0 {
-		t.Fatalf("expected no emitted deltas on rewrite divergence, got %v", emitted)
+		t.Fatalf("expected the kill switch to suppress re-emission, got %v", emitted)
+	}
+}
+
+func TestFinalizeTextDivergenceDeliversThe20260911Tail(t *testing.T) {
+	// The live 2026-09-11 case: the caller streamed 186 bytes of a plan
+	// statement while the authoritative final message was 787 bytes — upstream
+	// had rewritten the opening, so streamed was not a prefix of final and the
+	// remainder never reached the streaming caller. The missing tail must now
+	// be delivered.
+	streamed := "我会把缺失的日期逻辑、表单状态、响应式浮岛、图表高度和历史检查栏样式一起补齐，然后用定向语法检查、构建和多尺寸页面验收闭环。"
+	final := "我会把缺失的日期逻辑、表单状态、响应式浮岛、图表高度和历史检查栏样式全部补齐，再用定向语法检查、构建和多尺寸页面验收闭环。\n\n先补 dayKeysBetween 与自定义范围激活态，再稳定历史图表高度。"
+	var emitted []string
+	got, err := finalizeText(streamed, final, 22, collectEmit(&emitted))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != final {
+		t.Fatalf("got %q, want %q", got, final)
+	}
+	wantTail := final[commonPrefixLen(streamed, final):]
+	if len(emitted) != 1 || emitted[0] != wantTail {
+		t.Fatalf("expected the missing tail %q to be delivered, got %v", wantTail, emitted)
+	}
+}
+
+func TestCommonPrefixLenStopsOnRuneBoundary(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"", "abc", 0},
+		{"abc", "", 0},
+		{"abc", "abd", 2},
+		{"我会把", "我会补齐", 6},
+		{"我会", "我会", 6},
+	}
+	for _, tc := range cases {
+		if got := commonPrefixLen(tc.a, tc.b); got != tc.want {
+			t.Fatalf("commonPrefixLen(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+	// A prefix that lands inside a multi-byte rune must round down.
+	a := "我会"
+	b := "我" + "会"[1:]
+	if got := commonPrefixLen(a, b); got != 3 {
+		t.Fatalf("expected the prefix to round down to a rune boundary, got %d", got)
 	}
 }
 

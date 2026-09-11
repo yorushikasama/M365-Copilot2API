@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"m365-copilot2api/internal/chathub"
+	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -198,6 +200,119 @@ var toolDenialPhrases = append(toolRefusalPatterns,
 	"cannot write files",
 	"no file editing tool",
 )
+
+// promissoryOpeners are the phrases that open a promise of future action
+// ("I will ...", "接下来我会 ..."). They head the third failure shape this
+// gateway has had to guard, and the only one that survives every existing
+// check: not a denial that tools exist (toolDenialPhrases), not a sandbox
+// hallucination (sandboxHallucinationPatterns), but an execution request
+// answered with a plan of what the model is about to do. 2026-09-11: the
+// answering turn replied "我会把缺失的日期逻辑…一起补齐，然后用定向语法检查…
+// 验收闭环。" with zero tool calls — it denies nothing, so every guard passed
+// it through.
+var promissoryOpeners = []string{
+	"我会", "我将", "我将要", "我会先", "我先", "我先来", "接下来我", "下一步我",
+	"下面我", "现在我将", "现在我会", "让我先", "让我来", "我将继续", "我会继续",
+	"接着我", "然后我",
+	"i will", "i'll", "i am going to", "i'm going to", "let me ", "next, i", "next i ",
+}
+
+// promissoryPlanMaxBytes bounds the shape. A real answer that merely opens
+// with a promise ("我会从三个方面说明…") grows past this size and is released;
+// a bare promise of upcoming work does not. The measured live case was 186
+// bytes.
+const promissoryPlanMaxBytes = 600
+
+// promissoryEvidenceMarkers mark text that reports actual work. Their presence
+// means the reply is not a bare promise, whatever it opens with.
+var promissoryEvidenceMarkers = []string{
+	"已完成", "已修改", "已修复", "已补齐", "已落地", "已更新", "已创建", "已删除",
+	"执行结果", "运行结果", "命令输出",
+	"already done", "has been updated", "i have already",
+}
+
+// promissoryHoldInitial is how many opening bytes stay undecided while the
+// promissory hold is armed. Every opener is decided well before it — the
+// longest is "i am going to" at 13 bytes — so a stream shorter than this has
+// simply not said enough to judge yet.
+const promissoryHoldInitial = 24
+
+// isPromissoryPrefix reports whether s could still grow into a promissory
+// opener once more deltas are appended — the same prefix-safety rule
+// isProtocolMarkerPrefix enforces for the protocol marker. Stream deltas are
+// tiny (the measured first delta is 4-5 bytes), so the opening fragment "我" or
+// "I" must never be classified as "not a promise"; doing so released the hold
+// and let the whole promise through, which is exactly how the 2026-09-11
+// classification bug worked for CALL_TOOL.
+//
+// The case-folding is guarded by utf8.ValidString: a delta cut mid-rune makes
+// strings.ToLower substitute U+FFFD, which changes the byte prefix and made
+// "我\xe4" (the first 4 bytes of "我会…") fail to match. Byte-wise comparison of
+// the raw string is what keeps a truncated opener detectable.
+func isPromissoryPrefix(s string) bool {
+	if s == "" {
+		return false
+	}
+	valid := utf8.ValidString(s)
+	low := s
+	if valid {
+		low = strings.ToLower(s)
+	}
+	for _, p := range promissoryOpeners {
+		if strings.HasPrefix(p, s) || (valid && strings.HasPrefix(p, low)) {
+			return true
+		}
+	}
+	return false
+}
+
+// answerPromissoryGuardEnabled reports whether an execution request answered
+// with a bare promise of future work is held back and retried, instead of being
+// streamed as the final answer. Set M365_ANSWER_PROMISSORY_GUARD=0 to fall back
+// to the previous behaviour.
+func answerPromissoryGuardEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("M365_ANSWER_PROMISSORY_GUARD"))
+	if raw == "" {
+		return true
+	}
+	return raw != "0" && !strings.EqualFold(raw, "false")
+}
+
+// isPromissoryPlan reports whether text is a bare promise of future work rather
+// than the work itself: it opens with a promise phrase, is short enough to be
+// just a promise, carries no code and no completion evidence. It is a shape
+// detector, not a gate — callers pair it with userMessageDemandsAction so a
+// conversational "我会建议…" answer is never touched.
+func isPromissoryPlan(text string) bool {
+	t := strings.TrimSpace(text)
+	t = strings.TrimLeft(t, "*#>- \t\r\n")
+	if t == "" {
+		return false
+	}
+	low := strings.ToLower(t)
+	matched := false
+	for _, p := range promissoryOpeners {
+		if strings.HasPrefix(low, p) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+	if len(t) > promissoryPlanMaxBytes {
+		return false
+	}
+	if strings.Contains(t, "```") {
+		return false
+	}
+	for _, m := range promissoryEvidenceMarkers {
+		if strings.Contains(low, strings.ToLower(m)) {
+			return false
+		}
+	}
+	return true
+}
 
 // containsToolDenial reports whether the text denies that callable tools
 // exist. Unlike isToolRefusal it has no length cap: refusal prose buried in a

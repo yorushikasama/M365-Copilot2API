@@ -50,16 +50,30 @@ const (
 // gate locks: the rest of the turn is dropped instead of streamed, while the
 // caller's own parse keeps operating on the full accumulated text.
 type answerProtocolGate struct {
-	armed     bool
-	measured  bool
-	locking   bool
-	lockedNow bool
-	window    strings.Builder
+	armed          bool
+	measured       bool
+	locking        bool
+	lockedNow      bool
+	promissory     bool
+	promissoryHeld bool
+	window         strings.Builder
 }
 
 func newAnswerProtocolGate(armed bool) *answerProtocolGate {
 	return &answerProtocolGate{armed: armed}
 }
+
+// ArmPromissory makes the gate hold prose that is a bare promise of future work
+// instead of an answer, so an execution request answered with "我会把…补齐"
+// never reaches the content channel and the caller can retry with a protocol
+// correction from a clean slate. Only the caller knows whether the turn was an
+// execution request; the gate never decides that on its own.
+func (g *answerProtocolGate) ArmPromissory(on bool) { g.promissory = on }
+
+// PromissoryHeld reports whether the gate is (or ended up) withholding prose
+// because it read as a bare promise. Checked before Flush so the caller can
+// discard the held promise rather than put it on the wire.
+func (g *answerProtocolGate) PromissoryHeld() bool { return g.promissoryHeld }
 
 // Push feeds one upstream delta and returns the bytes that may be written to
 // the content channel ("" when the gate is withholding them).
@@ -77,6 +91,24 @@ func (g *answerProtocolGate) Push(part string) string {
 		if !decided && len(buf) < protocolHoldInitial {
 			return ""
 		}
+		if !isCall && g.promissory {
+			if isPromissoryPlan(buf) {
+				// A promise of future work is not an answer to an execution
+				// request. Hold it until the turn ends; isPromissoryPlan stops
+				// matching once the buffer grows past a bare promise, which
+				// releases the hold naturally for a real answer.
+				g.promissoryHeld = true
+				return ""
+			}
+			if len(buf) < promissoryHoldInitial || isPromissoryPrefix(buf) {
+				// Undecided, not a promise: the opening fragment is still
+				// growing toward a promise phrase ("我" → "我会"). Deciding
+				// here is the prefix-safety bug the protocol marker already
+				// paid for once, and a mid-rune delta must not decide either.
+				return ""
+			}
+		}
+		g.promissoryHeld = false
 		g.measured = true
 		if isCall {
 			g.lock()

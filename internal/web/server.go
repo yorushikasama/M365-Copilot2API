@@ -2285,6 +2285,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// into tool calls instead. Prose passes through unchanged.
 		answerToolArmed := planningMode != "native" && len(toolMaps) > 0
 		gate := newAnswerProtocolGate(answerToolArmed)
+		// A promise of future work in reply to an execution request is a failed
+		// turn, not an answer (see isPromissoryPlan). Arm the hold only for
+		// those turns: a conversational reply that happens to open with
+		// "我会建议…" must stream normally.
+		answerTurnDemandsAction := len(toolMaps) > 0 && answerPromissoryGuardEnabled() && userMessageDemandsAction(lastUserMessageText(body.Messages))
+		gate.ArmPromissory(answerTurnDemandsAction)
 		textEmitted := false
 		writeContent := func(part string) error {
 			if part == "" {
@@ -2442,8 +2448,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// Release the gate's withheld tail. Without this the last bytes of every
 		// answer would be swallowed — the gate keeps a short rolling window back
 		// so a marker split across deltas cannot reach the content channel.
-		if out := gate.Flush(); out != "" {
-			if err := writeContent(out); err != nil {
+		// A held promise of future work is deliberately NOT released here: the
+		// retry below replaces it, and putting it on the wire first would make
+		// the correction arrive as a second, contradicting answer.
+		held := gate.Flush()
+		heldPromissory := gate.PromissoryHeld()
+		if held != "" && !heldPromissory {
+			if err := writeContent(held); err != nil {
 				return
 			}
 		}
@@ -2460,6 +2471,41 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				parsed = filterCompletedCalls(parsed, ledger)
 				log.Printf("[answer-tool] id=%s decision=call count=%d text_emitted=%t", requestID, len(parsed), textEmitted)
 				rawCalls = parsed
+			}
+		}
+		if heldPromissory && len(rawCalls) == 0 && !gate.Locked() {
+			// The answer turn replied to an execution request with a promise of
+			// future work ("我会把…一起补齐") instead of calling a tool. Nothing
+			// was emitted, so the turn can be corrected without contradicting
+			// anything the caller has already seen.
+			log.Printf("[answer-promissory] id=%s answer turn promised future work instead of calling a tool; retrying", requestID)
+			correction := appendExecutionAnchor("Your previous response announced work you intended to do, but executed none of it. Do not describe, plan, or promise the work — the caller executes the tool calls you emit on the user's machine. Emit the tool call NOW.\n\nUser request:\n"+prompt, executionAnchor)
+			promRes, promErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor})
+			switch {
+			case promErr == nil && strings.TrimSpace(promRes.Text) != "":
+				if promCalls, promOK := parseModelToolDecision(promRes.Text, toolMaps, body.ToolChoice); promOK && len(promCalls) > 0 {
+					log.Printf("[answer-promissory] id=%s retry produced %d tool call(s)", requestID, len(promCalls))
+					rawCalls = promCalls
+					text.Reset()
+					text.WriteString(promRes.Text)
+					res = promRes
+					break
+				}
+				if !isPromissoryPlan(promRes.Text) {
+					// The retry produced real prose — prefer it over the promise.
+					text.Reset()
+					text.WriteString(promRes.Text)
+					res = promRes
+					_ = writeContent(promRes.Text)
+					textEmitted = true
+					break
+				}
+				// Still a bare promise: surface the original rather than nothing.
+				_ = writeContent(held)
+				textEmitted = true
+			default:
+				_ = writeContent(held)
+				textEmitted = true
 			}
 		}
 		if len(rawCalls) == 0 {

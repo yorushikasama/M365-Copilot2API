@@ -1450,8 +1450,37 @@ func finalizeText(streamedText, final string, skipped int, emit func(string) err
 	if skipped == 0 && len(final) <= len(streamedText) {
 		return streamedText, nil
 	}
+	// Diverged: upstream revised content it had already sent. Those deltas are
+	// on the wire and cannot be retracted, but the authoritative final message
+	// must still reach the client — otherwise a streaming caller is left with
+	// the stale fragment and no way to know the rest ever existed. 2026-09-11:
+	// a turn streamed 186 bytes ("我会把…验收闭环。") while the final message
+	// was 787 bytes; the caller saw a quarter of the answer and the remainder
+	// was silently dropped. Emit everything past the longest common prefix so
+	// the tail arrives without re-sending what already did.
+	if streamDivergenceReemit() {
+		cp := commonPrefixLen(streamedText, final)
+		if tail := final[cp:]; tail != "" {
+			if err := emit(tail); err != nil {
+				return "", err
+			}
+		}
+		log.Printf("[emitSnapshot] streamed text diverged from final result (streamed=%d final=%d lcp=%d skipped_snapshots=%d); emitted final tail", len(streamedText), len(final), cp, skipped)
+		return final, nil
+	}
 	log.Printf("[emitSnapshot] streamed text diverged from final result (streamed=%d final=%d skipped_snapshots=%d); using final", len(streamedText), len(final), skipped)
 	return final, nil
+}
+
+// streamDivergenceReemit reports whether a mid-stream rewrite should deliver
+// the authoritative final message's missing tail to a streaming caller.
+// Set M365_STREAM_DIVERGENCE_REEMIT=0 to fall back to dropping it.
+func streamDivergenceReemit() bool {
+	raw := strings.TrimSpace(os.Getenv("M365_STREAM_DIVERGENCE_REEMIT"))
+	if raw == "" {
+		return true
+	}
+	return raw != "0" && !strings.EqualFold(raw, "false")
 }
 
 func BuildWSURL(acc Account, sessionID, conversationID, requestID, licenseType, scenario string) (string, error) {
