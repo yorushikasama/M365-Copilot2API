@@ -1471,7 +1471,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		"sessionId":                 res.SessionID,
 		"requestId":                 res.RequestID,
 		"throttling":                res.Throttling,
-		"suggestedResponses":        res.SuggestedResponses,
+		"suggestedResponses":        sanitizedSuggestedResponses(res.SuggestedResponses),
 		"result":                    res.RawResult,
 		"events":                    res.Events,
 		"images":                    res.Images,
@@ -1480,7 +1480,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		"scores":                    res.Scores,
 		"conversationTransferToken": res.ConversationTransferToken,
 		"meteringInformation":       res.MeteringInformation,
-		"spokenText":                res.SpokenText,
+		"spokenText":                stripInternalCitationMarkers(res.SpokenText),
 		"storageMessageId":          res.StorageMessageID,
 		"timestamps":                res.Timestamps,
 	})

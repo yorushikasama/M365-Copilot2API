@@ -25,7 +25,7 @@ func compatM365Metadata(res chathub.Result) map[string]any {
 		m["throttling"] = res.Throttling
 	}
 	if len(res.SuggestedResponses) > 0 {
-		m["suggestedResponses"] = res.SuggestedResponses
+		m["suggestedResponses"] = sanitizedSuggestedResponses(res.SuggestedResponses)
 	}
 	if res.Offense != "" {
 		m["offense"] = res.Offense
@@ -40,7 +40,7 @@ func compatM365Metadata(res chathub.Result) map[string]any {
 		m["meteringInformation"] = res.MeteringInformation
 	}
 	if res.SpokenText != "" {
-		m["spokenText"] = res.SpokenText
+		m["spokenText"] = stripInternalCitationMarkers(res.SpokenText)
 	}
 	if res.Timestamps.RequestSent != "" {
 		m["timestamps"] = res.Timestamps
@@ -72,6 +72,21 @@ func compatM365Metadata(res chathub.Result) map[string]any {
 		m["events"] = res.Events
 	}
 	return m
+}
+
+// sanitizedSuggestedResponses copies the follow-up suggestions with the upstream
+// citation sentinels removed. These are model-authored prose the client renders
+// as clickable chips, so a cited suggestion showed up as "citeturn2search1"
+// glued to the text exactly like the assistant content did.
+func sanitizedSuggestedResponses(in []chathub.SuggestedResponse) []chathub.SuggestedResponse {
+	out := make([]chathub.SuggestedResponse, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].Text = stripInternalCitationMarkers(out[i].Text)
+		out[i].CommandText = stripInternalCitationMarkers(out[i].CommandText)
+		out[i].HiddenText = stripInternalCitationMarkers(out[i].HiddenText)
+	}
+	return out
 }
 
 func normalizedToolChoiceMode(choice any) string {

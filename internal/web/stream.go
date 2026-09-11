@@ -154,9 +154,9 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	if err := writeEvent("done", map[string]any{
 		"type": "done", "text": res.Text,
 		"conversationId": res.ConversationID, "sessionId": res.SessionID, "requestId": res.RequestID,
-		"throttling": res.Throttling, "suggestedResponses": res.SuggestedResponses,
+		"throttling": res.Throttling, "suggestedResponses": sanitizedSuggestedResponses(res.SuggestedResponses),
 		"offense": res.Offense, "scores": res.Scores, "conversationTransferToken": res.ConversationTransferToken,
-		"meteringInformation": res.MeteringInformation, "spokenText": res.SpokenText,
+		"meteringInformation": res.MeteringInformation, "spokenText": stripInternalCitationMarkers(res.SpokenText),
 		"storageMessageId": res.StorageMessageID,
 		"timestamps":       res.Timestamps,
 	}); err != nil {

@@ -224,8 +224,12 @@ const (
 
 // contentPolicyMessage prefers the upstream's own wording, which usually says
 // what it objected to, and falls back to a generic line.
+//
+// The detail is the raw refusal text, taken before the response sanitizer runs,
+// so it still carries upstream citation sentinels; stripping them here keeps the
+// refusal from being the one client-visible string that leaks them.
 func contentPolicyMessage(detail string) string {
-	if detail = strings.TrimSpace(detail); detail != "" {
+	if detail = strings.TrimSpace(stripInternalCitationMarkers(detail)); detail != "" {
 		return detail
 	}
 	return "M365 content policy refused this request; rephrase the prompt or try another account"
