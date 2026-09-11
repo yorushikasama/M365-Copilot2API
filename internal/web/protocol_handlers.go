@@ -3,9 +3,11 @@ package web
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -145,21 +147,57 @@ func innerErrorDetail(raw []byte) (code string, message string) {
 	return "", trimmed
 }
 
+// errResponsesStreamAbandoned unblocks the inner handler when the outer
+// Responses stream stops reading.
+var errResponsesStreamAbandoned = errors.New("responses stream abandoned")
+
+// internalAdapterKey marks a request that the Responses/Anthropic adapters
+// synthesized to drive openaiChat in-process. Carried on the context rather
+// than a header so an external caller cannot set it.
+type internalAdapterKey struct{}
+
+// internalAdapterRequest clones r for in-process replay by another protocol
+// handler. openaiChat is the real handler on the other end, so without this
+// marker it books its own UsageRecord under /v1/chat/completions while the
+// outer handler books a second one: every /v1/responses and /v1/messages call
+// was counted twice, with the tokens attributed to the wrong endpoint.
+func internalAdapterRequest(r *http.Request, body []byte) *http.Request {
+	r2 := r.Clone(context.WithValue(r.Context(), internalAdapterKey{}, true))
+	r2.Method = http.MethodPost
+	r2.Body = io.NopCloser(bytes.NewReader(body))
+	r2.ContentLength = int64(len(body))
+	return r2
+}
+
+func isInternalAdapterRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	v, _ := r.Context().Value(internalAdapterKey{}).(bool)
+	return v
+}
+
 // runResponsesInnerChat is an indirect seam so tests can drive
 // streamResponsesAdapter with a canned inner chat stream.
 var runResponsesInnerChat = (*Server).openaiChat
 
 // streamResponsesAdapter converts the internal OpenAI SSE incrementally instead
 // of buffering the entire completion in httptest.ResponseRecorder.
-func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string) {
+func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string, releaseParent func()) {
+	startedAt := time.Now()
+	if releaseParent == nil {
+		releaseParent = func() {}
+	}
 	o.Stream = true
 	b, _ := json.Marshal(o)
-	r2 := r.Clone(r.Context())
-	r2.Method = http.MethodPost
-	r2.Body = io.NopCloser(bytes.NewReader(b))
-	r2.ContentLength = int64(len(b))
+	r2 := internalAdapterRequest(r, b)
 	pr, pw := io.Pipe()
 	irw := &pipeResponseWriter{h: make(http.Header), w: pw}
+	// Every early return below must unblock the inner handler. It writes the
+	// whole completion into pw, so an abandoned read half (client hang-up, a
+	// failed emit) left openaiChat parked on Write forever, holding its account
+	// concurrency slot and upstream WebSocket for the life of the process.
+	defer pr.CloseWithError(errResponsesStreamAbandoned)
 	innerDone := make(chan struct{})
 	go func() {
 		defer func() {
@@ -197,6 +235,10 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
 		if r.Context().Err() != nil {
+			// The client hung up mid-turn, so nothing was delivered and the
+			// parent must stay resumable; otherwise a dropped connection cost
+			// the caller its whole conversation with a permanent 409.
+			releaseParent()
 			return
 		}
 		line := scanner.Text()
@@ -297,6 +339,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		// full incident investigation (Codex sessions silently failing for
 		// 90 minutes with no diagnosable cause in the gateway logs).
 		log.Printf("[responses] inner-reject id=%s status=%d code=%s detail=%q", id, status, code, detail)
+		releaseParent()
 		emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
@@ -310,6 +353,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		// Never leave a Responses stream after response.created without a
 		// terminal event: clients otherwise render this as a successful blank
 		// answer and may reuse an incomplete response on the next turn.
+		releaseParent()
 		emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
@@ -365,6 +409,23 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		usageOutput += call.Name + call.Args
 	}
 	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, usageOutput)
+	// The inner openaiChat call is suppressed from usage accounting, so a
+	// streaming turn has to book its own record; otherwise every streaming
+	// /v1/responses request went unmetered.
+	if s.usage != nil {
+		s.usage.record(UsageRecord{
+			Time:         time.Now(),
+			APIKeyPrefix: extractAPIKey(r),
+			ClientIP:     clientIP(r),
+			Model:        model,
+			Endpoint:     "/v1/responses",
+			Stream:       true,
+			InputTokens:  int64(estimate.Values["input_tokens"].(int)),
+			OutputTokens: int64(estimate.Values["output_tokens"].(int)),
+			DurationMs:   time.Since(startedAt).Milliseconds(),
+			Status:       200,
+		})
+	}
 	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": localUsageMetadata(estimate.Source)}
 	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
@@ -372,10 +433,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []byte, int, error) {
 	o.Stream = false
 	b, _ := json.Marshal(o)
-	r2 := r.Clone(r.Context())
-	r2.Method = http.MethodPost
-	r2.Body = io.NopCloser(bytes.NewReader(b))
-	r2.ContentLength = int64(len(b))
+	r2 := internalAdapterRequest(r, b)
 	rr := httptest.NewRecorder()
 	s.openaiChat(rr, r2)
 	var out map[string]any
@@ -415,6 +473,12 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionID := responseSessionID(r)
 	nsKey := responseNamespace(tenant, sessionID)
+	// releaseParent un-consumes the parent node when this turn ends without
+	// producing a successor. Consumption is a replay guard, not a record that
+	// the turn happened: leaving it set after an upstream 429/502 meant the
+	// client's identical retry got 409 "already consumed" forever, with no
+	// surviving response ID to continue from — the conversation was dead.
+	releaseParent := func() {}
 	if body.PreviousResponseID != "" {
 		toolIDs := extractResponsesToolOutputIDs(body.Input)
 		s.responseMu.Lock()
@@ -475,6 +539,17 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		messages := append([]oaiMsg(nil), prior.Messages...)
 		newVersion := prior.Version
 		parentToolCount := len(prior.ToolCalls)
+		parentID := body.PreviousResponseID
+		releaseParent = func() {
+			s.responseMu.Lock()
+			// Re-read under the lock: a concurrent turn may have replaced or
+			// evicted the node, and reviving a stale pointer would resurrect
+			// history this namespace no longer owns.
+			if node, ok := s.responseMessages[nsKey][parentID]; ok && node == prior {
+				node.Consumed = false
+			}
+			s.responseMu.Unlock()
+		}
 		s.responseMu.Unlock()
 		log.Printf("[responses-audit] tenantHash=%s session=%s previous=%s action=consumed version=%d tool_ids=%v parentToolCalls=%d", tenantHashPrefix(tenant), sessionHashPrefix(sessionID), body.PreviousResponseID, newVersion, toolIDs, parentToolCount)
 		if s.debug != nil {
@@ -483,20 +558,23 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		o.Messages = append(messages, o.Messages...)
 	}
 	if body.Stream {
-		s.streamResponsesAdapter(w, r, o, firstNonEmpty(body.Model, "m365-copilot"))
+		s.streamResponsesAdapter(w, r, o, firstNonEmpty(body.Model, "m365-copilot"), releaseParent)
 		return
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
 	if status >= 400 {
+		releaseParent()
 		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
 		return
 	}
 	if err != nil {
+		releaseParent()
 		log.Printf("[responses] adapter failed: %v", err)
 		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "upstream protocol error: "+err.Error())
 		return
 	}
 	if !responsesOutputHasContent(out) {
+		releaseParent()
 		log.Printf("[responses] upstream produced no content (status=%d)", status)
 		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "ChatHub returned an empty response; no reusable message was created")
 		return

@@ -62,7 +62,7 @@ func TestResponsesAdapterToolCallAddedCarriesIdentity(t *testing.T) {
 	s := &Server{}
 	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rr := httptest.NewRecorder()
-	s.streamResponsesAdapter(rr, r, oaiReq{Model: "gpt-5.6-sol"}, "gpt-5.6-sol")
+	s.streamResponsesAdapter(rr, r, oaiReq{Model: "gpt-5.6-sol"}, "gpt-5.6-sol", nil)
 
 	events := collectResponsesEvents(t, rr.Body.String())
 	var added map[string]any

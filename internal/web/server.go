@@ -3260,7 +3260,7 @@ func (s *Server) writePublicIdentityChatResponse(w http.ResponseWriter, r *http.
 	inputTokens := EstimateTokens(prompt)
 	outputTokens := EstimateTokens(answer)
 	usage := map[string]any{"prompt_tokens": inputTokens, "completion_tokens": outputTokens, "total_tokens": inputTokens + outputTokens}
-	if s.usage != nil {
+	if s.usage != nil && !isInternalAdapterRequest(r) {
 		s.usage.record(UsageRecord{
 			Time:         time.Now(),
 			APIKeyPrefix: extractAPIKey(r),
@@ -3351,6 +3351,13 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	newTokens := EstimateTokens(prompt)
 	sessions := s.sessionResolver.ListSessions()
 	cacheStats.RecordRequest(apiKey, historyTokens > 0, newTokens, historyTokens, len(sessions))
+	// A request the Responses/Anthropic adapters replayed through openaiChat is
+	// not a /v1/chat/completions call: the outer handler books the real record
+	// for its own endpoint, so booking one here double-counted every request and
+	// filed the tokens under the wrong endpoint.
+	if isInternalAdapterRequest(r) {
+		return
+	}
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: apiKey,
