@@ -182,14 +182,21 @@ func (s *Server) clientForProxy(proxyURL string) *chathub.Client {
 		log.Printf("[bound-proxy] invalid proxy %q: %v", proxyURL, err)
 		return s.chat
 	}
-	c := &chathub.Client{
-		HTTPHeader: make(http.Header),
-		HTTPClient: clients.HTTP,
-		Dialer:     clients.WebSocket,
-		Trace:      s.chat.Trace,
-	}
+	// Copy the configured client so a bound proxy inherits MemoryPolicy and the
+	// M365_CHATHUB_* timeouts by construction; a bare literal here silently
+	// dialed with account memory enabled and without connection reuse.
+	cp := *s.chat
+	c := &cp
+	c.HTTPHeader = make(http.Header)
+	c.HTTPClient = clients.HTTP
+	c.Dialer = clients.WebSocket
 	c.HTTPHeader.Set("Origin", "https://m365.cloud.microsoft")
 	c.HTTPHeader.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
+	// The pool keys connections by dialer, so a proxied client needs its own;
+	// sharing s.chat.Pool would hand back direct-dialed sockets.
+	if s.chat.Pool != nil {
+		c.Pool = chathub.NewConnPool(clients.WebSocket, c.HTTPHeader)
+	}
 	actual, _ := s.proxyClients.LoadOrStore(proxyURL, c)
 	return actual.(*chathub.Client)
 }
@@ -2967,7 +2974,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		// so the next request re-sends the full history on a fresh conversation.
 		s.sessionResolver.InvalidateMatching(r, &body)
 		s.debounceRememberFailure(debounceKey, err)
-		writeUpstreamErrorWithAccount(w, err, acc.ID)
+		// A streaming turn already reported the failure in-band: the SSE error
+		// event, the finish_reason="error" usage chunk and [DONE] are on the
+		// wire and the 200 text/event-stream header is committed. Writing an
+		// HTTP error here would log a superfluous WriteHeader, discard the
+		// intended status, and append JSON after [DONE].
+		if !body.Stream {
+			writeUpstreamErrorWithAccount(w, err, acc.ID)
+		}
 		return
 	}
 	if res.Throttling != nil && s.accountPool != nil {

@@ -47,18 +47,24 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sen
 			isLast := i == len(calls)-1
 			emit(base(map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": tc.ID, "type": typ, "function": map[string]any{"name": tc.Name, "arguments": ""}}}}, nil))
 			args := string(tc.Arguments)
-			for off := 0; off < len(args); off += chunkSize {
+			for off := 0; off < len(args); {
 				end := off + chunkSize
 				if end > len(args) {
 					end = len(args)
 				}
+				// A chunk boundary inside a multi-byte rune would make both
+				// halves invalid UTF-8, and encoding/json rewrites those bytes
+				// as U+FFFD — one CJK character arrives as "\ufffd\ufffd\ufffd".
+				// Extend to the end of the straddled rune, then resume exactly
+				// where this chunk stopped: advancing by chunkSize instead
+				// re-sent the borrowed bytes and restarted mid-rune anyway.
 				for end < len(args) && !utf8.RuneStart(args[end]) {
 					end++
 				}
 				argChunk := args[off:end]
-				isLastArgChunk := off+chunkSize >= len(args)
+				off = end
 				var finish any
-				if isLast && isLastArgChunk {
+				if isLast && off >= len(args) {
 					finish = "tool_calls"
 				}
 				emit(base(map[string]any{"tool_calls": []any{map[string]any{"index": i, "function": map[string]any{"arguments": argChunk}}}}, finish))

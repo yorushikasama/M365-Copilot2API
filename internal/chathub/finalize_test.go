@@ -208,6 +208,26 @@ func TestCommonPrefixLenStopsOnRuneBoundary(t *testing.T) {
 	}
 }
 
+func TestFinalizeTextDivergenceTailIsValidUTF8(t *testing.T) {
+	// End-to-end guard for the same corruption: a divergence inside a CJK rune
+	// must not hand the streaming caller a tail that starts mid-character.
+	streamed := "然后用定向语法检查、构建和多尺寸页面验收闭环。"
+	final := "然后用定向语法检验、构建和多尺寸页面验收闭环。补齐日期逻辑。"
+	var emitted []string
+	if _, err := finalizeText(streamed, final, 0, collectEmit(&emitted)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(emitted) != 1 {
+		t.Fatalf("expected one tail emission, got %v", emitted)
+	}
+	if !utf8.ValidString(emitted[0]) {
+		t.Fatalf("emitted tail %q is not valid UTF-8", emitted[0])
+	}
+	if strings.ContainsRune(emitted[0], utf8.RuneError) {
+		t.Fatalf("emitted tail %q contains a replacement character", emitted[0])
+	}
+}
+
 func TestFinalizeTextPropagatesEmitError(t *testing.T) {
 	wantErr := errors.New("client went away")
 	_, err := finalizeText("prefix ", "prefix and tail", 0, func(string) error { return wantErr })
