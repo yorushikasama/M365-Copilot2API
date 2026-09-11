@@ -120,6 +120,11 @@ func TestIsSafeToRetry(t *testing.T) {
 		{"pre-send failures left nothing on the wire", &DialError{Status: 0, Kind: "WS_HANDSHAKE"}, true},
 		{"wrapped still resolves", fmt.Errorf("chat: %w", &DialError{Status: 0, Kind: "TCP"}), true},
 		{"wrapped streamed still refuses", fmt.Errorf("chat: %w", &DialError{Status: 0, Kind: "TCP", Streamed: true}), false},
+		// A non-Success result frame ("InternalError") used to surface as a bare
+		// fmt.Errorf, which carries no phase, so failover refused a fault that
+		// another account usually serves without trouble.
+		{"result error before any content", &DialError{Status: 0, Kind: "UPSTREAM_STRUCTURED"}, true},
+		{"result error after content", &DialError{Status: 0, Kind: "UPSTREAM_STRUCTURED", Streamed: true}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

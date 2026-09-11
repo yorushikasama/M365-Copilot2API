@@ -1303,7 +1303,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							if strings.Contains(low, "throttl") {
 								return Result{}, &MeteringError{Cause: ErrMeteringThrottled, Throttling: throttling, Metering: meteringInformation}
 							}
-							return Result{}, fmt.Errorf("upstream result error: %s", rawResult)
+							return Result{}, &DialError{Status: 0, Kind: "UPSTREAM_STRUCTURED", Streamed: phase >= PhaseStreaming, cause: fmt.Errorf("upstream result error: %s", rawResult)}
 						}
 						if mi, ok := res["meteringInformation"]; ok && mi != nil {
 							meteringInformation = mi
