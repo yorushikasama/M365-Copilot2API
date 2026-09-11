@@ -3,8 +3,6 @@ package web
 import (
 	"fmt"
 	"strings"
-
-	"m365-copilot2api/internal/chathub"
 )
 
 type atomKind string
@@ -131,23 +129,6 @@ func buildAtomsWithCounter(messages []oaiMsg, counter func(string) int) []contex
 		}
 	}
 	return atoms
-}
-
-func flattenAtoms(atoms []contextAtom, attachments []chathub.Attachment) (string, []chathub.Attachment) {
-	var msgs []oaiMsg
-	for _, a := range atoms {
-		msgs = append(msgs, a.Msgs...)
-	}
-	return flattenPromptMessages(msgs, attachments)
-}
-
-func flattenPromptMessagesWithBudget(messages []oaiMsg, attachments []chathub.Attachment, budget int) (string, []chathub.Attachment, bool, error) {
-	truncatedMsgs, truncated, err := slidingWindow(messages, budget)
-	if err != nil {
-		return "", attachments, false, err
-	}
-	prompt, atts := flattenPromptMessages(truncatedMsgs, attachments)
-	return prompt, atts, truncated, nil
 }
 
 // budget for slidingWindow: B = ContextWindow - MaxOutput - 512

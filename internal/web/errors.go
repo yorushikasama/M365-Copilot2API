@@ -358,21 +358,6 @@ func canFailoverChatTurn(ctx context.Context, err error) bool {
 	return ok
 }
 
-func ClassifyErrorCode(code string) ErrorCategory {
-	switch code {
-	case "ErrorUserBanned":
-		return CategoryUserBanned
-	case "ErrorUserThrottled":
-		return CategoryUserThrottled
-	case "InsufficientTokens":
-		return CategoryInsufficientTokens
-	case "ErrorDisallowedAADUser":
-		return CategoryDesignerDisabled
-	default:
-		return CategoryUnknown
-	}
-}
-
 // logUpstreamFailure records why a request is being failed. Without it the
 // journal holds only the status code, which leaves a 429 or 502 impossible to
 // diagnose after the fact.

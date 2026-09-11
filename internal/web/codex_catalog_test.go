@@ -177,6 +177,11 @@ func TestReasoningEffortRouting(t *testing.T) {
 		{"gpt-5.5", "low", "Gpt_5_5_Chat"},
 		{"gpt-5.5", "medium", "Gpt_5_5_Reasoning"},
 		{"gpt-5.6-reasoning", "none", "Gpt_5_6_Reasoning"},
+		// "max" is an accepted OpenAI effort tier; it must route to the same
+		// reasoning tone as high/xhigh (the gateway only forwards the tone).
+		{"gpt-5.6-reasoning", "max", "Gpt_5_6_Reasoning"},
+		{"gpt-5.5", "max", "Gpt_5_5_Reasoning"},
+		{"claude-sonnet", "max", "Claude_Sonnet_Reasoning"},
 	}
 	for _, tc := range cases {
 		got, err := reasoningTone(tc.model, tc.effort)

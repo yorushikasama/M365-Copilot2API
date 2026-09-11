@@ -2,7 +2,6 @@ package web
 
 import (
 	"encoding/json"
-	"fmt"
 	"m365-copilot2api/internal/chathub"
 	"os"
 	"strings"
@@ -76,7 +75,7 @@ func validateDetectedToolCalls(calls []detectedToolCall, tools []map[string]any,
 			continue
 		}
 		if call.ID == "" {
-			call.ID = callID(call.Name, string(call.Arguments), len(valid))
+			call.ID = callID()
 		}
 		if call.Type == "" {
 			call.Type = toolType(call.Name, tools)
@@ -105,65 +104,8 @@ func toolChoiceAllows(choice any, name string) bool {
 	return true
 }
 
-// callID returns a globally unique tool call id. Content hashes previously
-// collided when the same tool+arguments was invoked again (duplicate tool call
-// id errors from clients), so uniqueness must not depend on call content.
-func callID(name, args string, index int) string {
+func callID() string {
 	return "call_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-}
-
-func extractToolCalls(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
-	allowed := allowedToolNames(tools)
-	var out []detectedToolCall
-	remaining := text
-	for {
-		start := strings.Index(remaining, "<m365-tool-call>")
-		if start < 0 {
-			break
-		}
-		end := strings.Index(remaining[start:], "</m365-tool-call>")
-		if end < 0 {
-			break
-		}
-		end += start
-		content := remaining[start+len("<m365-tool-call>") : end]
-		remaining = remaining[end+len("</m365-tool-call>"):]
-		var raw any
-		if json.Unmarshal([]byte(content), &raw) != nil {
-			continue
-		}
-		items := []any{raw}
-		if arr, ok := raw.([]any); ok {
-			items = arr
-		}
-		for _, item := range items {
-			m, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			n, _ := m["name"].(string)
-			if !allowed[n] || !toolChoiceAllows(choice, n) {
-				continue
-			}
-			a, _ := json.Marshal(m["arguments"])
-			out = append(out, detectedToolCall{ID: callID(n, string(a), len(out)), Type: toolType(n, tools), Name: n, Arguments: a})
-		}
-	}
-	return out, len(out) > 0
-}
-
-func validateToolResult(messages []oaiMsg, known map[string]bool) error {
-	for _, m := range messages {
-		if m.Role == "tool" {
-			if m.ToolCallID == "" {
-				return fmt.Errorf("tool_call_id required")
-			}
-			if len(known) > 0 && !known[m.ToolCallID] {
-				return fmt.Errorf("unknown tool_call_id: %s", m.ToolCallID)
-			}
-		}
-	}
-	return nil
 }
 
 var toolRefusalPatterns = []string{

@@ -43,13 +43,13 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			if m, ok := v.(map[string]any); ok {
 				if cmd, hasCmd := m["command"]; hasCmd && cmd != "" {
 					cmdBytes, _ := json.Marshal(map[string]any{"command": cmd, "timeout": m["timeout"], "workdir": m["workdir"]})
-					out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
+					out = append(out, detectedToolCall{ID: callID(), Type: "function", Name: converted, Arguments: cmdBytes})
 					continue
 				}
 			}
 			if v == nil {
 				cmdBytes, _ := json.Marshal(map[string]any{"command": args})
-				out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
+				out = append(out, detectedToolCall{ID: callID(), Type: "function", Name: converted, Arguments: cmdBytes})
 				continue
 			}
 			continue
@@ -61,7 +61,7 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			continue
 		}
 		b, _ := json.Marshal(v)
-		out = append(out, detectedToolCall{ID: callID(name, string(b), len(out)), Type: toolType(name, tools), Name: name, Arguments: b})
+		out = append(out, detectedToolCall{ID: callID(), Type: toolType(name, tools), Name: name, Arguments: b})
 	}
 	// Also check for plain JSON objects with a "command" field (not in fenced blocks)
 	if len(out) == 0 && shell != "" {
@@ -87,7 +87,7 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			}
 			if cmd, hasCmd := obj["command"]; hasCmd && cmd != "" {
 				cmdBytes, _ := json.Marshal(map[string]any{"command": cmd, "timeout": obj["timeout"], "workdir": obj["workdir"]})
-				out = append(out, detectedToolCall{ID: callID(shell, string(cmdBytes), len(out)), Type: "function", Name: shell, Arguments: cmdBytes})
+				out = append(out, detectedToolCall{ID: callID(), Type: "function", Name: shell, Arguments: cmdBytes})
 				break
 			}
 		}

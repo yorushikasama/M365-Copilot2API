@@ -229,10 +229,6 @@ const (
 	PhaseCompleted
 )
 
-func IsRetriablePhase(p Phase) bool {
-	return p == PhasePayloadSent
-}
-
 var chTrace = os.Getenv("M365_TRACE") == "1"
 
 func commonPrefixLen(a, b string) int {

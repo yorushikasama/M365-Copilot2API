@@ -6,20 +6,6 @@ import (
 	"strings"
 )
 
-func flattenPromptMessagesBudgeted(messages []oaiMsg, attachments []chathub.Attachment, budget int) (string, []chathub.Attachment, bool, error) {
-	truncatedMsgs, truncated, err := slidingWindow(messages, budget)
-	if err != nil {
-		return "", attachments, false, err
-	}
-	prompt, atts := flattenPromptMessages(truncatedMsgs, attachments)
-	return prompt, atts, truncated, nil
-}
-
-// flattenAtoms delegates to context_budget flattenAtoms for atom-aware flattening.
-func flattenAtomsAlias(atoms []contextAtom, attachments []chathub.Attachment) (string, []chathub.Attachment) {
-	return flattenAtoms(atoms, attachments)
-}
-
 func flattenPromptMessages(messages []oaiMsg, attachments []chathub.Attachment) (string, []chathub.Attachment) {
 	var systemParts []string
 	var rest []oaiMsg

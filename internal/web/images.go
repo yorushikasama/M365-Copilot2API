@@ -913,10 +913,6 @@ func classifyImageRefusal(text string) imageRefusalKind {
 	return imageRefusalUnknown
 }
 
-func downloadImageAsBase64(url string) (b64, contentType string, err error) {
-	return downloadImageAsBase64WithToken(url, "")
-}
-
 func downloadImageAsBase64WithToken(url, token string) (b64, contentType string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -945,14 +941,6 @@ func downloadImageAsBase64WithToken(url, token string) (b64, contentType string,
 	}
 	enc := base64.StdEncoding.EncodeToString(body)
 	return enc, ct, nil
-}
-
-func downloadImageAsDataURI(url string) (string, error) {
-	b64, ct, err := downloadImageAsBase64(url)
-	if err != nil {
-		return url, nil
-	}
-	return "data:" + ct + ";base64," + b64, nil
 }
 
 func downloadImageAsDataURIWithToken(url, token string) (string, error) {

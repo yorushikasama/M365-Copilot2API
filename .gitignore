@@ -12,6 +12,7 @@ cookies*.txt
 # Build artifacts
 /m365-copilot2api
 /m365-copilot2api.exe
+/m365-copilot2api-linux-amd64
 /m365-copilot2api.exe.rollback
 /bin/
 /dist/
