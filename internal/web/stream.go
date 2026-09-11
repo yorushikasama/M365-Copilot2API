@@ -147,7 +147,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for i, event := range chathub.SemanticEvents(res.Events) {
-		if err := writeEvent("semantic", map[string]any{"index": i, "type": "m365.semantic", "event": event}); err != nil {
+		if err := writeEvent("semantic", map[string]any{"index": i, "type": "m365.semantic", "event": sanitizedSemanticEvent(event)}); err != nil {
 			return
 		}
 	}
@@ -248,4 +248,22 @@ func applyMeteringCooldown(pool *accountHealth, accountID string, meterError str
 		pool.MarkImageGenSystemThrottled(accountID)
 		log.Printf("[metering] account=%s imageGenSystemCooldown=30m", accountID)
 	}
+}
+
+// sanitizedSemanticEvent strips the upstream citation sentinels from the
+// projected fields of a semantic event. Text/HiddenText/Queries are the
+// presentation view an API consumer renders, so they carry the same obligation
+// as assistant content; the embedded Raw event is deliberately left verbatim,
+// because it is the debug passthrough of exactly what the upstream sent.
+func sanitizedSemanticEvent(e chathub.SemanticEvent) chathub.SemanticEvent {
+	e.Text = stripInternalCitationMarkers(e.Text)
+	e.HiddenText = stripInternalCitationMarkers(e.HiddenText)
+	if len(e.Queries) > 0 {
+		queries := make([]string, len(e.Queries))
+		for i, q := range e.Queries {
+			queries[i] = stripInternalCitationMarkers(q)
+		}
+		e.Queries = queries
+	}
+	return e
 }

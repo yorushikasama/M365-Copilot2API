@@ -108,3 +108,67 @@ func TestCompatMetadataLeavesCleanResultUntouched(t *testing.T) {
 		t.Fatalf("metadata is no longer serializable: %v", err)
 	}
 }
+
+func TestSanitizedSemanticEventStripsProjectedFields(t *testing.T) {
+	// /api/chat/stream emits a projected "semantic" view of each upstream event.
+	// Text/HiddenText/Queries are what an API consumer renders, so they leaked the
+	// sentinels the same way assistant content did — confirmed live: 82 semantic
+	// frames of one search-heavy turn carried U+E200/U+E201/U+E202.
+	marker := string(citationMarkerOpen) + "citeturn2search1" + string(citationMarkerClose)
+	in := chathub.SemanticEvent{
+		Kind:        "search.progress",
+		Text:        "range-over-func changed. " + marker,
+		HiddenText:  "hidden " + marker,
+		Queries:     []string{"go 1.24 " + marker, "clean query"},
+		ContentType: "SearchResults",
+	}
+
+	got := sanitizedSemanticEvent(in)
+	if strings.ContainsRune(got.Text, citationMarkerOpen) || strings.Contains(got.Text, "citeturn") {
+		t.Fatalf("semantic text still carries a marker: %q", got.Text)
+	}
+	if got.Text != "range-over-func changed. " {
+		t.Fatalf("stripping damaged the surrounding prose: %q", got.Text)
+	}
+	if strings.ContainsRune(got.HiddenText, citationMarkerOpen) {
+		t.Fatalf("semantic hiddenText still carries a marker: %q", got.HiddenText)
+	}
+	for i, q := range got.Queries {
+		if strings.ContainsRune(q, citationMarkerOpen) {
+			t.Fatalf("query %d still carries a marker: %q", i, q)
+		}
+	}
+	if got.Queries[1] != "clean query" {
+		t.Fatalf("a clean query was rewritten: %q", got.Queries[1])
+	}
+	if got.Kind != "search.progress" || got.ContentType != "SearchResults" {
+		t.Fatalf("non-text fields were altered: %+v", got)
+	}
+}
+
+func TestSanitizedSemanticEventDoesNotMutateSource(t *testing.T) {
+	// The Queries slice is shared with the caller's event, so stripping in place
+	// would rewrite the upstream data the Raw passthrough is supposed to preserve.
+	marker := string(citationMarkerOpen) + "citeturn2search1" + string(citationMarkerClose)
+	original := []string{"go 1.24 " + marker}
+	in := chathub.SemanticEvent{Text: "t " + marker, Queries: original}
+
+	_ = sanitizedSemanticEvent(in)
+	if !strings.ContainsRune(original[0], citationMarkerOpen) {
+		t.Fatalf("source query slice was mutated: %q", original[0])
+	}
+	if !strings.ContainsRune(in.Text, citationMarkerOpen) {
+		t.Fatalf("source event text was mutated: %q", in.Text)
+	}
+}
+
+func TestSanitizedSemanticEventKeepsRawVerbatim(t *testing.T) {
+	// Raw is the debug passthrough of exactly what the upstream sent; cleaning it
+	// would defeat its only purpose.
+	marker := string(citationMarkerOpen) + "citeturn2search1" + string(citationMarkerClose)
+	raw := chathub.Event{Arguments: json.RawMessage(`{"text":"a ` + marker + `"}`)}
+	got := sanitizedSemanticEvent(chathub.SemanticEvent{Text: "x " + marker, Raw: raw})
+	if !strings.ContainsRune(string(got.Raw.Arguments), citationMarkerOpen) {
+		t.Fatalf("Raw passthrough was sanitized: %q", got.Raw.Arguments)
+	}
+}
