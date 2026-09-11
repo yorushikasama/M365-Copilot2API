@@ -256,14 +256,35 @@ func applyMeteringCooldown(pool *accountHealth, accountID string, meterError str
 // as assistant content; the embedded Raw event is deliberately left verbatim,
 // because it is the debug passthrough of exactly what the upstream sent.
 func sanitizedSemanticEvent(e chathub.SemanticEvent) chathub.SemanticEvent {
-	e.Text = stripInternalCitationMarkers(e.Text)
-	e.HiddenText = stripInternalCitationMarkers(e.HiddenText)
+	e.Text = stripSemanticFieldMarkers(e.Text)
+	e.HiddenText = stripSemanticFieldMarkers(e.HiddenText)
 	if len(e.Queries) > 0 {
 		queries := make([]string, len(e.Queries))
 		for i, q := range e.Queries {
-			queries[i] = stripInternalCitationMarkers(q)
+			queries[i] = stripSemanticFieldMarkers(q)
 		}
 		e.Queries = queries
 	}
 	return e
+}
+
+// stripSemanticFieldMarkers removes complete citation spans, then drops a
+// trailing span that upstream cut off mid-marker.
+//
+// stripInternalCitationMarkers leaves an unterminated span alone on purpose: in
+// a streaming fragment the closing half arrives in a later chunk, so cutting at
+// the opener would corrupt the join. A semantic event is not a fragment — each
+// one is a complete snapshot of the answer so far — so an opener with no closer
+// means upstream truncated the snapshot inside the marker, and there is no
+// continuation coming. Everything from that opener onward is marker debris:
+// leaving it produced a bare U+E200 at the end of 6 progress snapshots, and
+// removing only the sentinel runes would be worse, surfacing a half-written
+// "citecall_4eb" payload as visible text.
+func stripSemanticFieldMarkers(text string) string {
+	text = stripInternalCitationMarkers(text)
+	i := strings.IndexRune(text, citationMarkerOpen)
+	if i < 0 {
+		return text
+	}
+	return text[:i]
 }

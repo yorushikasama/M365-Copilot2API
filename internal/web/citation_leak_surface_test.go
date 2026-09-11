@@ -172,3 +172,44 @@ func TestSanitizedSemanticEventKeepsRawVerbatim(t *testing.T) {
 		t.Fatalf("Raw passthrough was sanitized: %q", got.Raw.Arguments)
 	}
 }
+
+func TestSemanticFieldDropsUnterminatedMarkerTail(t *testing.T) {
+	// Upstream truncates a progress snapshot inside the marker, so the opener
+	// arrives with no closer and no continuation is coming. Live traffic showed a
+	// bare U+E200 at the end of 6 snapshots on /api/chat/stream.
+	in := "no new range-over-func language changes. " + string(citationMarkerOpen)
+	got := stripSemanticFieldMarkers(in)
+	if want := "no new range-over-func language changes. "; got != want {
+		t.Fatalf("dangling opener not dropped: %q", got)
+	}
+}
+
+func TestSemanticFieldDropsHalfWrittenCitationPayload(t *testing.T) {
+	// The worse form of the same truncation: enough of the marker arrived that
+	// removing only the sentinel runes would surface "citecall_4eb" as visible
+	// text -- the exact symptom users reported.
+	in := "未提交、未推送 " + string(citationMarkerOpen) + "citecall_4eb"
+	got := stripSemanticFieldMarkers(in)
+	if strings.Contains(got, "citecall_") || strings.Contains(got, "cite") {
+		t.Fatalf("half-written citation payload became visible: %q", got)
+	}
+	if want := "未提交、未推送 "; got != want {
+		t.Fatalf("unexpected result: %q", got)
+	}
+}
+
+func TestSemanticFieldKeepsCompleteSpanBehaviour(t *testing.T) {
+	// A complete span must still be removed with the surrounding prose intact,
+	// including prose that follows the span.
+	in := "before " + string(citationMarkerOpen) + "citeturn2search1" + string(citationMarkerClose) + " after"
+	if got, want := stripSemanticFieldMarkers(in), "before  after"; got != want {
+		t.Fatalf("complete span handling regressed: %q", got)
+	}
+}
+
+func TestSemanticFieldLeavesCleanTextUntouched(t *testing.T) {
+	in := "ordinary progress text with no markers 检索中"
+	if got := stripSemanticFieldMarkers(in); got != in {
+		t.Fatalf("clean text was rewritten: %q", got)
+	}
+}
