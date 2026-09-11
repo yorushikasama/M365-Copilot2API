@@ -216,6 +216,19 @@ func TestClassifyAnswerOutputPrefix(t *testing.T) {
 		{`{"calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}`, true, true},
 		{"好的，我来总结一下当前的进度……", true, false},
 		{`The result is {"x":1} and more`, true, false},
+		// Streaming deltas are tiny (measured first delta: 4 bytes). A fragment
+		// that is still a viable prefix of the marker must NOT decide "not a
+		// call" — that flushed the protocol line to the content channel
+		// (2026-09-11 the client received a literal CALL_TOOL: Skill({...})).
+		{"C", false, false},
+		{"CAL", false, false},
+		{"CALL_TOOL", false, false},
+		{"call_tool", false, false},
+		{"```json\nCALL_TOOL", false, false},
+		{"c", false, false},
+		// The bare marker is already a call attempt (the arguments follow in the
+		// next deltas); what matters is that no PREFIX of it decides "not a call".
+		{"CALL_TOOL:", true, true},
 	}
 	for i, c := range cases {
 		decided, isCall := classifyAnswerOutputPrefix(c.in)

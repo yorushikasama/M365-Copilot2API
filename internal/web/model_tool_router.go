@@ -396,6 +396,14 @@ func classifyAnswerOutputPrefix(s string) (decided, isCall bool) {
 	if strings.HasPrefix(low, "call_tool:") || strings.HasPrefix(low, "call_tool：") {
 		return true, true
 	}
+	// Still a viable prefix of the marker: keep buffering. Upstream deltas are
+	// tiny (the measured first delta is 4-5 bytes), so a fragment such as "CALL"
+	// must NOT decide "definitely not a call" — that decision released the
+	// holdback and the caller saw the literal protocol line as content while the
+	// gateway also emitted the parsed tool call (2026-09-11).
+	if isProtocolMarkerPrefix(low) {
+		return false, false
+	}
 	if strings.HasPrefix(t, "{") {
 		comp := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(t)
 		if strings.HasPrefix(comp, `{"calls"`) {

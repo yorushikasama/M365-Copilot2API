@@ -2278,37 +2278,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		var streamedTools []detectedToolCall
 		first := true
 		identityFilter := newPublicIdentityStreamFilter(model)
-		// Answer-turn tool protocol (answerToolProtocol): hold back the opening
-		// bytes until the stream's disposition is known. If the model chose the
-		// CALL_TOOL protocol, nothing may reach the content channel — the tail
-		// parses the accumulated text into tool calls instead. Prose flushes
-		// the holdback and streams on with unchanged granularity.
+		// Answer-turn tool protocol (answerToolProtocol): the gate holds the
+		// opening bytes until the stream's disposition is known and withholds a
+		// short rolling tail for the whole turn, so a CALL_TOOL answer never
+		// reaches the content channel — the tail parses the accumulated text
+		// into tool calls instead. Prose passes through unchanged.
 		answerToolArmed := planningMode != "native" && len(toolMaps) > 0
-		var toolHold strings.Builder
-		toolHoldDecided, toolHoldMode, textEmitted := false, false, false
-		emitText := func(part string) error {
+		gate := newAnswerProtocolGate(answerToolArmed)
+		textEmitted := false
+		writeContent := func(part string) error {
 			if part == "" {
 				return nil
-			}
-			if answerToolArmed {
-				if toolHoldMode {
-					return nil
-				}
-				if !toolHoldDecided {
-					toolHold.WriteString(part)
-					decided, isCall := classifyAnswerOutputPrefix(toolHold.String())
-					if !decided && toolHold.Len() < 512 {
-						return nil
-					}
-					toolHoldDecided = true
-					if isCall {
-						toolHoldMode = true
-						log.Printf("[answer-tool] id=%s decision=deferred_call stream_suppressed=true", requestID)
-						return nil
-					}
-					part = toolHold.String()
-					toolHold.Reset()
-				}
 			}
 			part = identityFilter.Push(part)
 			if part == "" {
@@ -2338,6 +2318,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			return nil
+		}
+		emitText := func(part string) error {
+			out := gate.Push(part)
+			if gate.LockedNow() {
+				log.Printf("[answer-tool] id=%s decision=deferred_call stream_suppressed=true", requestID)
+			}
+			return writeContent(out)
 		}
 		res, err := s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
@@ -2452,6 +2439,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if text.Len() == 0 && strings.TrimSpace(res.Text) != "" {
 			text.WriteString(res.Text)
 		}
+		// Release the gate's withheld tail. Without this the last bytes of every
+		// answer would be swallowed — the gate keeps a short rolling window back
+		// so a marker split across deltas cannot reach the content channel.
+		if out := gate.Flush(); out != "" {
+			if err := writeContent(out); err != nil {
+				return
+			}
+		}
 		rawCalls := streamedTools
 		if len(rawCalls) == 0 && answerToolArmed {
 			if looksLikeToolRefusal(text.String()) {
@@ -2515,13 +2510,19 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
 		}
-		if toolHoldMode && len(calls) == 0 && text.Len() > 0 {
-			// The answer turn tried the protocol but produced no valid call;
-			// surface its text rather than an empty message.
-			toolHoldMode = false
-			toolHoldDecided = true
-			log.Printf("[answer-tool] id=%s protocol output failed validation; surfacing as text", requestID)
-			_ = emitText(text.String())
+		if !textEmitted && len(calls) == 0 && text.Len() > 0 {
+			// Nothing reached the content channel: either the answer turn tried
+			// the protocol and its output failed validation, or the gate never
+			// got enough bytes to classify (a very short answer). Surface the
+			// text rather than an empty message — except when the gate locked,
+			// where the withheld bytes are protocol syntax and re-emitting them
+			// is the very leak the gate exists to prevent.
+			if gate.Locked() {
+				log.Printf("[answer-tool] id=%s protocol output failed validation; suppressed as protocol syntax", requestID)
+			} else {
+				log.Printf("[answer-tool] id=%s protocol output failed validation; surfacing as text", requestID)
+				_ = writeContent(text.String())
+			}
 		}
 		finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
 		if res.Throttling != nil {
@@ -2696,37 +2697,23 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		contentFilter := newPublicIdentityStreamFilter(firstNonEmpty(body.Model, defaultPublicModelName))
 		reasoningFilter := newPublicReasoningStreamFilter()
-		// Answer-turn tool protocol holdback (see the chat-stream twin): keep
-		// the opening bytes back until the disposition is known, so a
-		// CALL_TOOL answer never reaches the content channel.
+		// Answer-turn tool protocol holdback (see the chat-stream twin): the gate
+		// keeps the protocol bytes off the content channel, including a marker
+		// that arrives after prose or straddles two deltas.
 		answerToolArmed := planningMode != "native" && len(toolMaps) > 0
-		var answerHold strings.Builder
-		answerHoldDecided, answerHoldMode := false, false
-		onDelta := func(content string) error {
-			if answerToolArmed {
-				if answerHoldMode {
-					return nil
-				}
-				if !answerHoldDecided {
-					answerHold.WriteString(content)
-					decided, isCall := classifyAnswerOutputPrefix(answerHold.String())
-					if !decided && answerHold.Len() < 512 {
-						return nil
-					}
-					answerHoldDecided = true
-					if isCall {
-						answerHoldMode = true
-						log.Printf("[answer-tool] id=%s decision=deferred_call stream_suppressed=true", requestID)
-						return nil
-					}
-					content = answerHold.String()
-					answerHold.Reset()
-				}
-			}
+		gateB := newAnswerProtocolGate(answerToolArmed)
+		writeContentB := func(content string) error {
 			if content = contentFilter.Push(content); content != "" {
 				return writeChunk(map[string]any{"content": content})
 			}
 			return nil
+		}
+		onDelta := func(content string) error {
+			out := gateB.Push(content)
+			if gateB.LockedNow() {
+				log.Printf("[answer-tool] id=%s decision=deferred_call stream_suppressed=true", requestID)
+			}
+			return writeContentB(out)
 		}
 		onReasoning := func(reasoning string) error {
 			if reasoning = reasoningFilter.Push(reasoning); reasoning != "" {
@@ -2810,9 +2797,13 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
 			}
-			if answerToolArmed && answerHoldMode {
-				// The whole answer was suppressed as a protocol candidate;
-				// decide from the authoritative final text.
+			// Release the gate's withheld tail (see the chat-stream twin).
+			if out := gateB.Flush(); out != "" {
+				_ = writeContentB(out)
+			}
+			if answerToolArmed && gateB.Locked() {
+				// The protocol bytes were suppressed; decide from the
+				// authoritative final text.
 				if parsed, ok := parseModelToolDecision(res.Text, toolMaps, body.ToolChoice); ok && len(parsed) > 0 {
 					parsed = filterCompletedCalls(parsed, ledger)
 					calls, _ := validateCalls("answer", parsed)
@@ -2831,14 +2822,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						return
 					}
 				}
-				// Protocol output failed validation → surface it as text
-				// rather than an empty message.
-				answerHoldMode = false
-				answerHoldDecided = true
-				log.Printf("[answer-tool] id=%s protocol output failed validation; surfacing as text", requestID)
-				if fb := contentFilter.Push(res.Text); fb != "" {
-					_ = writeChunk(map[string]any{"content": fb})
-				}
+				// Protocol output failed validation. The withheld bytes are
+				// protocol syntax, so nothing is surfaced: re-emitting them is
+				// the leak the gate exists to prevent.
+				log.Printf("[answer-tool] id=%s protocol output failed validation; suppressed as protocol syntax", requestID)
 			}
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
