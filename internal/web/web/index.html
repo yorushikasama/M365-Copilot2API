@@ -2004,7 +2004,7 @@ async function loadAppVersion(){
     if(!r.ok)return;
     const d=await r.json();
     const v=String(d.version||'').trim();
-    if(v)el.textContent=v==='dev'?'vdev':(v.startsWith('v')?v:'v'+v);
+    if(v)el.textContent=/^\d/.test(v)?'v'+v:v;
   }catch(e){}
 }
 

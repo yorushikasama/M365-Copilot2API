@@ -144,6 +144,28 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Record the release in internal/web/VERSION
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          file="internal/web/VERSION"
+          # This file is compiled into the binary and is the badge's last line of
+          # defence when a build carries neither -ldflags nor vcs metadata.
+          # Keeping it equal to the newest release means every build path reports
+          # the right number without anyone bumping it by hand.
+          printf '%s\n' "${version}" > "${file}"
+          if git diff --quiet -- "${file}"; then
+            echo "${file} already reads ${version}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${file}"
+          git commit -m "chore(version): record release ${TAG} in internal/web/VERSION"
+          git push origin HEAD:main
+
       - name: Update README version badge and download table
         env:
           TAG: ${{ needs.release.outputs.tag }}
