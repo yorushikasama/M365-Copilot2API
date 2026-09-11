@@ -208,13 +208,56 @@ func applyPublicIdentityPolicy(prompt string) string {
 	return strings.TrimSpace(prompt)
 }
 
+// ChatHub wraps its internal citation ids in private-use sentinels
+// (U+E200 ... U+E201). They are not part of the answer, no client renders them,
+// and they leaked verbatim into every OpenAI-compatible response because the
+// only stripper lived behind M365_PUBLIC_IDENTITY_POLICY, which is off in
+// production. Removing them is a protocol correctness fix, not an identity
+// rewrite, so it is unconditional.
+const (
+	citationMarkerOpen  = ''
+	citationMarkerClose = ''
+)
+
+// citationSpanPattern is the catch-all for marker forms the specific pattern
+// does not enumerate (new turn kinds keep appearing upstream); an unterminated
+// span is left alone so a partial fragment is never mangled.
+var citationSpanPattern = regexp.MustCompile(string(citationMarkerOpen) + "[^" + string(citationMarkerClose) + "]*" + string(citationMarkerClose))
+
+func stripInternalCitationMarkers(text string) string {
+	if text == "" {
+		return text
+	}
+	if !strings.ContainsRune(text, citationMarkerOpen) && !strings.Contains(text, "<cite>") {
+		return text
+	}
+	text = publicInternalCitationPattern.ReplaceAllString(text, "")
+	return citationSpanPattern.ReplaceAllString(text, "")
+}
+
+// splitPendingCitation holds back a marker that a streaming chunk cut in half,
+// so the two halves are stripped together instead of being emitted raw. The
+// holdback is capped: a stray unterminated U+E200 must not stall the stream.
+func splitPendingCitation(pending string) (emit, keep string) {
+	i := strings.LastIndex(pending, string(citationMarkerOpen))
+	if i < 0 || strings.ContainsRune(pending[i:], citationMarkerClose) {
+		return pending, ""
+	}
+	if len(pending)-i > maxPendingCitationBytes {
+		return pending, ""
+	}
+	return pending[:i], pending[i:]
+}
+
+const maxPendingCitationBytes = 256
+
 func sanitizePublicAssistantText(text string) string {
 	return sanitizePublicAssistantTextForModel(text, "")
 }
 
 func sanitizePublicAssistantTextForModel(text, model string) string {
 	if !publicIdentityPolicyEnabled() {
-		return text
+		return stripInternalCitationMarkers(text)
 	}
 	identityWritten := false
 	return sanitizePublicAssistantTextWithStateForModel(text, &identityWritten, model)
@@ -229,7 +272,7 @@ func sanitizePublicInternalText(text string) string {
 
 func sanitizePublicReasoningText(text string) string {
 	if !publicIdentityPolicyEnabled() {
-		return text
+		return stripInternalCitationMarkers(text)
 	}
 	if text == "" || publicReasoningLeakPattern.MatchString(text) || publicProviderSelfDescriptionPattern.MatchString(text) || publicLocalizedSelfIdentityPattern.MatchString(text) {
 		return ""
@@ -404,10 +447,12 @@ func (f *publicIdentityStreamFilter) Push(fragment string) string {
 	if f == nil {
 		return sanitizePublicAssistantText(fragment)
 	}
-	if !publicIdentityPolicyEnabled() {
-		return fragment
-	}
 	f.pending += fragment
+	if !publicIdentityPolicyEnabled() {
+		emit, keep := splitPendingCitation(f.pending)
+		f.pending = keep
+		return stripInternalCitationMarkers(emit)
+	}
 	return f.consume(false)
 }
 
@@ -416,7 +461,7 @@ func (f *publicIdentityStreamFilter) Flush() string {
 		return ""
 	}
 	if !publicIdentityPolicyEnabled() {
-		out := f.pending
+		out := stripInternalCitationMarkers(f.pending)
 		f.pending = ""
 		return out
 	}

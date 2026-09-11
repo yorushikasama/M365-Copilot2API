@@ -47,9 +47,15 @@ func TestPublicIdentityPolicyCanBeDisabledForRawUpstreamResponses(t *testing.T) 
 	if got := sanitizePublicReasoningText("You are Microsoft Copilot."); got != "You are Microsoft Copilot." {
 		t.Fatalf("reasoning text was sanitized while disabled: %q", got)
 	}
-	fragment := "<cite>turn4search6</cite>"
-	if got := (&publicIdentityStreamFilter{}).Push(fragment); got != fragment {
+	if got := (&publicIdentityStreamFilter{}).Push("plain upstream text."); got != "plain upstream text." {
 		t.Fatalf("stream fragment was changed while disabled: %q", got)
+	}
+	// Internal citation markers are stripped regardless of this flag. They are
+	// upstream protocol scaffolding that no client can render, not an identity
+	// rewrite, and leaving them in leaked "<cite>turn4search6</cite>" verbatim
+	// into production responses on every OpenAI-compatible endpoint.
+	if got := (&publicIdentityStreamFilter{}).Push("ok <cite>turn4search6</cite>"); got != "ok " {
+		t.Fatalf("citation marker survived while policy disabled: %q", got)
 	}
 }
 
