@@ -164,7 +164,7 @@ func (p *ConnPool) startPark(key string, pc *pooledConn) {
 				} else {
 					removePooledLocked(p.conns, key, pc)
 					p.mu.Unlock()
-					pc.conn.Close()
+					_ = pc.conn.Close()
 				}
 				return
 			}
@@ -201,7 +201,7 @@ func (p *ConnPool) evict(key string, target *pooledConn) {
 	p.mu.Lock()
 	removePooledLocked(p.conns, key, target)
 	p.mu.Unlock()
-	target.conn.Close()
+	_ = target.conn.Close()
 }
 
 // removePooledLocked drops target from the pool slice for key. Callers must hold
@@ -258,7 +258,7 @@ func (p *ConnPool) Take(ctx context.Context, oid, tid, wsURL string, opts DialOp
 
 	for _, pc := range stale {
 		pc.taken.Store(true)
-		pc.conn.Close()
+		_ = pc.conn.Close()
 	}
 
 	if picked != nil {
@@ -333,14 +333,14 @@ func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string, opts Dia
 
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+"\x1e")); err != nil {
 		log.Printf("[connpool] warm handshake send failed: %v", err)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, _, err = conn.ReadMessage()
 	if err != nil {
 		log.Printf("[connpool] warm handshake recv failed: %v", err)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	_ = conn.SetReadDeadline(time.Time{})
@@ -379,9 +379,12 @@ func (p *ConnPool) park(key string, conn *websocket.Conn) {
 	pc := newPooledConn(conn)
 	pc.handshook = true
 	p.mu.Lock()
-	if len(p.conns[key]) >= maxPoolPerKey {
+	// A park that lands after Close would re-add a socket to a pool whose GC
+	// loop has already exited, so nothing would ever reap it. Close the
+	// connection instead of parking it.
+	if p.closed || len(p.conns[key]) >= maxPoolPerKey {
 		p.mu.Unlock()
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	p.conns[key] = append(p.conns[key], pc)
@@ -401,7 +404,7 @@ func (p *ConnPool) Discard(oid, tid string, conn *websocket.Conn) {
 	p.mu.Lock()
 	delete(p.leased, conn)
 	p.mu.Unlock()
-	conn.Close()
+	_ = conn.Close()
 }
 
 func (p *ConnPool) GC() {
@@ -413,7 +416,7 @@ func (p *ConnPool) GC() {
 		for _, pc := range conns {
 			if now.Sub(pc.created) > poolConnTTL {
 				pc.taken.Store(true)
-				pc.conn.Close()
+				_ = pc.conn.Close()
 			} else {
 				kept = append(kept, pc)
 			}
@@ -450,7 +453,7 @@ func (p *ConnPool) Close() {
 	for k, conns := range p.conns {
 		for _, pc := range conns {
 			pc.taken.Store(true)
-			pc.conn.Close()
+			_ = pc.conn.Close()
 		}
 		delete(p.conns, k)
 	}

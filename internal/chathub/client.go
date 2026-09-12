@@ -222,8 +222,11 @@ type Phase int
 const (
 	PhaseInit Phase = iota
 	PhaseDial
-	PhaseHandshake
+	// The attachment wait precedes the SignalR handshake write, so Upload
+	// orders before Handshake. The only comparison made on a Phase is
+	// ">= PhaseStreaming", so the ladder must stay monotonic with execution.
 	PhaseUpload
+	PhaseHandshake
 	PhasePayloadSent
 	PhaseStreaming
 	PhaseCompleted
@@ -385,7 +388,6 @@ type Result struct {
 	SuggestedResponses        []SuggestedResponse
 	RawResult                 string
 	Events                    []json.RawMessage
-	Normalized                []Event
 	Images                    []string
 	Offense                   string
 	Scores                    []Score
@@ -425,6 +427,12 @@ type Reference struct {
 
 type Client struct {
 	HTTPHeader http.Header
+	// HTTPClient pins this client to one outbound HTTP client. It is set only
+	// for a client bound to a specific proxy; leaving it nil is the normal case
+	// and makes every request re-select through outbound.HTTPClient(), so
+	// uploads rotate across the proxy pool and observe cooldowns. Pinning it
+	// here at construction froze the choice for the process lifetime: a proxy
+	// marked dead by other traffic kept receiving every upload.
 	HTTPClient *http.Client
 	Dialer     *websocket.Dialer
 	Pool       *ConnPool
@@ -488,8 +496,9 @@ func NewClient() *Client {
 	d := outbound.WebSocketDialer()
 	return &Client{
 		HTTPHeader: h,
-		HTTPClient: outbound.HTTPClient(),
-		Dialer:     d,
+		// HTTPClient is deliberately left nil: see the field comment. The
+		// per-request accessor picks a pool entry for each call.
+		Dialer: d,
 		// Reuse verified upstream: M365 allows a second chat invocation on a
 		// cleanly completed WebSocket (docs/har-mining/01 §7). Pool misses fall
 		// back to a fresh dial, so wiring this in is strictly a TTFB win.
@@ -498,6 +507,20 @@ func NewClient() *Client {
 		ResponseDeadline: envSecondsDuration("M365_CHATHUB_RESPONSE_DEADLINE_SECONDS", defaultResponseDeadline),
 		FirstTokenGrace:  envSecondsDuration("M365_CHATHUB_FIRST_TOKEN_GRACE_SECONDS", defaultFirstTokenGrace),
 	}
+}
+
+// HTTPClientForRequest returns the HTTP client to use for one outbound call. A
+// pinned HTTPClient (proxy-bound client) wins; otherwise the proxy pool is
+// consulted per request so successive calls rotate and respect cooldowns.
+//
+// Callers must not hold on to the result: it may carry a single pool entry that
+// goes into cooldown, which is exactly the staleness this accessor exists to
+// avoid.
+func (c *Client) HTTPClientForRequest() *http.Client {
+	if c != nil && c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return outbound.HTTPClient()
 }
 
 func (c *Client) readFrameTimeout() time.Duration {
@@ -710,8 +733,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	} else {
 		log.Printf("chathub timing ws_dial_ms=%d total_ms=%d reused=false", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds())
 	}
-	phase = PhaseHandshake
-
 	wsWrite := func(msgType int, data []byte) error {
 		if connWriteMu != nil {
 			connWriteMu.Lock()
@@ -741,7 +762,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			c.Pool.Discard(acc.OID, acc.TID, conn)
 			return
 		}
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	phase = PhaseUpload
@@ -754,6 +775,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 
+	phase = PhaseHandshake
 	if !reused {
 		if err := wsWrite(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -804,7 +826,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// the wide pre-token budget and the tight inter-frame one.
 	var streamStarted atomic.Bool
 
-	var deltas []string
 	var streamed strings.Builder
 	emitDelta := func(d string) error {
 		if d == "" {
@@ -823,7 +844,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			streamStarted.Store(true)
 		}
 		streamed.WriteString(d)
-		deltas = append(deltas, d)
 		if onDelta != nil {
 			return onDelta(d)
 		}
@@ -1035,11 +1055,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: fmt.Errorf("ws read before completion: %w", read.err)}
 			}
 			kind := "WS_READ_TIMEOUT"
-			if strings.Contains(strings.ToLower(read.err.Error()), "timeout") || errors.Is(read.err, context.DeadlineExceeded) {
-				kind = "WS_READ_TIMEOUT"
-			} else {
+			if !strings.Contains(strings.ToLower(read.err.Error()), "timeout") && !errors.Is(read.err, context.DeadlineExceeded) {
 				kind = classifyTransportError(read.err)
-				if kind == "" || kind == "TCP" {
+				if kind == "" {
 					kind = "TCP"
 				}
 			}
@@ -1098,12 +1116,21 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						}
 					}
 
+					// arg is the whole update argument (message array, references,
+					// throttling) and routinely runs to tens of KB. Marshal it at
+					// most once per frame, and only when an event is actually
+					// delivered: text events are the common case and dropped the
+					// result immediately, since ev is a loop-local copy.
+					var argRaw json.RawMessage
 					for _, ev := range classifyUpdateMessages(msgs) {
 						if ev.Kind == "reasoning" {
 							reasoningBuf.WriteString(ev.Text)
 						}
-						ev.Raw = eventRaw(arg)
 						if ev.Kind != "text" && onEvent != nil {
+							if argRaw == nil {
+								argRaw = eventRaw(arg)
+							}
+							ev.Raw = argRaw
 							if err := onEvent(ev); err != nil {
 								return Result{}, err
 							}
@@ -1340,10 +1367,17 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					case "ErrorUserThrottled", "InsufficientTokens":
 						return Result{}, ErrRateLimitNotice
 					default:
+						// A bare fmt.Errorf here is invisible to the gateway's
+						// ClassifyError, which only inspects *DialError: an
+						// unmapped upstream code fell through to
+						// CategoryUnknown and got a hard 502 with zero
+						// failover. Streamed keeps a mid-answer failure from
+						// being re-issued as duplicate output.
+						structured := fmt.Errorf("chathub completion error: %v", errObj)
 						if errMsg != "" {
-							return Result{}, fmt.Errorf("chathub completion error: code=%q message=%q", errCode, errMsg)
+							structured = fmt.Errorf("chathub completion error: code=%q message=%q", errCode, errMsg)
 						}
-						return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
+						return Result{}, &DialError{Status: 0, Kind: "UPSTREAM_STRUCTURED", Streamed: phase >= PhaseStreaming, cause: structured}
 					}
 				}
 				phase = PhaseCompleted
@@ -1359,9 +1393,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				text, ferr := finalizeText(streamed.String(), final, skippedSnapshots, emitDelta)
 				if ferr != nil {
 					return Result{}, ferr
-				}
-				if text == "" {
-					text = strings.Join(deltas, "")
 				}
 				if imageLimitDetected(text) {
 					return Result{}, &MeteringError{Cause: ErrImageLimit, Throttling: throttling, Metering: meteringInformation}
@@ -1395,7 +1426,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					References:                references,
 					RawResult:                 rawResult,
 					Events:                    events,
-					Normalized:                NormalizeEvents(events),
 					Images:                    imageURLs(events),
 					Timestamps:                ts,
 				}
@@ -1410,7 +1440,10 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// Reaching the overall deadline without a SignalR completion frame is
 	// an incomplete upstream response. Do not return accumulated deltas as if
 	// they were a successful, finished answer.
-	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
+	// Typed so failover can act on it: frames kept arriving slower than the
+	// response deadline allowed (or M365_CHATHUB_READ_TIMEOUT_SECONDS was raised
+	// above it), which is the same "slow upstream" case as a read timeout.
+	return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", Streamed: phase >= PhaseStreaming, cause: fmt.Errorf("chathub response deadline exceeded before completion")}
 }
 
 // finalizeText reconciles the incrementally streamed text with the
@@ -1519,19 +1552,28 @@ func BuildWSURLWithOptions(acc Account, sessionID, conversationID, requestID, li
 }
 
 // downloadClient returns an HTTP client used only for fetching remote image
-// attachments. It reuses the shared transport (so proxy settings apply) but
-// installs a redirect guard: validateRemoteDownloadURL only inspects the
-// initial URL, so without re-validation a server could 302 an approved public
-// URL to http://169.254.169.254/ or an internal host and defeat the SSRF
-// check. Here every redirect target is re-validated and hops are capped.
+// attachments.
+//
+// It deliberately does NOT reuse the shared transport. That one pools up to 100
+// idle connections, so an already-open socket to an attacker-controlled host
+// could be handed back with no name resolution and no dial-time check, leaving
+// the redirect guard as the only defence. This transport is private to
+// downloads and enforces the address check at connect time (see
+// safeDialControl), which also closes the DNS-rebinding window that
+// validateRemoteDownloadURL alone cannot.
+//
+// The redirect guard stays: validateRemoteDownloadURL only inspects the initial
+// URL, so without re-validation a server could 302 an approved public URL to
+// http://169.254.169.254/ or an internal host. Every hop is re-validated and
+// the count is capped.
 func (c *Client) downloadClient() *http.Client {
-	base := c.HTTPClient
-	if base == nil {
-		base = http.DefaultClient
+	timeout := 60 * time.Second
+	if hc := c.HTTPClientForRequest(); hc != nil && hc.Timeout > 0 {
+		timeout = hc.Timeout
 	}
 	return &http.Client{
-		Transport: base.Transport,
-		Timeout:   base.Timeout,
+		Transport: downloadTransport(),
+		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("attachment download: too many redirects")
@@ -1670,7 +1712,7 @@ func (c *Client) uploadOneImage(ctx context.Context, acc Account, conversationID
 			}
 		}
 	}
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.HTTPClientForRequest().Do(req)
 	if err != nil {
 		log.Printf("[upload] http error: %v", err)
 		return uploadedDoc{}, fmt.Errorf("%w: %v", ErrAttachmentUploadFailed, err)

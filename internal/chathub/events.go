@@ -97,3 +97,9 @@ func SemanticEvents(raw []json.RawMessage) []SemanticEvent {
 	}
 	return out
 }
+
+// NormalizedEvents parses the retained frames on demand. It used to be an eager
+// Result field, which meant every completion re-unmarshalled every frame a
+// second time (imageURLs makes a third pass) at the exact moment the caller is
+// waiting for the last token. Only /api/chat/stream needs it.
+func (r Result) NormalizedEvents() []Event { return NormalizeEvents(r.Events) }

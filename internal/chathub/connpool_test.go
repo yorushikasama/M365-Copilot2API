@@ -333,7 +333,9 @@ func TestDialOptionsSignatureDistinguishesFields(t *testing.T) {
 	if (DialOptions{DisableMemory: true}).Signature() == (DialOptions{}).Signature() {
 		t.Fatal("DisableMemory must be part of the signature")
 	}
-	if (DialOptions{DisableMemory: true}).Signature() != (DialOptions{DisableMemory: true}).Signature() {
+	first := DialOptions{DisableMemory: true}
+	second := DialOptions{DisableMemory: true}
+	if first.Signature() != second.Signature() {
 		t.Fatal("signature must be deterministic")
 	}
 	// Per-request identity must not fragment the key.

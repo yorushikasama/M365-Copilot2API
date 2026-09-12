@@ -52,9 +52,19 @@ func imageURLs(raw []json.RawMessage) []string {
 	return out
 }
 
+// imageExtRe was compiled inside isImageURL, which runs for every string field
+// of every node of every retained frame — thousands of compilations per answer.
+var imageExtRe = regexp.MustCompile(`\.(png|jpe?g|webp|gif)(&|$)`)
+
 func isImageURL(s string) bool {
 	if strings.HasPrefix(s, "data:image/") {
-		_, err := base64.StdEncoding.DecodeString(strings.SplitN(s, ",", 2)[1])
+		// A bare "data:image/png" with no comma has no payload; indexing [1]
+		// unconditionally would panic on it.
+		parts := strings.SplitN(s, ",", 2)
+		if len(parts) != 2 {
+			return false
+		}
+		_, err := base64.StdEncoding.DecodeString(parts[1])
 		return err == nil
 	}
 	u, err := url.Parse(s)
@@ -67,6 +77,5 @@ func isImageURL(s string) bool {
 	if strings.Contains(p, "image") {
 		return true
 	}
-	re := regexp.MustCompile(`\.(png|jpe?g|webp|gif)(&|$)`)
-	return re.MatchString(p)
+	return imageExtRe.MatchString(p)
 }
