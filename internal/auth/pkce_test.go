@@ -4,7 +4,8 @@ import "testing"
 
 func TestChallengeIsDeterministic(t *testing.T) {
 	v := "test-verifier"
-	if Challenge(v) != Challenge(v) {
+	first, second := Challenge(v), Challenge(v)
+	if first != second {
 		t.Fatal("challenge is not deterministic")
 	}
 	if Challenge(v) == Challenge("other") {

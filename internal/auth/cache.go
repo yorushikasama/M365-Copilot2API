@@ -139,11 +139,6 @@ func encryptRefreshToken(plain string) (string, error) {
 	return encPrefix + base64.StdEncoding.EncodeToString(ct), nil
 }
 
-func decryptRefreshToken(enc string) (string, error) {
-	pt, _, err := decryptRefreshTokenEx(enc)
-	return pt, err
-}
-
 // decryptRefreshTokenEx decrypts a stored refresh token. legacy=true means the
 // ciphertext was produced by the built-in fallback key (i.e. written before
 // M365_MASTER_KEY was configured); callers should re-encrypt with the current
@@ -443,7 +438,7 @@ func (s *Store) EnsureValid(id string) (AccountToken, error) {
 		s.mu.Unlock()
 		return AccountToken{}, os.ErrNotExist
 	}
-	remaining := acc.ExpiresAt.Sub(time.Now())
+	remaining := time.Until(acc.ExpiresAt)
 	threshold := 120 * time.Second
 	if total := acc.ExpiresAt.Sub(acc.UpdatedAt); total > 0 {
 		if t := total / 10; t < threshold {
@@ -517,10 +512,15 @@ func (s *Store) refreshInflight(acc AccountToken) (AccountToken, error) {
 		}
 		f.acc, f.err = s.Upsert(tok)
 	}
-	close(f.done)
+	// Remove the inflight entry BEFORE publishing the result. With the old
+	// order (close then delete) a caller arriving in between found the stale
+	// entry, returned immediately from <-f.done, and got this attempt's result
+	// instead of starting its own refresh -- handing back a stale error, or a
+	// token already close to expiry.
 	s.mu.Lock()
 	delete(s.inflight, acc.ID)
 	s.mu.Unlock()
+	close(f.done)
 	return f.acc, f.err
 }
 
@@ -530,7 +530,7 @@ func (s *Store) RefreshAllExpired() []TokenRefreshResult {
 	s.mu.Lock()
 	candidates := make([]AccountToken, 0, len(s.data.Accounts))
 	for _, a := range s.data.Accounts {
-		remaining := a.ExpiresAt.Sub(time.Now())
+		remaining := time.Until(a.ExpiresAt)
 		threshold := 120 * time.Second
 		if total := a.ExpiresAt.Sub(a.UpdatedAt); total > 0 {
 			if t := total / 10; t < threshold {

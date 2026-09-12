@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/url"
 	"strings"
@@ -41,7 +40,7 @@ func StartDeviceCode() (DeviceCode, error) {
 		return DeviceCode{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := outbound.HTTPClient().Do(req)
+	resp, err := authHTTPClient().Do(req)
 	if err != nil {
 		return DeviceCode{}, err
 	}
@@ -85,7 +84,7 @@ func PollDeviceCode(deviceCode string) (TokenSet, bool, error) {
 		return TokenSet{}, false, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := outbound.HTTPClient().Do(req)
+	resp, err := authHTTPClient().Do(req)
 	if err != nil {
 		return TokenSet{}, false, err
 	}

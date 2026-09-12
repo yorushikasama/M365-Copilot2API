@@ -115,6 +115,30 @@ func ROPC(username, password string) (TokenSet, error) {
 	return requestTokenTenant(form, Authority()+"/organizations/oauth2/v2.0/token", "ROPC", "", "")
 }
 
+// authHTTPTimeout bounds every AAD token/device call. The shared outbound client
+// has no Timeout and these requests were built with http.NewRequest (no
+// context), so nothing but the TCP/TLS handshake limited them. That matters
+// because Store.refreshInflight makes every concurrent caller for an account
+// block on the first refresh: one hung AAD request froze the whole account
+// indefinitely. Kept generous so a slow-but-working tenant still succeeds.
+const authHTTPTimeout = 30 * time.Second
+
+// authHTTPClient copies the configured outbound client (preserving proxy pool
+// selection and its transport) and applies authHTTPTimeout. The copy matters:
+// mutating the shared client's Timeout would also cap chathub's attachment
+// uploads, which are legitimately slow.
+func authHTTPClient() *http.Client {
+	c := outbound.HTTPClient()
+	if c == nil {
+		return &http.Client{Timeout: authHTTPTimeout}
+	}
+	cp := *c
+	if cp.Timeout <= 0 || cp.Timeout > authHTTPTimeout {
+		cp.Timeout = authHTTPTimeout
+	}
+	return &cp
+}
+
 func requestTokenTenant(form url.Values, endpoint string, caller string, oid, tid string) (TokenSet, error) {
 	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -124,7 +148,7 @@ func requestTokenTenant(form url.Values, endpoint string, caller string, oid, ti
 	if oid != "" && tid != "" {
 		req.Header.Set("X-AnchorMailbox", "Oid:"+oid+"@"+tid)
 	}
-	resp, err := outbound.HTTPClient().Do(req)
+	resp, err := authHTTPClient().Do(req)
 	if err != nil {
 		return TokenSet{}, err
 	}
@@ -178,7 +202,7 @@ func requestToken(form url.Values) (TokenSet, error) {
 		return TokenSet{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := outbound.HTTPClient().Do(req)
+	resp, err := authHTTPClient().Do(req)
 	if err != nil {
 		return TokenSet{}, err
 	}
