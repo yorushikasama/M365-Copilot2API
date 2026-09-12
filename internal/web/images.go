@@ -540,7 +540,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
+		defer func() { _ = r.MultipartForm.RemoveAll() }()
 	}
 	prompt := strings.TrimSpace(r.FormValue("prompt"))
 	if prompt == "" {

@@ -13,11 +13,10 @@ import (
 )
 
 var (
-	Version     = "dev"
-	Commit      = "unknown"
-	BuildTime   = "unknown"
-	startedAt   = time.Now()
-	updateCheck uint32
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
+	startedAt = time.Now()
 )
 
 // versionFile is compiled into the binary, so the release the source belongs to

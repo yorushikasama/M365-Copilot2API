@@ -234,11 +234,19 @@ func (cm *conversationManager) Cleanup() []string {
 	return toDelete
 }
 
+// ShouldCleanup and Mode take the mutex because SetMode writes cm.mode under
+// it from the admin handler while ShouldCleanup runs on the request path
+// (bindConversation) -- an unsynchronized read there is a data race the
+// detector flags, and conversations.go calls SetMode then Mode back to back.
 func (cm *conversationManager) ShouldCleanup() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 	return cm.mode != CleanupOnExit
 }
 
 func (cm *conversationManager) Mode() ConversationCleanupMode {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 	return cm.mode
 }
 

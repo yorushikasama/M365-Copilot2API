@@ -189,7 +189,7 @@ func (c *captureWriter) Write(b []byte) (int, error) {
 	if c.status == 0 {
 		c.status = 200
 	}
-	c.body.Write(b)
+	_, _ = c.body.Write(b)
 	return c.ResponseWriter.Write(b)
 }
 func (s *Server) debugMiddleware(next http.Handler) http.Handler {
@@ -204,7 +204,11 @@ func (s *Server) debugMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		var in []byte
-		if r.Body != nil && r.ContentLength > 0 && r.ContentLength < maxDebugCaptureBytes {
+		if r.Body != nil && r.ContentLength > 0 && r.ContentLength < maxDebugRequestBytes {
+			// Capture only the first maxDebugCaptureBytes for the snapshot, but
+			// keep forwarding the whole body: gating on the capture size instead
+			// meant any request with an image or audio data URL (routinely past
+			// 256 KiB) produced no debug record at all.
 			in, _ = io.ReadAll(io.LimitReader(r.Body, maxDebugCaptureBytes))
 			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(in), r.Body))
 		}

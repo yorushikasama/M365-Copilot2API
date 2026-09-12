@@ -43,8 +43,9 @@ func initServer() {
 	s.InitM365CloudClient()
 	s.StartConvCacheGC()
 	s.RefreshExpiredTokens()
-	// StartAutoCleanup/StartPreheatPool are long-running loops; skip them in
-	// an ephemeral serverless environment where instances are short-lived.
+	// StartAutoCleanup, StartCooldownProber and PreheatPool are long-running
+	// loops; skip them in an ephemeral serverless environment where instances
+	// are short-lived.
 	handler = s.Routes()
 	log.Println("m365-copilot2api serverless instance ready")
 }

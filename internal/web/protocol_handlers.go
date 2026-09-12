@@ -219,7 +219,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	}
 	id := "resp_" + uuid.NewString()
 	created := time.Now().Unix()
-	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
+	_ = emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
 
 	var text strings.Builder
 	messageID := "msg_" + uuid.NewString()
@@ -259,13 +259,13 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			text.WriteString(content)
 			if !textStarted {
 				textStarted = true
-				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
+				_ = emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
 				// content_part.added must precede the first delta: clients
 				// build the text part from it, and without it the opening
 				// delta can be dropped (answer truncated at the start).
-				emit("response.content_part.added", map[string]any{"type": "response.content_part.added", "output_index": 0, "content_index": 0, "item_id": messageID, "part": map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}})
+				_ = emit("response.content_part.added", map[string]any{"type": "response.content_part.added", "output_index": 0, "content_index": 0, "item_id": messageID, "part": map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}})
 			}
-			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": content})
+			_ = emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": content})
 		}
 		if rawCalls, ok := delta["tool_calls"].([]any); ok {
 			for _, raw := range rawCalls {
@@ -311,12 +311,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 					} else {
 						item = map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": "", "status": "in_progress"}
 					}
-					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+					_ = emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
 				}
 				if v, ok := fn["arguments"].(string); ok {
 					st.Args += v
 					if st.Type != "custom" && st.Added {
-						emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": v})
+						_ = emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": v})
 					}
 				}
 			}
@@ -340,7 +340,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		// 90 minutes with no diagnosable cause in the gateway logs).
 		log.Printf("[responses] inner-reject id=%s status=%d code=%s detail=%q", id, status, code, detail)
 		releaseParent()
-		emit("response.failed", map[string]any{
+		_ = emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
 				"id": id, "object": "response", "status": "failed", "model": model,
@@ -354,7 +354,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		// terminal event: clients otherwise render this as a successful blank
 		// answer and may reuse an incomplete response on the next turn.
 		releaseParent()
-		emit("response.failed", map[string]any{
+		_ = emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
 				"id": id, "object": "response", "status": "failed", "model": model,
@@ -382,27 +382,27 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				input := customToolInput(st.Args)
 				item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
 				output = append(output, item)
-				emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
-				emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
-				emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
+				_ = emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
+				_ = emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
+				_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
 				continue
 			}
 			item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
 			output = append(output, item)
-			emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": st.ItemID, "arguments": st.Args})
-			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
+			_ = emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": st.ItemID, "arguments": st.Args})
+			_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
 		}
 	} else {
 		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}
 		output = append(output, item)
 		if !textStarted {
-			emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
-			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": text.String()})
+			_ = emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
+			_ = emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": text.String()})
 		}
-		emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": messageID, "text": text.String()})
+		_ = emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": messageID, "text": text.String()})
 		item["status"] = "completed"
 		item["content"] = []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}
-		emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
+		_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
 	}
 	usageOutput := text.String()
 	for _, call := range calls {
@@ -427,7 +427,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		})
 	}
 	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": localUsageMetadata(estimate.Source)}
-	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
+	_ = emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
 func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []byte, int, error) {
@@ -626,15 +626,16 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		}
 		toolCallsMap := buildRespToolCallsMap(storedToolCalls)
 		s.responseMu.Lock()
+		// Sweep every namespace, not just this one. nsKey embeds the
+		// caller-supplied X-M365-Session-Id, so a client rotating session ids
+		// created an outer entry per id that nothing ever removed, each holding
+		// up to maxResponsesPerTenant full conversation histories for the
+		// process lifetime.
+		s.pruneResponseBucketsLocked()
 		bucket := s.responseMessages[nsKey]
 		if bucket == nil {
 			bucket = map[string]*RespNode{}
 			s.responseMessages[nsKey] = bucket
-		}
-		for k, h := range bucket {
-			if time.Since(h.At) > time.Hour {
-				delete(bucket, k)
-			}
 		}
 		if len(bucket) >= maxResponsesPerTenant {
 			var oldestKey string
@@ -651,6 +652,50 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[responses-audit] tenantHash=%s session=%s new=%s parent=%s toolCalls=%d version=1", tenantHashPrefix(tenant), sessionHashPrefix(sessionID), publicID, body.PreviousResponseID, len(toolCallsMap))
 	}
 	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out, o.Messages, o.Tools, o.ToolChoice)
+}
+
+const (
+	respNodeTTL        = time.Hour
+	maxResponseBuckets = 512
+)
+
+// pruneResponseBucketsLocked drops expired nodes across all namespaces, removes
+// namespaces left empty, and caps the number of namespaces. Callers must hold
+// s.responseMu.
+func (s *Server) pruneResponseBucketsLocked() {
+	newest := make(map[string]time.Time, len(s.responseMessages))
+	for ns, bucket := range s.responseMessages {
+		var latest time.Time
+		for id, node := range bucket {
+			if time.Since(node.At) > respNodeTTL {
+				delete(bucket, id)
+				continue
+			}
+			if node.At.After(latest) {
+				latest = node.At
+			}
+		}
+		if len(bucket) == 0 {
+			delete(s.responseMessages, ns)
+			continue
+		}
+		newest[ns] = latest
+	}
+	if len(s.responseMessages) <= maxResponseBuckets {
+		return
+	}
+	type aged struct {
+		ns string
+		at time.Time
+	}
+	all := make([]aged, 0, len(newest))
+	for ns, at := range newest {
+		all = append(all, aged{ns: ns, at: at})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	for i := 0; i < len(all)-maxResponseBuckets; i++ {
+		delete(s.responseMessages, all[i].ns)
+	}
 }
 
 func responsesOutputHasContent(src map[string]any) bool {

@@ -59,14 +59,102 @@ type accountThrottleCounters struct {
 //
 // The window is fixed at 24h (the upstream metering day) and the event ring
 // is capped; both bound memory regardless of traffic.
+// throttleBucket holds one hour of counters. Bucketing is what makes the
+// window actually rolling: the counters used to be incremented forever and
+// cleared only by the manual reset, so the panel labelled a since-boot total as
+// a 24h figure and a storm from days earlier kept an account pinned at the top
+// of the sort.
+type throttleBucket struct {
+	hour     time.Time
+	counters accountThrottleCounters
+}
+
+// throttleWindow is a short ring of hourly buckets plus the last activity
+// timestamp, which is kept outside the buckets so it survives their expiry
+// while the entry is still live.
+type throttleWindow struct {
+	buckets []throttleBucket
+	lastAt  time.Time
+}
+
+func (w *throttleWindow) bump(kind string, now time.Time, window time.Duration) {
+	hour := now.Truncate(time.Hour)
+	w.lastAt = now
+	cutoff := now.Add(-window).Truncate(time.Hour)
+	kept := w.buckets[:0]
+	for _, b := range w.buckets {
+		if !b.hour.Before(cutoff) {
+			kept = append(kept, b)
+		}
+	}
+	w.buckets = kept
+	idx := -1
+	for i := range w.buckets {
+		if w.buckets[i].hour.Equal(hour) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		w.buckets = append(w.buckets, throttleBucket{hour: hour})
+		idx = len(w.buckets) - 1
+	}
+	c := &w.buckets[idx].counters
+	switch kind {
+	case ThrottleUpstream429:
+		c.Upstream429++
+	case ThrottleLocalShortCircuit:
+		c.LocalShortCircuit++
+	case ThrottleDebounceReplay:
+		c.DebounceReplay++
+	case ThrottleFailover:
+		c.Failovers++
+	case ThrottleProbeRecovered:
+		c.ProbeRecovered++
+	case ThrottleProbeFailed:
+		c.ProbeFailed++
+	}
+}
+
+// sum totals the buckets still inside the window.
+func (w *throttleWindow) sum(now time.Time, window time.Duration) accountThrottleCounters {
+	cutoff := now.Add(-window).Truncate(time.Hour)
+	var out accountThrottleCounters
+	for _, b := range w.buckets {
+		if b.hour.Before(cutoff) {
+			continue
+		}
+		out.Upstream429 += b.counters.Upstream429
+		out.LocalShortCircuit += b.counters.LocalShortCircuit
+		out.DebounceReplay += b.counters.DebounceReplay
+		out.Failovers += b.counters.Failovers
+		out.ProbeRecovered += b.counters.ProbeRecovered
+		out.ProbeFailed += b.counters.ProbeFailed
+	}
+	out.LastAt = w.lastAt
+	return out
+}
+
+// empty reports whether every bucket has aged out, so the account entry can be
+// dropped and the map stays bounded by *active* accounts.
+func (w *throttleWindow) empty(now time.Time, window time.Duration) bool {
+	cutoff := now.Add(-window).Truncate(time.Hour)
+	for _, b := range w.buckets {
+		if !b.hour.Before(cutoff) {
+			return false
+		}
+	}
+	return true
+}
+
 type throttleMetrics struct {
 	mu        sync.Mutex
 	window    time.Duration
 	maxEvents int
 	startedAt time.Time
 	events    []throttleEvent
-	byAccount map[string]*accountThrottleCounters
-	totals    accountThrottleCounters
+	byAccount map[string]*throttleWindow
+	totals    throttleWindow
 }
 
 var throttleMetricsSingleton = newThrottleMetrics(24*time.Hour, 200)
@@ -76,7 +164,7 @@ func newThrottleMetrics(window time.Duration, maxEvents int) *throttleMetrics {
 		window:    window,
 		maxEvents: maxEvents,
 		startedAt: time.Now(),
-		byAccount: map[string]*accountThrottleCounters{},
+		byAccount: map[string]*throttleWindow{},
 	}
 }
 
@@ -103,31 +191,21 @@ func (t *throttleMetrics) record(kind, accountID, detail string) {
 	}
 	t.events = append(t.events, throttleEvent{At: now, Kind: kind, AccountID: accountID, Detail: detail})
 
-	bump := func(c *accountThrottleCounters) {
-		switch kind {
-		case ThrottleUpstream429:
-			c.Upstream429++
-		case ThrottleLocalShortCircuit:
-			c.LocalShortCircuit++
-		case ThrottleDebounceReplay:
-			c.DebounceReplay++
-		case ThrottleFailover:
-			c.Failovers++
-		case ThrottleProbeRecovered:
-			c.ProbeRecovered++
-		case ThrottleProbeFailed:
-			c.ProbeFailed++
-		}
-		c.LastAt = now
-	}
-	bump(&t.totals)
+	t.totals.bump(kind, now, t.window)
 	if accountID != "" {
 		c, ok := t.byAccount[accountID]
 		if !ok {
-			c = &accountThrottleCounters{}
+			c = &throttleWindow{}
 			t.byAccount[accountID] = c
 		}
-		bump(c)
+		c.bump(kind, now, t.window)
+	}
+	// Drop accounts whose whole window has aged out so the map is bounded by
+	// active accounts rather than every account ever seen.
+	for id, w := range t.byAccount {
+		if id != accountID && w.empty(now, t.window) {
+			delete(t.byAccount, id)
+		}
 	}
 }
 
@@ -151,9 +229,13 @@ func (t *throttleMetrics) snapshot() map[string]any {
 	for i := len(t.events) - 1; i >= 0 && len(events) < 100; i-- {
 		events = append(events, t.events[i])
 	}
+	now := time.Now()
 	rows := make([]throttleAccountRow, 0, len(t.byAccount))
 	for id, c := range t.byAccount {
-		rows = append(rows, throttleAccountRow{AccountID: id, accountThrottleCounters: *c})
+		if c.empty(now, t.window) {
+			continue
+		}
+		rows = append(rows, throttleAccountRow{AccountID: id, accountThrottleCounters: c.sum(now, t.window)})
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].Upstream429 != rows[j].Upstream429 {
@@ -164,7 +246,7 @@ func (t *throttleMetrics) snapshot() map[string]any {
 	return map[string]any{
 		"windowHours": int(t.window.Hours()),
 		"startedAt":   t.startedAt,
-		"totals":      t.totals,
+		"totals":      t.totals.sum(now, t.window),
 		"accounts":    rows,
 		"events":      events,
 	}
@@ -178,8 +260,8 @@ func (t *throttleMetrics) reset() {
 	defer t.mu.Unlock()
 	t.startedAt = time.Now()
 	t.events = nil
-	t.byAccount = map[string]*accountThrottleCounters{}
-	t.totals = accountThrottleCounters{}
+	t.byAccount = map[string]*throttleWindow{}
+	t.totals = throttleWindow{}
 }
 
 // RecordThrottleEvent is the recording hook for the whole rate-limit chain.

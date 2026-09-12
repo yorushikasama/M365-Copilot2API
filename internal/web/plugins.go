@@ -47,7 +47,7 @@ func (s *Server) fetchPlugins(accessToken string) (json.RawMessage, error) {
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
-	resp, err := s.chat.HTTPClient.Do(req)
+	resp, err := s.chat.HTTPClientForRequest().Do(req)
 	if err != nil {
 		return nil, err
 	}

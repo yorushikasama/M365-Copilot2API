@@ -59,7 +59,7 @@ func openCacheStats() *CacheStats {
 	s := &CacheStats{KeyStats: make(map[string]*KeyStat), path: p}
 	b, err := os.ReadFile(p)
 	if err == nil {
-		json.Unmarshal(b, s)
+		_ = json.Unmarshal(b, s)
 		if s.KeyStats == nil {
 			s.KeyStats = make(map[string]*KeyStat)
 		}

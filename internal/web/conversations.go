@@ -90,7 +90,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			SessionID string `json:"session_id"`
 		}
-		json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		sess, ok := s.sessionResolver.GetSession(tenant, body.SessionID)
 		if !ok {
 			jsonOut(w, map[string]any{
@@ -309,7 +309,7 @@ func (s *Server) handleM365Cleanup(w http.ResponseWriter, r *http.Request) {
 		MaxAgeHours int `json:"max_age_hours"`
 		KeepN       int `json:"keep_n"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	_ = json.NewDecoder(r.Body).Decode(&body)
 
 	maxAge := time.Duration(body.MaxAgeHours) * time.Hour
 	if maxAge <= 0 {

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,25 +23,78 @@ type conversation struct {
 }
 
 type sessionStore struct {
-	mu      sync.Mutex
-	path    string
-	data    map[string]conversation
-	persist *persistStore
+	mu          sync.Mutex
+	path        string
+	data        map[string]conversation
+	ttl         time.Duration
+	maxSessions int
+	persist     *persistStore
+}
+
+const defaultSessionKeyTTL = 7 * 24 * time.Hour
+
+const maxSessionKeys = 4096
+
+// sessionKeyStorePath resolves where the legacy sessionKey→conversation map
+// lives. It must never be M365_SESSION_CACHE: sessionResolver owns that path and
+// writes a JSON array there, while this store writes a JSON object. Both share
+// the 5s persist loop, so pointing them at one file makes the later flush
+// destroy the other's data and the loser silently starts empty after a restart.
+// docker-compose sets M365_SESSION_CACHE=/data/sessions.json, so that collision
+// was the shipped default.
+func sessionKeyStorePath() string {
+	if p := os.Getenv("M365_SESSION_KEY_CACHE"); p != "" {
+		return p
+	}
+	// Derive from the resolver's directory so a configured data dir still holds
+	// both files, but under a distinct name.
+	if p := os.Getenv("M365_SESSION_CACHE"); p != "" {
+		return filepath.Join(filepath.Dir(p), "session-keys.json")
+	}
+	return filepath.Join(os.TempDir(), "m365-copilot2api-session-keys.json")
 }
 
 func openSessionStore() *sessionStore {
-	path := os.Getenv("M365_SESSION_CACHE")
-	if path == "" {
-		path = filepath.Join(os.TempDir(), "m365-copilot2api-sessions.json")
-	}
-	s := &sessionStore{path: path, data: map[string]conversation{}}
+	path := sessionKeyStorePath()
+	s := &sessionStore{path: path, data: map[string]conversation{}, ttl: defaultSessionKeyTTL, maxSessions: maxSessionKeys}
 	s.persist = &persistStore{flush: s.flush}
 	if b, err := os.ReadFile(path); err == nil {
 		if err := json.Unmarshal(b, &s.data); err != nil {
 			log.Printf("[sessions] failed to unmarshal %s: %v", path, err)
 		}
 	}
+	s.evictLocked()
 	return s
+}
+
+// evictLocked drops entries past the TTL and, if still over capacity, the
+// least recently updated ones. sessionKey is client-supplied, so without a
+// bound a caller sending a fresh key per request grows this map and its file
+// for the process lifetime and across restarts.
+func (s *sessionStore) evictLocked() {
+	if s.ttl > 0 {
+		cutoff := time.Now().UTC().Add(-s.ttl)
+		for k, v := range s.data {
+			if v.UpdatedAt.Before(cutoff) {
+				delete(s.data, k)
+			}
+		}
+	}
+	if s.maxSessions <= 0 || len(s.data) <= s.maxSessions {
+		return
+	}
+	type aged struct {
+		id string
+		at time.Time
+	}
+	all := make([]aged, 0, len(s.data))
+	for k, v := range s.data {
+		all = append(all, aged{id: k, at: v.UpdatedAt})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	for i := 0; i < len(all)-s.maxSessions; i++ {
+		delete(s.data, all[i].id)
+	}
 }
 
 // flush 在锁内生成快照，锁外写盘。
@@ -86,6 +140,7 @@ func (s *sessionStore) upsert(v conversation) conversation {
 	}
 	v.UpdatedAt = now
 	s.data[v.ID] = v
+	s.evictLocked()
 	s.persist.markDirty()
 	return v
 }

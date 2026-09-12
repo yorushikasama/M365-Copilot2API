@@ -243,11 +243,12 @@ func saveAdminPasswordWithHistory(newHash string, history []string, oldHash stri
 	return writeFileAtomic(primary, b, 0600)
 }
 
+// saveAdminPassword deliberately does not enforce the strength policy. It is
+// the migration/bootstrap writer: it persists whatever password the operator
+// already configured (env var, legacy plaintext file, bootstrap file) so the
+// hash format can be upgraded without locking them out. Strength is enforced on
+// the interactive path, in adminChangePassword via validNewAdminPassword.
 func saveAdminPassword(password string) error {
-	if err := validNewAdminPassword(password, nil); err != nil {
-		// allow saving bootstrap passwords without strength check when called from load migration?
-		// but enforce for explicit save via change-password; load path bypasses this
-	}
 	hash, err := hashPassword(password)
 	if err != nil {
 		return err

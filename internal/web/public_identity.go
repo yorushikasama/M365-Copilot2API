@@ -108,11 +108,6 @@ func publicIdentityAnswer(messages []oaiMsg, requestedModel string) (string, boo
 	return "", false
 }
 
-func isDirectPublicIdentityQuestion(text string) bool {
-	_, ok := publicIdentityQuestionLanguage(text)
-	return ok
-}
-
 func publicIdentityQuestionLanguage(text string) (string, bool) {
 	text = strings.TrimSpace(text)
 	if text == "" || utf8.RuneCountInString(text) > 96 || publicIdentityQuestionMetaPattern.MatchString(text) {
@@ -280,10 +275,6 @@ func sanitizePublicReasoningText(text string) string {
 	return sanitizePublicAssistantText(text)
 }
 
-func sanitizePublicAssistantTextWithState(text string, identityWritten *bool) string {
-	return sanitizePublicAssistantTextWithStateForModel(text, identityWritten, "")
-}
-
 func sanitizePublicAssistantTextWithStateForModel(text string, identityWritten *bool, model string) string {
 	if text == "" {
 		return ""
@@ -384,21 +375,6 @@ func sanitizePublicPayload(value any) any {
 		return value
 	}
 	return sanitizePublicJSONValue(decoded)
-}
-
-func sanitizePublicJSONText(text string) string {
-	if !publicIdentityPolicyEnabled() {
-		return text
-	}
-	var decoded any
-	if json.Unmarshal([]byte(text), &decoded) != nil {
-		return sanitizePublicAssistantText(text)
-	}
-	raw, err := json.Marshal(sanitizePublicJSONValue(decoded))
-	if err != nil {
-		return sanitizePublicAssistantText(text)
-	}
-	return string(raw)
 }
 
 func sanitizePublicJSONValue(value any) any {

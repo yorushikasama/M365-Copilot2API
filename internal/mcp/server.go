@@ -96,7 +96,7 @@ func HandleToolsList(w http.ResponseWriter, r *http.Request) {
 		tools = []Tool{}
 	}
 	log.Printf("[mcp-tools] HandleToolsList called, returning %d tools", len(tools))
-	json.NewEncoder(w).Encode(map[string]any{"tools": tools})
+	_ = json.NewEncoder(w).Encode(map[string]any{"tools": tools})
 }
 
 type sessionRegistry struct {
@@ -197,19 +197,19 @@ func HandleMessage(w http.ResponseWriter, r *http.Request) {
 
 	sessionID := r.URL.Query().Get("sessionId")
 	if sessionID == "" {
-		json.NewEncoder(w).Encode(newRPCError(nil, -32000, "sessionId required"))
+		_ = json.NewEncoder(w).Encode(newRPCError(nil, -32000, "sessionId required"))
 		return
 	}
 
 	sess := GlobalRegistry.getSession(sessionID)
 	if sess == nil {
-		json.NewEncoder(w).Encode(newRPCError(nil, -32000, "session not found"))
+		_ = json.NewEncoder(w).Encode(newRPCError(nil, -32000, "session not found"))
 		return
 	}
 
 	var req jsonRPCRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(newRPCError(nil, -32700, "parse error: "+err.Error()))
+		_ = json.NewEncoder(w).Encode(newRPCError(nil, -32700, "parse error: "+err.Error()))
 		return
 	}
 
@@ -226,7 +226,7 @@ func HandleMessage(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[mcp] dropped response for session %s (channel full)", sessionID)
 	}
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
 
 // SetSessionTools sets the tools for an existing session. Called after SSE is established.

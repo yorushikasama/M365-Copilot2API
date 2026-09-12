@@ -17,7 +17,7 @@ import (
 func main() {
 	if exe, err := os.Executable(); err == nil {
 		if dir := filepath.Dir(exe); dir != "" {
-			os.Chdir(dir)
+			_ = os.Chdir(dir)
 		}
 	}
 	web.ApplyStartupSettingsEnv()

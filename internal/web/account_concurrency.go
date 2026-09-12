@@ -252,23 +252,3 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 	}
 	return result, err
 }
-
-func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onDelta, onReasoning func(string) error) (chathub.Result, error) {
-	release, err := s.accountConcurrency.Acquire(ctx, accountID)
-	if err != nil {
-		return chathub.Result{}, err
-	}
-	defer release()
-	if s.accountPool != nil {
-		s.accountPool.MarkCall(accountID)
-	}
-	result, err := s.accountClient(accountID).ChatWithReasoning(ctx, account, request, onDelta, onReasoning)
-	s.recordAccountResultForCapability(accountID, result, err, request.Capability)
-	if err == nil {
-		s.recordAllowanceConsumption(accountID, request)
-		s.mu.Lock()
-		s.lastHealthyAccount = accountID
-		s.mu.Unlock()
-	}
-	return result, err
-}

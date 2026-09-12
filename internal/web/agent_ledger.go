@@ -192,6 +192,7 @@ func (l agentLedger) hasCompleted(name, args string) bool {
 	}
 	return false
 }
+
 // readOnlyToolNames are tools whose re-execution is harmless: their result can
 // legitimately change between calls (a file may have been edited in between)
 // and re-reading costs the user nothing.
@@ -273,19 +274,6 @@ func duplicateCallNotice(calls []detectedToolCall, l agentLedger) string {
 	}
 	return b.String()
 }
-func recordMetering(l *agentLedger, meterError string, hasAccess bool, remaining map[string]int) {
-	if l == nil {
-		return
-	}
-	snap := meteringSnapshot{
-		MeterError:         meterError,
-		HasAccess:          hasAccess,
-		RemainingAllowance: remaining,
-		Timestamp:          time.Now(),
-	}
-	l.Metering = append(l.Metering, snap)
-}
-
 func (l agentLedger) CanContinue(maxRounds int) error {
 	if maxRounds <= 0 {
 		maxRounds = 32

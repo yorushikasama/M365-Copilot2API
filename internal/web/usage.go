@@ -81,8 +81,6 @@ type usageLog struct {
 	cache   usageSnapshotCache
 }
 
-var globalUsage = &usageLog{}
-
 func openUsageLog() *usageLog {
 	p := strings.TrimSpace(os.Getenv("M365_USAGE_LOG"))
 	if p == "" {
@@ -319,7 +317,13 @@ func (s *usageLog) computeSnapshot(days int) map[string]any {
 
 	cutoff := time.Now().AddDate(0, 0, -days)
 	loc := time.Now().Location()
-	today := time.Now().In(loc).Truncate(24 * time.Hour)
+	// Truncate rounds down relative to the zero time in UTC and ignores the
+	// location, so it yielded UTC midnight: in UTC+8 today_* silently dropped
+	// the first eight hours of the local day, and in UTC-5 it folded in five
+	// hours of yesterday. The trend buckets below already use the local date,
+	// so the summary and the chart disagreed.
+	tnow := time.Now().In(loc)
+	today := time.Date(tnow.Year(), tnow.Month(), tnow.Day(), 0, 0, 0, 0, loc)
 	dayAgo := time.Now().Add(-24 * time.Hour)
 
 	var (

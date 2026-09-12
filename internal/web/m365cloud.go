@@ -32,14 +32,6 @@ func NewM365CloudClient(clientID, tenantID, refreshToken string) *M365CloudClien
 	}
 }
 
-func (c *M365CloudClient) updateRefreshToken(newToken string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if newToken != "" && newToken != c.refreshToken {
-		c.refreshToken = newToken
-	}
-}
-
 func (c *M365CloudClient) getAccessToken() (string, error) {
 	c.mu.Lock()
 	if c.accessToken != "" && time.Now().Before(c.expiresAt.Add(-2*time.Minute)) {

@@ -133,7 +133,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		b, _ := json.Marshal(value)
 		return sw.raw(fmt.Sprintf("event: %s\ndata: %s\n\n", name, b))
 	}
-	for i, event := range res.Normalized {
+	for i, event := range res.NormalizedEvents() {
 		payload := map[string]any{
 			"index":          i,
 			"type":           "chathub.event",

@@ -22,6 +22,10 @@ const EnvProxy = "M365_OUTBOUND_PROXY"
 type Clients struct {
 	HTTP      *http.Client
 	WebSocket *websocket.Dialer
+	// Proxied records that outbound traffic goes through a proxy, which
+	// Transport.Proxy alone does not reveal for the https/SOCKS5 branches
+	// (those install a custom DialContext instead).
+	Proxied bool
 }
 
 var (
@@ -85,6 +89,21 @@ func ConfigurePool(raw []string) error {
 }
 
 func CurrentPool() *Pool { clientsMu.RLock(); defer clientsMu.RUnlock(); return proxyPool }
+
+// ProxyConfigured reports whether outbound traffic goes through a proxy (single
+// or pool). Callers that want to enforce a destination-IP policy on the dial
+// need this: with a proxy the process connects to the proxy — commonly itself a
+// private address — and never resolves or dials the real target, so a
+// destination-IP guard on the dial would both reject the proxy and inspect the
+// wrong address.
+func ProxyConfigured() bool {
+	clientsMu.RLock()
+	defer clientsMu.RUnlock()
+	if proxyPool != nil {
+		return true
+	}
+	return clients.Proxied
+}
 
 func ProxyPoolStatus() []map[string]any {
 	clientsMu.RLock()
@@ -162,6 +181,7 @@ func New(raw string) (*Clients, error) {
 	case "http":
 		c.HTTP.Transport.(*http.Transport).Proxy = http.ProxyURL(u)
 		c.WebSocket.Proxy = http.ProxyURL(u)
+		c.Proxied = true
 	case "https":
 		// Do not use Transport.Proxy here: Go's standard transport performs its
 		// own proxy TLS handshake and bypasses our IP-certificate compatibility.
@@ -169,6 +189,7 @@ func New(raw string) (*Clients, error) {
 		transport.Proxy = nil
 		transport.DialContext = httpsProxyDialer{proxyURL: u}.DialContext
 		c.WebSocket.NetDialContext = httpsProxyDialer{proxyURL: u}.DialContext
+		c.Proxied = true
 	case "socks5":
 		var a *proxy.Auth
 		if u.User != nil {
@@ -182,6 +203,7 @@ func New(raw string) (*Clients, error) {
 		x := socksContextDialer{dialer: d}
 		c.HTTP.Transport.(*http.Transport).DialContext = x.DialContext
 		c.WebSocket.NetDialContext = x.DialContext
+		c.Proxied = true
 	default:
 		return nil, fmt.Errorf("outbound proxy scheme %q is unsupported; use socks5, http, or https", u.Scheme)
 	}
@@ -218,18 +240,18 @@ func (d httpsProxyDialer) DialContext(ctx context.Context, network, address stri
 		q.SetBasicAuth(d.proxyURL.User.Username(), pw)
 	}
 	if e = q.Write(conn); e != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, e
 	}
 	rd := bufio.NewReader(conn)
 	resp, e := http.ReadResponse(rd, q)
 	if e != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, e
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("HTTPS proxy CONNECT %s: %s", address, resp.Status)
 	}
 	return &bufferedConn{Conn: conn, reader: rd}, nil
