@@ -541,8 +541,18 @@ func (f *publicReasoningStreamFilter) consume(final bool) string {
 		return sanitizePublicReasoningText(chunk)
 	}
 	if len(f.pending) > 4096 {
-		chunk := f.pending[:len(f.pending)-256]
-		f.pending = f.pending[len(f.pending)-256:]
+		// The 256-byte tail is a byte count, so retreat to a rune boundary before
+		// cutting: a split multi-byte rune leaves invalid UTF-8 on both sides and
+		// json.Marshal turns each stray byte into U+FFFD (see answerProtocolGate).
+		cut := len(f.pending) - 256
+		for cut > 0 && !utf8.RuneStart(f.pending[cut]) {
+			cut--
+		}
+		if cut <= 0 {
+			return ""
+		}
+		chunk := f.pending[:cut]
+		f.pending = f.pending[cut:]
 		return sanitizePublicReasoningText(chunk)
 	}
 	return ""

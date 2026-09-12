@@ -1,6 +1,9 @@
 package web
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // protocolMarkers are the byte sequences that make up the answer turn's textual
 // tool protocol (see answerToolProtocol). They are transport instructions and
@@ -127,7 +130,19 @@ func (g *answerProtocolGate) Push(part string) string {
 	if len(buf) <= protocolHoldWindow {
 		return ""
 	}
+	// protocolHoldWindow is a byte count, so the cut can land inside a multi-byte
+	// rune. Both halves are then invalid UTF-8 on their own, and encoding/json
+	// rewrites each stray byte as U+FFFD when the delta is marshaled — one CJK
+	// character arrived as three replacement characters, turning a Chinese answer
+	// into "当\ufffd\ufffd\ufffd代码". Retreat to the start of the straddled rune
+	// and leave it in the window for the next delta.
 	cut := len(buf) - protocolHoldWindow
+	for cut > 0 && !utf8.RuneStart(buf[cut]) {
+		cut--
+	}
+	if cut <= 0 {
+		return ""
+	}
 	out := buf[:cut]
 	g.window.Reset()
 	g.window.WriteString(buf[cut:])
