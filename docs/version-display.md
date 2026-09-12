@@ -44,7 +44,7 @@
 
 ## 前端
 
-`web/index.html` 与内嵌副本 `internal/web/web/index.html`（逐字节一致，`frontend_version_test.go` 守着）：
+`internal/web/web/index.html`（唯一一份，由 `//go:embed` 编进二进制，`frontend_version_test.go` 守着）：
 
 ```js
 if(v)el.textContent=/^\d/.test(v)?'v'+v:v;

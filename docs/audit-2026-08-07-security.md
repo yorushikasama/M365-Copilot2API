@@ -1,6 +1,6 @@
 # M365-Copilot2API 安全审计报告
 
-> 审计范围：`internal/web`、`internal/auth`、`internal/chathub`、`internal/outbound`、`internal/mcp`、`cmd/server`、`docker-compose.yml`、`Dockerfile`、前端 `web/index.html` 及落盘数据文件。只读分析，未修改任何代码。
+> 审计范围：`internal/web`、`internal/auth`、`internal/chathub`、`internal/outbound`、`internal/mcp`、`cmd/server`、`docker-compose.yml`、`Dockerfile`、前端 `internal/web/web/index.html` 及落盘数据文件。只读分析，未修改任何代码。
 > 部署背景：默认监听 `127.0.0.1:4141`（cmd/server/main.go:23-26）；docker-compose 仅映射回环端口。以下风险在「暴露公网 / 多租户分发 API key」场景下放大概率最高。
 
 ---
@@ -74,7 +74,7 @@
 
 ### M-2 前端引用不可信可变脚本，CSP 放宽
 
-- **风险点**：`web/index.html` `<script src="https://unpkg.com/lucide@latest">`（`@latest` 每次换版本、无 integrity）；`internal/web/security_http.go:12-17` 的 CSP 允许 `script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net`。
+- **风险点**：`internal/web/web/index.html` `<script src="https://unpkg.com/lucide@latest">`（`@latest` 每次换版本、无 integrity）；`internal/web/security_http.go:12-17` 的 CSP 允许 `script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net`。
 - **可利用场景**：CDN 被投毒/供应链替换内容时，可在管理页同源下执行任意 JS，窃取全部管理数据（所有 key、凭据、代理）。
 - **修复建议**：锁定 lucide 具体版本并加 `integrity`；CSP 收紧为 `'self'`（去 inline 与外域脚本）；上传改为自托管图标。
 
@@ -106,9 +106,9 @@
 ## 五、已排查确认「不算漏洞」（有意排除，避免误报）
 
 1. **SSE/流式协议注入（XSS via event）** — 所有 `data:` 帧均经 `mustJSON`/`json.Marshal`（`server.go:968,1135,1344`；`internal/web/tool_response.go:102`；`protocol_response.go:49-68`；`stream.go:96-98`），`\n`、CR、`<`、`>`、`&` 均被 JSON 转义，`writeSSE` 的 `event:` 名称为常量。无 CRLF/`<script>`/字段逃逸。
-- **CORS/CSRF**：主站（`web/index.html` fetch → `/api/*`）未设置任何 `Access-Control-Allow-Origin`，浏览器跨域被同源阻止；admin cookie `SameSite=Lax`（server.go:247）。`internal/mcp/server.go:55,118,156` 的 `Access-Control-Allow-Origin: *` 为**死代码**——`/v1/mcp/tools|sse|message` 从未在任何 `Routes()` 挂载（全项目 grep `HandleToolsList/HandleSSE/HandleMessage` 仅出现在定义处，main.go 也从未调用 `mcp` 包），不构成暴露面。
+- **CORS/CSRF**：主站（`internal/web/web/index.html` fetch → `/api/*`）未设置任何 `Access-Control-Allow-Origin`，浏览器跨域被同源阻止；admin cookie `SameSite=Lax`（server.go:247）。`internal/mcp/server.go:55,118,156` 的 `Access-Control-Allow-Origin: *` 为**死代码**——`/v1/mcp/tools|sse|message` 从未在任何 `Routes()` 挂载（全项目 grep `HandleToolsList/HandleSSE/HandleMessage` 仅出现在定义处，main.go 也从未调用 `mcp` 包），不构成暴露面。
 - **命令注入**：全库无 `os/exec`（`internal/mcp/client_test.go:47` 仅测试引用）；bash 工具块（`internal/web/fenced_tools.go:9-24`）只把工具调用编码为 `tool_calls` **返回客户端执行**，网关从不执行。
-- **路径穿越/目录遍历**：`server.go` `rootPage` 仅 `os.Open("web/index.html")`（static，不展开任意路径），非用户可控路径；写盘路径全部来自环境变量（管理员控制）。
+- **路径穿越/目录遍历**：`security_http.go` 从嵌入式 `internal/web/web/index.html` 提供根页面（static，不展开任意路径），非用户可控路径；写盘路径全部来自环境变量（管理员控制）。
 - **API key 认证绕过**：仅接受 `X-API-Key` / `Authorization: Bearer`，不支持 query 参数或变体；无需内置默认 key；中间件用 `url.Path` 前缀匹配（`/v1/`），`/v1/../api/accounts` 等会被 ServeMux 先 `../` 清理并 301，无法进入 `/api/` admin 分支绕过鉴权。
 - **登录暴力破解**：已实现5次失败锁15分钟（`internal/web/admin_security.go:104-126`）并受 4096 上限保护，属合理防护（仅提示反向代理需篡改XFF见上）。
 

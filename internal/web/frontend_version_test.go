@@ -8,20 +8,11 @@ import (
 )
 
 func TestFrontendVersionDisplayUsesBackendVersion(t *testing.T) {
-	rootPage := filepath.Join("..", "..", "web", "index.html")
-	embeddedPage := filepath.Join("web", "index.html")
-	root, err := os.ReadFile(rootPage)
+	pageBytes, err := os.ReadFile(filepath.Join("web", "index.html"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	embedded, err := os.ReadFile(embeddedPage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(root) != string(embedded) {
-		t.Fatal("frontend source and embedded copy differ")
-	}
-	page := string(root)
+	page := string(pageBytes)
 	for _, needle := range []string{
 		`id="appVersion">&mdash;</div>`,
 		"async function loadAppVersion()",

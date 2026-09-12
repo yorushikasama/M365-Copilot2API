@@ -72,7 +72,7 @@ func TestConversationListAndDetailUseCompleteLocalHistory(t *testing.T) {
 }
 
 func TestConversationDetailPageContainsCompleteViews(t *testing.T) {
-	body, err := os.ReadFile("../../web/conversation.html")
+	body, err := os.ReadFile("web/conversation.html")
 	if err != nil {
 		t.Fatal(err)
 	}
