@@ -1,0 +1,73 @@
+version: "2"
+
+# Deliberately a small, high-signal set rather than the full catalogue. This is
+# the first lint gate on an existing 24k-line codebase, so it is scoped to the
+# checks that caught real defects when it was first run, and the noisy ones are
+# either excluded below or left off entirely.
+#
+# bodyclose is intentionally NOT enabled: every finding was a gorilla/websocket
+# DialContext, whose handshake-failure response body is documented as not
+# needing to be closed, so the linter is wrong on all three sites.
+linters:
+  enable:
+    - ineffassign
+    - staticcheck
+    - unused
+    - govet
+    - errcheck
+
+  settings:
+    errcheck:
+      # Deliberate fire-and-forget writes are pervasive in the SSE paths, where
+      # a failed write means the client is gone and the next write reports it.
+      # They are written as `_ =` on purpose; flagging them would train people
+      # to ignore this linter.
+      check-blank: false
+      # Cleanup and best-effort output calls where a returned error gives the
+      # caller nothing to act on. Deferred Close on a read-only handle and a
+      # failed write to an already-broken client are both unactionable.
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Conn).Close
+        - (*os.File).Close
+        - (io.ReadCloser).Close
+        - (net/http.ResponseWriter).Write
+        - (*bytes.Buffer).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - os.Remove
+        - os.Setenv
+    staticcheck:
+      checks:
+        - all
+        # ST1000/ST1003/ST1020-22: package comment and naming conventions.
+        # Not defects, and retrofitting them would touch every file.
+        - -ST1000
+        - -ST1003
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # QF1001/QF1003/QF1012: rewrite suggestions (De Morgan's law, tagged
+        # switch, Fprintf). Style preferences, and the current spelling is
+        # often the more readable one.
+        - -QF1001
+        - -QF1003
+        - -QF1012
+        # ST1005: error strings must not be capitalized. Every finding here
+        # starts with a proper noun ("Account ID", "Worker", "Designer"), and
+        # two are user-facing Chinese messages, so lowercasing them would be
+        # wrong rather than idiomatic.
+        - -ST1005
+
+  exclusions:
+    rules:
+      # Tests use fixtures and partially-populated literals freely; unchecked
+      # errors there fail the test anyway.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
