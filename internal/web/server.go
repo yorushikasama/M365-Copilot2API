@@ -197,7 +197,14 @@ func (s *Server) clientForProxy(proxyURL string) *chathub.Client {
 	if s.chat.Pool != nil {
 		c.Pool = chathub.NewConnPool(clients.WebSocket, c.HTTPHeader)
 	}
-	actual, _ := s.proxyClients.LoadOrStore(proxyURL, c)
+	actual, loaded := s.proxyClients.LoadOrStore(proxyURL, c)
+	if loaded && actual.(*chathub.Client) != c && c.Pool != nil {
+		// Another goroutine registered a client for this proxy first, so the one
+		// built here is discarded. Its ConnPool must be closed explicitly: the
+		// pool starts a gcLoop goroutine and can already hold parked sockets,
+		// neither of which the GC reclaims while that goroutine lives.
+		c.Pool.Close()
+	}
 	return actual.(*chathub.Client)
 }
 
@@ -218,10 +225,6 @@ type RespNode struct {
 	Tenant    string                     `json:"tenant,omitempty"`
 	SessionID string                     `json:"session_id,omitempty"`
 }
-
-// respHistory is kept as an alias so older code or tests referencing the old
-// name continue to compile; the new canonical type is RespNode.
-type respHistory = RespNode
 
 func New() (*Server, error) {
 	store, err := auth.OpenStore("")
@@ -947,14 +950,36 @@ func (s *Server) bindProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	acc, _ := s.tokens.Get(body.ID)
 	if acc.BoundProxy == "" {
-		s.proxyClients.Range(func(key, _ any) bool {
-			if keyStr, ok := key.(string); ok && keyStr != "" {
-				s.proxyClients.Delete(keyStr)
+		// Dropping the map entry alone leaked the per-proxy ConnPool: its
+		// gcLoop goroutine runs forever and its parked sockets stay open, so
+		// repeatedly binding and unbinding a proxy accumulated both.
+		s.proxyClients.Range(func(key, value any) bool {
+			keyStr, ok := key.(string)
+			if !ok || keyStr == "" {
+				return true
+			}
+			s.proxyClients.Delete(keyStr)
+			if c, ok := value.(*chathub.Client); ok && c != nil && c.Pool != nil && c.Pool != s.chat.Pool {
+				c.Pool.Close()
 			}
 			return true
 		})
 	}
 	jsonOut(w, map[string]any{"ok": true, "id": body.ID, "boundProxy": acc.BoundProxy})
+}
+
+const pkceTTL = 10 * time.Minute
+
+const maxPendingPKCE = 1024
+
+// prunePKCE drops PKCE flows past their TTL; callers must hold s.mu. The TTL
+// matches the expiry checks in pkceStatus and callbackPKCE.
+func prunePKCE(m map[string]pendingPKCE, now time.Time) {
+	for k, p := range m {
+		if now.Sub(p.Created) > pkceTTL {
+			delete(m, k)
+		}
+	}
 }
 
 func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
@@ -971,6 +996,21 @@ func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
 	state := hex.EncodeToString(b)
 	redirectURI := auth.RedirectURI()
 	s.mu.Lock()
+	// /api/auth/start is unauthenticated (see adminMiddleware), and entries used
+	// to expire only when someone polled pkceStatus or posted callbackPKCE for
+	// that same state. A caller that started flows and never polled grew this
+	// map for the process lifetime, so sweep and cap on the way in.
+	prunePKCE(s.pkce, time.Now())
+	if len(s.pkce) >= maxPendingPKCE {
+		var oldest string
+		var oldestAt time.Time
+		for k, p := range s.pkce {
+			if oldest == "" || p.Created.Before(oldestAt) {
+				oldest, oldestAt = k, p.Created
+			}
+		}
+		delete(s.pkce, oldest)
+	}
 	s.pkce[state] = pendingPKCE{Verifier: v, Created: time.Now(), Status: "pending", RedirectURI: redirectURI}
 	s.mu.Unlock()
 	jsonOut(w, map[string]string{
@@ -997,7 +1037,7 @@ func (s *Server) pkceStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	p, ok := s.pkce[state]
-	if ok && time.Since(p.Created) > 10*time.Minute {
+	if ok && time.Since(p.Created) > pkceTTL {
 		delete(s.pkce, state)
 		ok = false
 	}
@@ -1038,7 +1078,7 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	p, ok := s.pkce[state]
-	if !ok || time.Since(p.Created) > 10*time.Minute {
+	if !ok || time.Since(p.Created) > pkceTTL {
 		if ok {
 			delete(s.pkce, state)
 		}
@@ -1115,7 +1155,6 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		s.mu.Unlock()
 		if preferred != "" && s.accountAvailable(preferred) && s.accountPool.ChatAvailable(preferred) && s.accountPool.Available(preferred) && s.accountConcurrency.Available(preferred) {
 			if acc, err := s.tokens.EnsureValid(preferred); err == nil {
-				accountID = preferred
 				return acc, nil
 			}
 		}
@@ -1928,9 +1967,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"type": "tool_round_limit", "message": err.Error(), "completed_calls": len(activeLedger.Completed)}})
 		return
 	}
+	// One settings snapshot for the whole request. Re-reading the store per use
+	// copied a 39-field struct under a lock a dozen times per request, and worse,
+	// an admin saving settings mid-request made later reads disagree with earlier
+	// ones -- a turn could pick its planning mode under the old config and its
+	// timeout under the new one.
+	cfg := s.settings.get()
 	// Context budget sliding window: B = ContextWindow - MaxOutput - 512, atom-aware.
-	cfgBudget := s.settings.get()
-	budget := cfgBudget.ContextWindow - cfgBudget.MaxOutputTokens - 512
+	budget := cfg.ContextWindow - cfg.MaxOutputTokens - 512
 	if budget < 1024 {
 		budget = 1024
 	}
@@ -2036,7 +2080,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// trimmed turns, and the model answered from unrelated account
 			// memory instead of the caller's own context. Send the caller's
 			// full history unless the operator explicitly re-enables trimming.
-			if s.settings.get().EnableIncrementalPrompt && resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
+			if cfg.EnableIncrementalPrompt && resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
 				incPrompt, incAtt := flattenPromptMessages(body.Messages[resolved.HistoryLen:], nil)
 				incPrompt = strings.TrimSpace(incPrompt)
 				if incPrompt != "" {
@@ -2109,7 +2153,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// 2.5h) and every lookup paid a full system-prompt hash for nothing.
 	convReused := false
 	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
-	routedToolTurn := s.settings.get().ToolPlanningMode == "router" && len(body.Tools) > 0
+	routedToolTurn := cfg.ToolPlanningMode == "router" && len(body.Tools) > 0
 	if body.ConversationID == "" && len(body.Messages) > 1 && !routedToolTurn &&
 		(body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		sysHash := systemPromptHash(body.Messages)
@@ -2155,10 +2199,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return valid, len(rejected)
 	}
-	planningMode := s.settings.get().ToolPlanningMode
-	toolCfg := s.settings.get()
+	planningMode := cfg.ToolPlanningMode
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.ChatTimeoutSeconds)*time.Second)
 	defer cancel()
 	account := chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
 	localeInfo := parseLocaleFromHeaders(r)
@@ -2176,7 +2219,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// completed assistant turn with the actual call lost.
 		routePrompt := s.buildRoutePrompt(&body, prompt, answerPrompt, ledger, executionAnchor, toolMaps)
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, cfg.LicenseType, cfg.Scenario, ""))
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
 		// Router turns run in a throwaway cloud conversation that is never
 		// reused by the answer turn; delete it so the conversation list does
@@ -2190,7 +2233,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// accounts that are healthy right now, but with a large pool a
 			// persistent upstream refusal would otherwise turn one request
 			// into one real upstream call per account.
-			maxRouteFailover := s.settings.get().FailoverMaxAttempts
+			maxRouteFailover := cfg.FailoverMaxAttempts
 			routeAttempts := 0
 			for !clientPinnedAccount && routeAttempts < maxRouteFailover && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
 				routeAttempts++
@@ -2200,7 +2243,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 				triedAccountIDs[next.ID] = true
 				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-				routeRes, routeErr = s.chatWithAccount(ctx, next.ID, nextAccount, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
+				routeRes, routeErr = s.chatWithAccount(ctx, next.ID, nextAccount, routerTurnRequest(routePrompt, tone, body.Attachments, cfg.LicenseType, cfg.Scenario, ""))
 				acc = next
 				account = nextAccount
 			}
@@ -2220,7 +2263,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
 		if !parsed {
-			repReq := routerTurnRequest(appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n`+compactToolResult(routeRes.Text, 6000), executionAnchor), tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, executionAnchor)
+			repReq := routerTurnRequest(appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n`+compactToolResult(routeRes.Text, 6000), executionAnchor), tone, body.Attachments, cfg.LicenseType, cfg.Scenario, executionAnchor)
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, repReq)
 			if repairErr == nil && repairRes.ConversationID != "" {
 				s.dropTransientConversation(repairRes.ConversationID)
@@ -2262,7 +2305,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.Stream {
-		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession, executionAnchor)
+		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, cfg, s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession, executionAnchor)
 		answerPrompt = answerReq.Text
 		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d native_tools=%d", requestID, len(answerPrompt), len(answerReq.Tools))
 		id := "chatcmpl-" + uuid.NewString()
@@ -2270,6 +2313,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
+		// Without this a buffering reverse proxy holds the deltas back and the
+		// stream arrives as one block at the end.
+		w.Header().Set("X-Accel-Buffering", "no")
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			writeOpenAIError(w, http.StatusInternalServerError, "server_error", "stream unsupported")
@@ -2285,6 +2331,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		var streamedTools []detectedToolCall
 		first := true
 		identityFilter := newPublicIdentityStreamFilter(model)
+		reasoningFilter := newPublicReasoningStreamFilter()
 		// Answer-turn tool protocol (answerToolProtocol): the gate holds the
 		// opening bytes until the stream's disposition is known and withholds a
 		// short rolling tail for the whole turn, so a CALL_TOOL answer never
@@ -2332,6 +2379,26 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		}
+		// reasoning_content deltas ride the same SSE stream as the answer. The
+		// role chunk is emitted by writeContent, so a turn that reasons before
+		// it answers must declare the role here too.
+		writeReasoning := func(part string) error {
+			if part = reasoningFilter.Push(part); part == "" {
+				return nil
+			}
+			if err := r.Context().Err(); err != nil {
+				return err
+			}
+			if first {
+				first = false
+				roleChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil}}}
+				if err := sw.data(mustJSON(roleChunk)); err != nil {
+					return err
+				}
+			}
+			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": part}, "finish_reason": nil}}}
+			return sw.data(mustJSON(chunk))
+		}
 		emitText := func(part string) error {
 			out := gate.Push(part)
 			if gate.LockedNow() {
@@ -2340,6 +2407,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return writeContent(out)
 		}
 		res, err := s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
+			if ev.Kind == "reasoning" {
+				return writeReasoning(ev.Text)
+			}
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 				toolKnown := false
 				for _, tm := range toolMaps {
@@ -2378,9 +2448,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					failoverReq.ConversationID = ""
 					failoverReq.SessionID = ""
 				}
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(cfg.ChatTimeoutSeconds)*time.Second)
 				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
 				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, nextAccount, failoverReq, func(ev chathub.StreamEvent) error {
+					if ev.Kind == "reasoning" {
+						return writeReasoning(ev.Text)
+					}
 					if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 						toolKnown := false
 						for _, tm := range toolMaps {
@@ -2487,7 +2560,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// anything the caller has already seen.
 			log.Printf("[answer-promissory] id=%s answer turn promised future work instead of calling a tool; retrying", requestID)
 			correction := appendExecutionAnchor("Your previous response announced work you intended to do, but executed none of it. Do not describe, plan, or promise the work — the caller executes the tool calls you emit on the user's machine. Emit the tool call NOW.\n\nUser request:\n"+prompt, executionAnchor)
-			promRes, promErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor})
+			promRes, promErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, ExecutionAnchor: executionAnchor})
 			switch {
 			case promErr == nil && strings.TrimSpace(promRes.Text) != "":
 				if promCalls, promOK := parseModelToolDecision(promRes.Text, toolMaps, body.ToolChoice); promOK && len(promCalls) > 0 {
@@ -2526,7 +2599,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// to exactly one of the tools the client actually declared.
 			repairPrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, "required", executionAnchor) +
 				"\nREPAIR RULE: The previous upstream event selected an undeclared tool. Select one declared tool that performs the intended operation. Never return unknown_tool."
-			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor})
+			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, ExecutionAnchor: executionAnchor})
 			if repairErr == nil {
 				repaired, parsed := parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				if parsed {
@@ -2577,12 +2650,34 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				_ = writeContent(text.String())
 			}
 		}
+		// Release the identity filter's withheld tail. It buffers everything after
+		// the last sentence boundary (and, with the public identity policy on,
+		// returns nothing at all below 1KB), so without this flush a short answer
+		// with no terminal punctuation reaches the client as an empty message.
+		if tail := identityFilter.Flush(); tail != "" {
+			textEmitted = true
+			if first {
+				first = false
+				roleChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil}}}
+				_ = sw.data(mustJSON(roleChunk))
+			}
+			tailChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": tail}, "finish_reason": nil}}}
+			_ = sw.data(mustJSON(tailChunk))
+		}
+		if tail := reasoningFilter.Flush(); tail != "" {
+			_ = sw.data(mustJSON(map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": tail}, "finish_reason": nil}}}))
+		}
 		finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
 		if res.Throttling != nil {
 			finishChunk["x_m365_throttling"] = res.Throttling
 		}
 		if len(res.Scores) > 0 {
 			finishChunk["x_m365_scores"] = res.Scores
+		}
+		if body.shouldSendStreamUsage() {
+			pt := EstimateTokens(prompt)
+			ct := EstimateTokens(res.Text)
+			finishChunk["usage"] = map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
 		}
 		_ = sw.data(mustJSON(finishChunk))
 		_ = sw.data("[DONE]")
@@ -2600,10 +2695,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := s.buildRoutePrompt(&body, prompt, answerPrompt, ledger, executionAnchor, toolMaps)
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, cfg.LicenseType, cfg.Scenario, ""))
 		if routeErr != nil {
 			triedAccountIDs := map[string]bool{acc.ID: true}
-			maxRouteFailover := s.settings.get().FailoverMaxAttempts
+			maxRouteFailover := cfg.FailoverMaxAttempts
 			routeAttempts := 0
 			for !clientPinnedAccount && routeAttempts < maxRouteFailover && (IsRateLimited(routeErr) || IsAuthFailure(routeErr)) && r.Context().Err() == nil {
 				routeAttempts++
@@ -2612,9 +2707,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				triedAccountIDs[next.ID] = true
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(cfg.ChatTimeoutSeconds)*time.Second)
 				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-				routeRes, routeErr = s.chatWithAccount(ctx2, next.ID, nextAccount, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
+				routeRes, routeErr = s.chatWithAccount(ctx2, next.ID, nextAccount, routerTurnRequest(routePrompt, tone, body.Attachments, cfg.LicenseType, cfg.Scenario, ""))
 				cancel2()
 				acc = next
 				account = nextAccount
@@ -2630,7 +2725,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		if !parsed {
 			repairReq := chathub.Request{Text: appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
-`+compactToolResult(routeRes.Text, 6000), executionAnchor), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor}
+`+compactToolResult(routeRes.Text, 6000), executionAnchor), Tone: tone, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, ExecutionAnchor: executionAnchor}
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, repairReq)
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
@@ -2683,7 +2778,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			retryText := `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
 APPLICATION_REQUEST_AND_EVIDENCE:
 ` + prompt + "\n" + ledger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario})
 			if retryErr == nil {
 				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice)
 				calls = filterCompletedCalls(calls, ledger)
@@ -2711,254 +2806,53 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return
 		}
 	}
-	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession, executionAnchor)
-	answerPrompt = answerReq.Text
+	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, cfg, s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession, executionAnchor)
 	var res chathub.Result
-	if body.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeOpenAIError(w, http.StatusInternalServerError, "server_error", "stream unsupported")
-			return
+	res, err = s.chatWithAccount(ctx, acc.ID, account, answerReq)
+	if IsEmptyCompletion(err) && tone != "magic" {
+		log.Printf("[tone-fallback] tone=%q returned empty, retrying with magic", tone)
+		magicReq := answerReq
+		magicReq.Tone = "magic"
+		if res2, err2 := s.chatWithAccount(ctx, acc.ID, account, magicReq); err2 == nil && res2.Text != "" {
+			res = res2
+			err = nil
 		}
-		id := "chatcmpl-" + uuid.NewString()
-		model := firstNonEmpty(body.Model, "m365-copilot")
-		firstDelta := true
-		sw2 := newSSEWriter(w, flusher)
-		ka2 := startSSEKeepalive(sw2, ctx)
-		defer ka2.stop()
-		writeChunk := func(delta map[string]any) error {
-			if err := r.Context().Err(); err != nil {
-				return err
+	}
+	// A slow or half-open upstream is retryable but used to reach no failover
+	// at all, so the very first WS_READ_TIMEOUT surfaced as a hard 502.
+	retryBudget, transportRetry := shouldFailoverTransport(ctx, err)
+	if err != nil && !convReused && !clientPinnedAccount && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		triedAccountIDs := map[string]bool{acc.ID: true}
+		for canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
+			next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
+			if nerr != nil {
+				break
 			}
-			// The first SSE chunk declares the role with empty content; the
-			// text itself is emitted as its own chunk (OpenAI/new-api order).
-			// Merging role and content into one chunk loses the first fragment
-			// on clients that only read `role` from chunk #1.
-			if firstDelta {
-				firstDelta = false
-				roleChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}}}}
-				if err := sw2.data(mustJSON(roleChunk)); err != nil {
-					return err
+			triedAccountIDs[next.ID] = true
+			failoverReq := answerReq
+			if body.ConversationID == resolvedConversationID {
+				failoverReq.ConversationID = ""
+				failoverReq.SessionID = ""
+			}
+			failoverTimeout := time.Duration(cfg.ChatTimeoutSeconds) * time.Second
+			if transportRetry && !IsRateLimited(err) && !IsAuthFailure(err) {
+				if retryBudget > 0 && retryBudget < failoverTimeout {
+					failoverTimeout = retryBudget
 				}
+				log.Printf("[transport-failover] account=%s next=%s budget=%s err=%v", acc.ID, next.ID, failoverTimeout.Round(time.Second), err)
 			}
-			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}}
-			return sw2.data(mustJSON(chunk))
-		}
-		contentFilter := newPublicIdentityStreamFilter(firstNonEmpty(body.Model, defaultPublicModelName))
-		reasoningFilter := newPublicReasoningStreamFilter()
-		// Answer-turn tool protocol holdback (see the chat-stream twin): the gate
-		// keeps the protocol bytes off the content channel, including a marker
-		// that arrives after prose or straddles two deltas.
-		answerToolArmed := planningMode != "native" && len(toolMaps) > 0
-		gateB := newAnswerProtocolGate(answerToolArmed)
-		writeContentB := func(content string) error {
-			if content = contentFilter.Push(content); content != "" {
-				return writeChunk(map[string]any{"content": content})
+			ctx2, cancel2 := context.WithTimeout(r.Context(), failoverTimeout)
+			nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+			res2, err2 := s.chatWithAccount(ctx2, next.ID, nextAccount, failoverReq)
+			cancel2()
+			res = res2
+			err = err2
+			acc = next
+			account = nextAccount
+			if err == nil {
+				break
 			}
-			return nil
-		}
-		onDelta := func(content string) error {
-			out := gateB.Push(content)
-			if gateB.LockedNow() {
-				log.Printf("[answer-tool] id=%s decision=deferred_call stream_suppressed=true", requestID)
-			}
-			return writeContentB(out)
-		}
-		onReasoning := func(reasoning string) error {
-			if reasoning = reasoningFilter.Push(reasoning); reasoning != "" {
-				return writeChunk(map[string]any{"reasoning_content": reasoning})
-			}
-			return nil
-		}
-		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
-			return
-		}
-		streamedReasoningLen := 0
-		onDeltaWrapped := func(content string) error {
-			if content != "" {
-				streamedReasoningLen += len(content)
-			}
-			return onDelta(content)
-		}
-		onReasoningWrapped := func(reasoning string) error {
-			if reasoning != "" {
-				streamedReasoningLen += len(reasoning)
-			}
-			return onReasoning(reasoning)
-		}
-		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDeltaWrapped, onReasoningWrapped)
-		if err != nil && streamedReasoningLen == 0 && !convReused && !clientPinnedAccount && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
-			triedAccountIDs := map[string]bool{acc.ID: true}
-			for streamedReasoningLen == 0 && canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
-				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
-				if nerr != nil {
-					break
-				}
-				triedAccountIDs[next.ID] = true
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-				res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, nextAccount, failoverReq, onDeltaWrapped, onReasoningWrapped)
-				cancel2()
-				res = res2
-				err = err2
-				acc = next
-				account = nextAccount
-				if err == nil || streamedReasoningLen > 0 {
-					break
-				}
-			}
-		}
-		// The upstream turn (and any failover retry) is done; the tail below writes
-		// through sseRaw and writeToolResponse, which bypass the sseWriter mutex.
-		// Stop the keepalive goroutine and wait, or its next tick could interleave
-		// a comment mid-frame.
-		ka2.stop()
-		if err == nil {
-			if content := contentFilter.Flush(); content != "" {
-				if writeErr := writeChunk(map[string]any{"content": content}); writeErr != nil {
-					return
-				}
-			}
-			if reasoning := reasoningFilter.Flush(); reasoning != "" {
-				if writeErr := writeChunk(map[string]any{"reasoning_content": reasoning}); writeErr != nil {
-					return
-				}
-			}
-			res.Text = sanitizePublicAssistantTextForModel(res.Text, body.Model)
-			res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
-			if res.Throttling != nil && s.accountPool != nil {
-				s.accountPool.UpdateThrottling(acc.ID, res.Throttling)
-				s.logThrottlingWarning(acc.ID, res.Throttling)
-			}
-			if isContentPolicyBlock(res.Text) {
-				log.Printf("[content-policy] M365 blocked the request (reasoning stream), sending error")
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": contentPolicyMessage(res.Text), "code": contentPolicyErrorCode}})+"\n\n")
-				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
-				return
-			}
-			if isImageLimitNotice(res.Text) {
-				if s.accountPool != nil {
-					s.accountPool.MarkImageLimited(acc.ID)
-				}
-			}
-			// Release the gate's withheld tail (see the chat-stream twin).
-			if out := gateB.Flush(); out != "" {
-				_ = writeContentB(out)
-			}
-			if answerToolArmed && gateB.Locked() {
-				// The protocol bytes were suppressed; decide from the
-				// authoritative final text.
-				if parsed, ok := parseModelToolDecision(res.Text, toolMaps, body.ToolChoice); ok && len(parsed) > 0 {
-					parsed = filterCompletedCalls(parsed, ledger)
-					calls, _ := validateCalls("answer", parsed)
-					if len(calls) > 0 {
-						log.Printf("[answer-tool] id=%s decision=call count=%d", requestID, len(calls))
-						calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-						if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
-							calls = calls[:1]
-						}
-						if body.User != "" && res.ConversationID != "" {
-							s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
-						}
-						s.bindConversation(acc, &body, r, res, prompt, startedAt)
-						s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
-						_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, res)
-						return
-					}
-				}
-				// Protocol output failed validation. The withheld bytes are
-				// protocol syntax, so nothing is surfaced: re-emitting them is
-				// the leak the gate exists to prevent.
-				log.Printf("[answer-tool] id=%s protocol output failed validation; suppressed as protocol syntax", requestID)
-			}
-		} else {
-			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
-				s.accountPool.MarkImageLimited(acc.ID)
-			}
-			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
-			}
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(streamErrorEvent(requestID, err))+"\n\n")
-		}
-		pt := EstimateTokens(prompt)
-		ct := EstimateTokens(res.Text)
-		log.Printf("[usage] stream id=%s pt=%d ct=%d res.Text=%d", id, pt, ct, len(res.Text))
-		if err == nil && ct == 0 {
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream returned empty completion; the requested model may be unavailable for this tenant", "code": "upstream_error"}})+"\n\n")
-		}
-		finish := "stop"
-		if err != nil {
-			finish = "error"
-		}
-		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
-		if res.Throttling != nil {
-			usageChunk["x_m365_throttling"] = res.Throttling
-		}
-		if len(res.Scores) > 0 {
-			usageChunk["x_m365_scores"] = res.Scores
-		}
-		_ = sw2.data(mustJSON(usageChunk))
-		_ = sw2.data("[DONE]")
-		if res.Timestamps.RequestSent != "" {
-			_ = sw2.raw(": m365-metrics " + mustJSON(res.Timestamps) + "\n\n")
-		}
-	} else {
-		res, err = s.chatWithAccount(ctx, acc.ID, account, answerReq)
-		if IsEmptyCompletion(err) && tone != "magic" {
-			log.Printf("[tone-fallback] tone=%q returned empty, retrying with magic", tone)
-			magicReq := answerReq
-			magicReq.Tone = "magic"
-			if res2, err2 := s.chatWithAccount(ctx, acc.ID, account, magicReq); err2 == nil && res2.Text != "" {
-				res = res2
-				err = nil
-			}
-		}
-		// A slow or half-open upstream is retryable but used to reach no failover
-		// at all, so the very first WS_READ_TIMEOUT surfaced as a hard 502.
-		retryBudget, transportRetry := shouldFailoverTransport(ctx, err)
-		if err != nil && !convReused && !clientPinnedAccount && canFailoverChatTurn(ctx, err) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
-			triedAccountIDs := map[string]bool{acc.ID: true}
-			for canFailoverChatTurn(ctx, err) && r.Context().Err() == nil {
-				next, nerr := s.nextHealthyAccountExcluding(triedAccountIDs)
-				if nerr != nil {
-					break
-				}
-				triedAccountIDs[next.ID] = true
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
-				failoverTimeout := time.Duration(s.settings.get().ChatTimeoutSeconds) * time.Second
-				if transportRetry && !IsRateLimited(err) && !IsAuthFailure(err) {
-					if retryBudget > 0 && retryBudget < failoverTimeout {
-						failoverTimeout = retryBudget
-					}
-					log.Printf("[transport-failover] account=%s next=%s budget=%s err=%v", acc.ID, next.ID, failoverTimeout.Round(time.Second), err)
-				}
-				ctx2, cancel2 := context.WithTimeout(r.Context(), failoverTimeout)
-				nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-				res2, err2 := s.chatWithAccount(ctx2, next.ID, nextAccount, failoverReq)
-				cancel2()
-				res = res2
-				err = err2
-				acc = next
-				account = nextAccount
-				if err == nil {
-					break
-				}
-				retryBudget, transportRetry = shouldFailoverTransport(ctx, err)
-			}
+			retryBudget, transportRetry = shouldFailoverTransport(ctx, err)
 		}
 	}
 	if err != nil {
@@ -2974,27 +2868,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		// so the next request re-sends the full history on a fresh conversation.
 		s.sessionResolver.InvalidateMatching(r, &body)
 		s.debounceRememberFailure(debounceKey, err)
-		// A streaming turn already reported the failure in-band: the SSE error
-		// event, the finish_reason="error" usage chunk and [DONE] are on the
-		// wire and the 200 text/event-stream header is committed. Writing an
-		// HTTP error here would log a superfluous WriteHeader, discard the
-		// intended status, and append JSON after [DONE].
-		if !body.Stream {
-			writeUpstreamErrorWithAccount(w, err, acc.ID)
-		}
+		writeUpstreamErrorWithAccount(w, err, acc.ID)
 		return
 	}
 	if res.Throttling != nil && s.accountPool != nil {
 		s.accountPool.UpdateThrottling(acc.ID, res.Throttling)
 		s.logThrottlingWarning(acc.ID, res.Throttling)
-	}
-	if body.Stream {
-		if body.User != "" && res.ConversationID != "" {
-			s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
-		}
-		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
-		return
 	}
 
 	if body.SessionKey != "" {
@@ -3027,7 +2906,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if len(toolMaps) > 0 && (isToolRefusal(res.Text) || (actionDemanded && containsToolDenial(res.Text))) {
 		log.Printf("[tool-eject] model refused tools, retrying with correction")
 		correction := appendExecutionAnchor("Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller's Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n"+prompt, executionAnchor)
-		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor})
+		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, ExecutionAnchor: executionAnchor})
 		if err2 == nil && !isToolRefusal(res2.Text) && !(actionDemanded && containsToolDenial(res2.Text)) {
 			res = res2
 		}
@@ -3035,7 +2914,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if len(toolMaps) > 0 && isSandboxHallucination(res.Text) {
 		log.Printf("[sandbox-eject] model used code interpreter/sandbox, retrying with explicit tool instruction")
 		correction := appendExecutionAnchor("CRITICAL: You must NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. The caller has provided a bash tool that runs Windows PowerShell 5.1 on their local machine — use it to execute any commands or code. Do NOT say you cannot run code. Do NOT say you only have a Linux container. Do NOT say you have no Windows execution channel. You DO have a bash tool that runs on Windows. Call the bash tool NOW with the appropriate PowerShell command.\n\nUser request:\n"+prompt, executionAnchor)
-		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario, ExecutionAnchor: executionAnchor})
+		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: cfg.LicenseType, Scenario: cfg.Scenario, ExecutionAnchor: executionAnchor})
 		if err2 == nil && !isSandboxHallucination(res2.Text) {
 			res = res2
 		}
@@ -3088,11 +2967,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// structured event that failed the declared-name/schema boundary.
 	if (planningMode == "native" || invalidDetectedTool) && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice, executionAnchor)
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, ""))
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, routerTurnRequest(routePrompt, tone, body.Attachments, cfg.LicenseType, cfg.Scenario, ""))
 		if routeErr == nil {
 			calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 			if !parsed {
-				repReq := routerTurnRequest(appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n`+compactToolResult(routeRes.Text, 6000), executionAnchor), tone, body.Attachments, toolCfg.LicenseType, toolCfg.Scenario, executionAnchor)
+				repReq := routerTurnRequest(appendExecutionAnchor(`Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n`+compactToolResult(routeRes.Text, 6000), executionAnchor), tone, body.Attachments, cfg.LicenseType, cfg.Scenario, executionAnchor)
 				repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, repReq)
 				if repairErr == nil {
 					calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
@@ -3132,76 +3011,6 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// completion from a real one.
 	log.Printf("[chat] response bytes=%d reasoning_bytes=%d", len(res.Text), len(res.Reasoning))
 	created := time.Now().Unix()
-
-	if body.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeOpenAIError(w, http.StatusInternalServerError, "server_error", "stream unsupported")
-			return
-		}
-		sw3 := newSSEWriter(w, flusher)
-		ticker3 := time.NewTicker(15 * time.Second)
-		defer ticker3.Stop()
-		keepaliveDone3 := make(chan struct{})
-		defer close(keepaliveDone3)
-		go func() {
-			for {
-				select {
-				case <-keepaliveDone3:
-					return
-				case <-r.Context().Done():
-					return
-				case <-ticker3.C:
-					_ = sw3.raw(": keepalive\n\n")
-				}
-			}
-		}()
-		// one-shot "stream" — emit role, then the full content, then done.
-		// The role is its own chunk for the same reason as the incremental
-		// paths: a client that only reads `role` off the first chunk would
-		// otherwise lose the entire answer.
-		roleChunk := map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index": 0,
-				"delta": map[string]any{"role": "assistant", "content": ""},
-			}},
-		}
-		_ = sw3.data(string(mustJSON(roleChunk)))
-		chunk := map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index": 0,
-				"delta": map[string]any{"content": res.Text},
-			}},
-		}
-		b, _ := json.Marshal(chunk)
-		_ = sw3.data(string(b))
-		pt := EstimateTokens(prompt)
-		ct := EstimateTokens(res.Text)
-		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
-		if res.Throttling != nil {
-			usageChunk["x_m365_throttling"] = res.Throttling
-		}
-		if len(res.Scores) > 0 {
-			usageChunk["x_m365_scores"] = res.Scores
-		}
-		_ = sw3.data(mustJSON(usageChunk))
-		_ = sw3.data("[DONE]")
-		if res.Timestamps.RequestSent != "" {
-			_ = sw3.raw(": m365-metrics " + mustJSON(res.Timestamps) + "\n\n")
-		}
-		return
-	}
 
 	if responseFormat != nil && (responseFormat.Type == "json_object" || responseFormat.Type == "json_schema") {
 		res.Text = normalizeJSONText(res.Text)

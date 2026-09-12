@@ -30,9 +30,19 @@ type ipRulesFile struct {
 }
 
 type ipManager struct {
-	mu    sync.RWMutex
-	path  string
-	rules []IPRule
+	// saveMu serializes mutations (add/remove) so the file write happens
+	// outside mu. Readers take mu.RLock only, so a blocked-IP check never
+	// waits on an fsync; previously add/remove held the write lock across
+	// writeFileAtomic and stalled every request for the duration.
+	saveMu sync.Mutex
+
+	mu   sync.RWMutex
+	path string
+	// rules and parsed are kept index-aligned. match() runs on every request,
+	// and re-parsing each rule's prefix there turned a hot path into O(rules)
+	// address parses per request.
+	rules  []IPRule
+	parsed []netip.Prefix
 }
 
 func openIPManager() *ipManager {
@@ -53,11 +63,12 @@ func openIPManager() *ipManager {
 		// only reached once the file was read successfully.
 		if decErr := json.Unmarshal(b, &data); decErr == nil {
 			for _, rule := range data.Rules {
-				if _, err := parseIPPrefix(rule.Prefix); err == nil {
+				if p, err := parseIPPrefix(rule.Prefix); err == nil {
 					if rule.ID == "" {
 						rule.ID = uuid.NewString()
 					}
 					m.rules = append(m.rules, rule)
+					m.parsed = append(m.parsed, p)
 				}
 			}
 		} else {
@@ -94,12 +105,21 @@ func canonicalIPPrefix(value string) (string, error) {
 	return p.String(), nil
 }
 
-func (m *ipManager) saveLocked() error {
-	b, err := json.MarshalIndent(ipRulesFile{Rules: m.rules}, "", "  ")
+// persist writes the given rule set to disk without holding m.mu, so a
+// concurrent blocked-IP check is never blocked behind the fsync.
+func (m *ipManager) persist(rules []IPRule) error {
+	b, err := json.MarshalIndent(ipRulesFile{Rules: rules}, "", "  ")
 	if err != nil {
 		return err
 	}
 	return writeFileAtomic(m.path, append(b, '\n'), 0600)
+}
+
+// commit publishes a rule set that has already reached disk.
+func (m *ipManager) commit(rules []IPRule, parsed []netip.Prefix) {
+	m.mu.Lock()
+	m.rules, m.parsed = rules, parsed
+	m.mu.Unlock()
 }
 
 func (m *ipManager) list() []IPRule {
@@ -108,45 +128,61 @@ func (m *ipManager) list() []IPRule {
 	return append([]IPRule(nil), m.rules...)
 }
 
+func (m *ipManager) snapshot() ([]IPRule, []netip.Prefix) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]IPRule(nil), m.rules...), append([]netip.Prefix(nil), m.parsed...)
+}
+
 func (m *ipManager) add(prefix, note string) (IPRule, error) {
 	canonical, err := canonicalIPPrefix(prefix)
 	if err != nil {
 		return IPRule{}, err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, r := range m.rules {
+	parsedPrefix, err := parseIPPrefix(canonical)
+	if err != nil {
+		return IPRule{}, err
+	}
+	// saveMu serializes mutators, so read-modify-write stays atomic with respect
+	// to other add/remove calls even though m.mu is released for the write.
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	rules, parsed := m.snapshot()
+	for _, r := range rules {
 		if r.Prefix == canonical {
 			return IPRule{}, errors.New("IP or CIDR rule already exists")
 		}
 	}
 	r := IPRule{ID: uuid.NewString(), Prefix: canonical, Note: strings.TrimSpace(note), CreatedAt: time.Now().UTC()}
-	m.rules = append(m.rules, r)
-	if err := m.saveLocked(); err != nil {
-		m.rules = m.rules[:len(m.rules)-1]
+	// Publish only after the write succeeds: a rule that never reached disk must
+	// not be enforced in memory, or it would silently disappear on restart.
+	next := append(rules, r)
+	if err := m.persist(next); err != nil {
 		return IPRule{}, err
 	}
+	m.commit(next, append(parsed, parsedPrefix))
 	return r, nil
 }
 
 func (m *ipManager) remove(id string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for i, r := range m.rules {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	rules, parsed := m.snapshot()
+	for i, r := range rules {
 		if r.ID == id {
-			// Build the new slice separately instead of splicing in place. The
-			// in-place append overwrote m.rules' backing array, so a failed save
-			// left the rule dropped from memory (unblocked) while the file still
-			// listed it — the block silently came back on the next restart.
-			kept := make([]IPRule, 0, len(m.rules)-1)
-			kept = append(kept, m.rules[:i]...)
-			kept = append(kept, m.rules[i+1:]...)
-			prev := m.rules
-			m.rules = kept
-			if err := m.saveLocked(); err != nil {
-				m.rules = prev
+			keptRules := make([]IPRule, 0, len(rules)-1)
+			keptRules = append(keptRules, rules[:i]...)
+			keptRules = append(keptRules, rules[i+1:]...)
+			keptParsed := make([]netip.Prefix, 0, len(parsed)-1)
+			keptParsed = append(keptParsed, parsed[:i]...)
+			keptParsed = append(keptParsed, parsed[i+1:]...)
+			// The rule stays in force until the shorter list is on disk;
+			// dropping it from memory first would unblock the address while the
+			// file still listed it, and the block would return after a restart.
+			if err := m.persist(keptRules); err != nil {
 				return err
 			}
+			m.commit(keptRules, keptParsed)
 			return nil
 		}
 	}
@@ -161,10 +197,9 @@ func (m *ipManager) match(ip string) (IPRule, bool) {
 	a = a.Unmap()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, r := range m.rules {
-		p, err := netip.ParsePrefix(r.Prefix)
-		if err == nil && p.Contains(a) {
-			return r, true
+	for i, p := range m.parsed {
+		if p.Contains(a) {
+			return m.rules[i], true
 		}
 	}
 	return IPRule{}, false
