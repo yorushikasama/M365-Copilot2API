@@ -321,30 +321,3 @@ func handleRPC(ctx context.Context, sess *session, req *jsonRPCRequest) *jsonRPC
 		return newRPCError(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 	}
 }
-
-// StaticToolProvider holds a static list of tools.
-type StaticToolProvider struct {
-	mu     sync.RWMutex
-	tools  []Tool
-	onCall func(ctx context.Context, name string, args map[string]any) (CallResult, error)
-}
-
-func NewStaticToolProvider(tools []Tool, onCall func(ctx context.Context, name string, args map[string]any) (CallResult, error)) *StaticToolProvider {
-	return &StaticToolProvider{tools: tools, onCall: onCall}
-}
-func (p *StaticToolProvider) ListTools(ctx context.Context) ([]Tool, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return append([]Tool(nil), p.tools...), nil
-}
-func (p *StaticToolProvider) CallTool(ctx context.Context, name string, args map[string]any) (CallResult, error) {
-	if p.onCall == nil {
-		return CallResult{}, fmt.Errorf("tool %s not implemented", name)
-	}
-	return p.onCall(ctx, name, args)
-}
-
-// ConvertTools converts OpenAI-format tools to MCP tools.
-func ConvertTools(tools []Tool) []Tool {
-	return tools
-}

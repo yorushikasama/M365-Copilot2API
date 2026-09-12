@@ -402,15 +402,6 @@ func (s *Store) Get(id string) (AccountToken, bool) {
 	return AccountToken{}, false
 }
 
-func (s *Store) First() (AccountToken, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.data.Accounts) == 0 {
-		return AccountToken{}, false
-	}
-	return s.data.Accounts[0], true
-}
-
 func (s *Store) Next() (AccountToken, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

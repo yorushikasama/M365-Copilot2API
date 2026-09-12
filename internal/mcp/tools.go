@@ -1,7 +1,6 @@
 package mcp
 
 import (
-	"encoding/json"
 	"strings"
 	"sync"
 )
@@ -30,35 +29,10 @@ func (c *ToolCache) Replace(tools []Tool) {
 	c.mu.Unlock()
 }
 
-func (c *ToolCache) Merge(tools []Tool) {
-	c.mu.Lock()
-	existing := map[string]bool{}
-	for _, t := range c.tools {
-		existing[t.Name] = true
-	}
-	for _, t := range tools {
-		if !existing[t.Name] {
-			c.tools = append(c.tools, t)
-		}
-	}
-	c.mu.Unlock()
-}
-
 func (c *ToolCache) List() []Tool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return append([]Tool(nil), c.tools...)
-}
-
-func (c *ToolCache) Find(name string) (Tool, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for _, tool := range c.tools {
-		if tool.Name == name {
-			return tool, true
-		}
-	}
-	return Tool{}, false
 }
 
 func (r CallResult) Text() string {
@@ -72,9 +46,4 @@ func (r CallResult) Text() string {
 		}
 	}
 	return strings.Join(out, "\n")
-}
-
-func (r CallResult) ContentJSON() []byte {
-	b, _ := json.Marshal(r.Content)
-	return b
 }

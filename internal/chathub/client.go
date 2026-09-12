@@ -1512,10 +1512,6 @@ func streamDivergenceReemit() bool {
 	return raw != "0" && !strings.EqualFold(raw, "false")
 }
 
-func BuildWSURL(acc Account, sessionID, conversationID, requestID, licenseType, scenario string) (string, error) {
-	return BuildWSURLWithOptions(acc, sessionID, conversationID, requestID, licenseType, scenario, false)
-}
-
 func BuildWSURLWithOptions(acc Account, sessionID, conversationID, requestID, licenseType, scenario string, disableMemory bool) (string, error) {
 	q := url.Values{}
 	q.Set("chatsessionid", requestID)

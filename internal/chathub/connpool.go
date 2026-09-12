@@ -392,10 +392,6 @@ func (p *ConnPool) park(key string, conn *websocket.Conn) {
 	p.startPark(key, pc)
 }
 
-func (p *ConnPool) WarmWithProbe(ctx context.Context, acc Account, wsURL string, opts DialOptions) {
-	p.Warm(ctx, acc, wsURL, opts)
-}
-
 // Discard drops a connection that must not be reused.
 func (p *ConnPool) Discard(oid, tid string, conn *websocket.Conn) {
 	if conn == nil {

@@ -446,7 +446,6 @@ func (g *globalCircuitState) Record(err error) {
 }
 
 func GlobalCircuitIsOpen() bool         { return globalCircuit.IsOpen() }
-func GlobalCircuitState() string        { return globalCircuit.State() }
 func GlobalCircuitOpenUntil() time.Time { return globalCircuit.OpenUntil() }
 func GlobalCircuitRecord(err error)     { globalCircuit.Record(err) }
 func ResetGlobalCircuit() {

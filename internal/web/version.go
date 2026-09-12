@@ -2,7 +2,6 @@ package web
 
 import (
 	_ "embed"
-	"fmt"
 	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"regexp"
@@ -175,12 +174,4 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request) {
 	// Read-only endpoint: release automation remains the only publisher/upgrader.
 	stable := strings.TrimSpace(Version) != "" && Version != "dev"
 	jsonOut(w, map[string]any{"current": effectiveVersion(), "channel": map[bool]string{true: "stable", false: "development"}[stable], "updateAvailable": false, "recommendUpdate": false, "message": map[bool]string{true: "当前为稳定版，可检查稳定版更新", false: "当前为开发版，不推荐更新"}[stable]})
-}
-
-func ReleaseTag() string {
-	v := strings.TrimSpace(Version)
-	if v == "" || v == "dev" {
-		return ""
-	}
-	return fmt.Sprintf("v%s", v)
 }
