@@ -30,6 +30,41 @@ func TestCommonPrefixLenNeverCutsUTF8Rune(t *testing.T) {
 	}
 }
 
+func TestRewriteResumableUsesBoundedMostlySharedPrefix(t *testing.T) {
+	cases := []struct {
+		name       string
+		streamed   int
+		lcp        int
+		wantResume bool
+	}{
+		{"small tail rewrite", 100, 80, true},
+		{"small tail with mostly shared prefix", 1000, 960, true},
+		{"rollback over bound", 100, 35, false},
+		{"prefix too short", 1000, 700, false},
+		{"prefix ratio just below threshold", 100, 79, false},
+		{"rollback over bound at low prefix", 100, 36, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rewriteResumable(tc.streamed, tc.lcp); got != tc.wantResume {
+				t.Fatalf("rewriteResumable(%d, %d) = %v, want %v", tc.streamed, tc.lcp, got, tc.wantResume)
+			}
+		})
+	}
+}
+
+func TestRewriteResumableAllowsRuneAlignedChineseTail(t *testing.T) {
+	streamed := "前缀内容已经发送，旧的尾巴和更多内容"
+	snapshot := "前缀内容已经发送，旧的尾巴和更多文案"
+	lcp := commonPrefixLen(streamed, snapshot)
+	if !rewriteResumable(len(streamed), lcp) {
+		t.Fatalf("expected bounded Chinese tail rewrite to resume: streamed=%d lcp=%d", len(streamed), lcp)
+	}
+	if !utf8.ValidString(snapshot[lcp:]) {
+		t.Fatalf("snapshot tail %q is not valid UTF-8", snapshot[lcp:])
+	}
+}
+
 func TestFinalizeTextKeepsStreamedWhenFinalNotLonger(t *testing.T) {
 	cases := []struct {
 		name     string
