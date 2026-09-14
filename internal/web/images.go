@@ -23,9 +23,20 @@ import (
 )
 
 const (
-	designerAppServiceScope  = "https://designerappservice.officeapps.live.com/.default"
-	maxGeneratedImageBytes   = 20 << 20
-	maxImageEditRequestBytes = maxGeneratedImageBytes + (2 << 20)
+	designerAppServiceScope = "https://designerappservice.officeapps.live.com/.default"
+	// maxGeneratedImageBytes caps the image the upstream hands *back* to us.
+	// It is not an upload ceiling: a generated PNG is not something the caller
+	// sent, so it must stay generous (see maxImageEditImageBytes for uploads).
+	maxGeneratedImageBytes = 20 << 20
+	// maxImageEditImageBytes caps one reference image on the image-to-image
+	// path — the multipart upload form and the base64 data: URL attachment form
+	// share this single number so both entry points agree.
+	maxImageEditImageBytes = 5 << 20
+	// maxImageEditRequestBytes bounds the whole edit request body. A 5 MiB image
+	// becomes ~6.7 MiB once base64-encoded, so the ceiling is the image limit
+	// plus 3 MiB of slack for that encoding and for JSON/multipart framing —
+	// otherwise a legal 5 MiB upload would 413 on the way in.
+	maxImageEditRequestBytes = maxImageEditImageBytes + (3 << 20)
 	generatedImageTTL        = 15 * time.Minute
 	maxGeneratedImages       = 128
 	// maxGeneratedImageCacheBytes caps what the whole cache may hold. The count
@@ -227,6 +238,39 @@ type generatedImage struct {
 	ExpiresAt   time.Time
 }
 
+// imageEditLimitError is the single wording for "your reference image is too
+// big". Both entry points — the multipart upload and the JSON data: URL
+// attachment — report it, so a client sees the same text whichever form it used
+// and no caller has to guess which limit it tripped.
+func imageEditLimitError() string {
+	return fmt.Sprintf("image exceeds %d MiB", maxImageEditImageBytes>>20)
+}
+
+// editAttachmentBytes returns the decoded size of a data: URL attachment, or 0
+// when the size is not knowable locally. A remote http(s) reference is capped
+// later by chathub's own download limit instead — we cannot measure it here
+// without fetching it, and fetching it here would defeat that guard.
+func editAttachmentBytes(a chathub.Attachment) int {
+	raw := strings.TrimSpace(a.URL)
+	if !strings.HasPrefix(raw, "data:") {
+		return 0
+	}
+	comma := strings.IndexByte(raw, ',')
+	if comma < 0 {
+		return 0
+	}
+	meta, payload := raw[:comma], raw[comma+1:]
+	if !strings.Contains(meta, ";base64") {
+		// Plain (percent-encoded) data URL: the payload length is the size.
+		return len(payload)
+	}
+	// Exact decoded length: drop the padding, then undo base64's 4→3 expansion.
+	if eq := strings.IndexByte(payload, '='); eq >= 0 {
+		payload = payload[:eq]
+	}
+	return len(payload)/4*3 + (len(payload)%4)*3/4
+}
+
 type imageGenerationRequest struct {
 	Prompt         string               `json:"prompt"`
 	N              int                  `json:"n"`
@@ -291,6 +335,24 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "response_format must be url or b64_json")
 		return
 	}
+	// Validate the reference image before touching accounts or the upstream: a
+	// request that can never succeed should not rotate an account or consume a
+	// throttle slot. The multipart handler already rejects an oversized file
+	// before it builds the data: URL, but a client speaking JSON directly never
+	// passes through it — so the same ceiling is applied here to the decoded
+	// size, which keeps both entry points on one number.
+	if b.Operation == "edit" {
+		if len(b.Attachments) == 0 {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "image is required")
+			return
+		}
+		for _, a := range b.Attachments {
+			if n := editAttachmentBytes(a); n > maxImageEditImageBytes {
+				writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", imageEditLimitError())
+				return
+			}
+		}
+	}
 	acc, err := s.resolveImageAccount(firstNonEmpty(b.AccountID, b.User))
 	if err != nil {
 		writeUpstreamError(w, err)
@@ -320,11 +382,8 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	endpoint := "/v1/images/generations"
 	prompt := fmt.Sprintf("Generate an image with GPT Image 2. Size: %s. Description: %s. Return the image URL directly.", size, b.Prompt)
+	// The reference image was validated above, before accounts were touched.
 	if b.Operation == "edit" {
-		if len(b.Attachments) == 0 {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "image is required")
-			return
-		}
 		endpoint = "/v1/images/edits"
 		prompt = fmt.Sprintf("Edit the first attached image with GPT Image 2. Size: %s. Instructions: %s. Preserve everything not requested to change. Return the edited image URL directly.", size, b.Prompt)
 	}
@@ -556,13 +615,13 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	imageData, err := io.ReadAll(io.LimitReader(file, maxGeneratedImageBytes+1))
+	imageData, err := io.ReadAll(io.LimitReader(file, maxImageEditImageBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "could not read image")
 		return
 	}
-	if len(imageData) > maxGeneratedImageBytes {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "image exceeds 20 MiB")
+	if len(imageData) > maxImageEditImageBytes {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", imageEditLimitError())
 		return
 	}
 	contentType := http.DetectContentType(imageData)
