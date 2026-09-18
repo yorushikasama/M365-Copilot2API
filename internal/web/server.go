@@ -364,7 +364,6 @@ func (s *Server) RefreshExpiredTokens() {
 }
 
 func (s *Server) Routes() http.Handler {
-	mcp.APIKeyValidator = s.validAPIKey
 	m := http.NewServeMux()
 	m.HandleFunc("/api/admin/login", s.adminLogin)
 	m.HandleFunc("/api/admin/logout", s.adminLogout)
@@ -418,9 +417,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/models", s.openaiModels)
 	m.HandleFunc("/v1/chat/completions", s.openaiChat)
 	m.HandleFunc("/v1/responses", s.responses)
-	m.HandleFunc("/v1/mcp/sse", mcp.HandleSSE)
-	m.HandleFunc("/v1/mcp/message", mcp.HandleMessage)
-	m.HandleFunc("/v1/mcp/tools", mcp.HandleToolsList)
+	m.Handle("/v1/mcp/", mcp.NewRouter(s.validAPIKey))
 	m.HandleFunc("/v1/messages", s.anthropicMessages)
 	m.HandleFunc("/v1/images/generations", s.imageGenerations)
 	m.HandleFunc("/v1/images/edits", s.imageEdits)

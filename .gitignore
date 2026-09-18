@@ -60,3 +60,6 @@ tmp_dump/
 
 # Local agent scratch space (stale binaries, script snapshots)
 .zcode/
+
+# Deployment build output (server-local builds land here)
+/out/

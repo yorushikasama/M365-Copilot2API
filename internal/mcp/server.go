@@ -79,16 +79,34 @@ func (r *toolRegistry) ClearTools() {
 // GlobalRegistry is a global registry of MCP sessions, keyed by session ID.
 var GlobalRegistry = &sessionRegistry{sessions: map[string]*session{}}
 
-// APIKeyValidator is injected by the web package to validate API keys.
-// When nil, no authentication is enforced on MCP endpoints.
-var APIKeyValidator func(r *http.Request) bool
+// NewRouter mounts the MCP HTTP endpoints (/v1/mcp/sse, /v1/mcp/message,
+// /v1/mcp/tools) with a single injection point for API-key validation.
+//
+// validate replaces the historical package-level APIKeyValidator so the
+// enforcement is wired per router construction instead of global mutable state.
+// A nil validate is fail-closed: every request is rejected. The old behavior
+// of "nil means unauthenticated is allowed" silently left the endpoints open
+// whenever the injector was forgotten, so a missing validator now refuses
+// rather than admits.
+func NewRouter(validate func(r *http.Request) bool) http.Handler {
+	m := http.NewServeMux()
+	m.HandleFunc("/v1/mcp/sse", handleSSE)
+	m.HandleFunc("/v1/mcp/message", handleMessage)
+	m.HandleFunc("/v1/mcp/tools", handleToolsList)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if validate == nil {
+			http.Error(w, `{"error":{"message":"MCP endpoint is not configured for authentication","type":"configuration_error"}}`, http.StatusServiceUnavailable)
+			return
+		}
+		if !validate(r) {
+			http.Error(w, `{"error":{"message":"valid API key required","type":"auth_error"}}`, http.StatusUnauthorized)
+			return
+		}
+		m.ServeHTTP(w, r)
+	})
+}
 
-// HandleToolsList returns the currently registered tools as JSON. Mount at /v1/mcp/tools.
-func HandleToolsList(w http.ResponseWriter, r *http.Request) {
-	if APIKeyValidator != nil && !APIKeyValidator(r) {
-		http.Error(w, `{"error":{"message":"valid API key required","type":"auth_error"}}`, http.StatusUnauthorized)
-		return
-	}
+func handleToolsList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	tools := GlobalToolRegistry.ListTools()
@@ -144,8 +162,8 @@ func (r *sessionRegistry) getSession(id string) *session {
 	return r.sessions[id]
 }
 
-// HandleSSE handles MCP SSE connections. Mount at /v1/mcp/sse.
-func HandleSSE(w http.ResponseWriter, r *http.Request) {
+// handleSSE serves an MCP SSE connection. Mount via NewRouter at /v1/mcp/sse.
+func handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -186,8 +204,8 @@ func HandleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// HandleMessage handles MCP JSON-RPC messages. Mount at /v1/mcp/message.
-func HandleMessage(w http.ResponseWriter, r *http.Request) {
+// handleMessage handles MCP JSON-RPC messages. Mount via NewRouter at /v1/mcp/message.
+func handleMessage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
