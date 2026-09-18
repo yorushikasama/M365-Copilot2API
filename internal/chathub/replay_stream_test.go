@@ -145,11 +145,184 @@ func TestReplayLaggingSnapshotIsIgnored(t *testing.T) {
 	}
 }
 
-// The 2026-09-10 class: upstream regenerates the answer, so the new snapshot
-// shares almost nothing with what was streamed. Splicing would fabricate a
-// hybrid, so the stream stops after the stale fragment and the authoritative
-// final is delivered whole.
-//
+// A suppressed turn must not stay silent for the rest of the conversation.
+// The 2026-09-18 05:36 incident silenced an answer for 12s after a wholesale
+// rewrite even though upstream kept streaming a fresh, converging generation.
+// Once a post-rewrite snapshot arrives (a stable baseline, or a monotonic
+// extension of the previous one), the turn resumes from it: the stale prefix
+// is already on the wire, but the client gets the new answer as it streams
+// instead of one delayed catch-up burst. Completion is gated on the test so a
+// turn that fails to resume is caught before the turn ends.
+func TestReplayRewriteConvergesThenResumes(t *testing.T) {
+	head := strings.Repeat("稳定前缀，", 10)
+	stale := head + "旧版内容，这个尾巴会被整体重写。"
+	rewrite := "全新的生成，与旧版没有公共前缀，开头完全不同，这样才会触发抑制而不是前缀续写。"
+	// gen1 is the first post-rewrite snapshot: it becomes the baseline and the
+	// stream resumes from it (cur is reset, so its full text is emitted).
+	gen1 := rewrite + "第一段内容。"
+	final := gen1 + "第二段内容，最终收尾。"
+	if strings.HasPrefix(rewrite, stale) || commonPrefixLen(stale, rewrite) > 32 {
+		t.Fatal("fixture must be a genuine wholesale rewrite")
+	}
+	if !strings.HasPrefix(final, rewrite) {
+		t.Fatal("fixture must converge: each snapshot extends the previous")
+	}
+
+	released := make(chan struct{})
+	rewrote := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(released) }) }
+
+	newFakeChathub(t, func(c *websocket.Conn) {
+		if !startStream(c, 3*time.Second) {
+			return
+		}
+		stop := make(chan struct{})
+		go drainReads(c, stop)
+		defer close(stop)
+		sendScript(c, 10*time.Millisecond, snapshotFrame(stale))
+		// The wholesale rewrite lands mid-stream: the current generation is
+		// void, so the client must stop receiving that text.
+		_ = c.WriteMessage(websocket.TextMessage, []byte(snapshotFrame(rewrite)))
+		// The converged baseline arrives while completion is still held: the
+		// turn must resume from it instead of staying silent.
+		sendScript(c, 10*time.Millisecond, snapshotFrame(gen1))
+		close(rewrote)
+		// Hold completion until the test has checked that the stream resumed
+		// from the converged baseline.
+		select {
+		case <-released:
+		case <-time.After(5 * time.Second):
+		}
+		sendScript(c, 10*time.Millisecond, snapshotFrame(final), resultFrame(final), completionFrame())
+	})
+
+	tr := &deltaTrace{}
+	done := make(chan struct{})
+	var res Result
+	var err error
+	go func() {
+		defer close(done)
+		res, err = NewClient().ChatWithDelta(context.Background(), testAccount(), Request{Text: "hi", SessionID: "s", ConversationID: "c"}, tr.emit)
+	}()
+
+	<-rewrote
+	// Completion is still held. The stream must already have resumed—the
+	// client must have seen the first post-rewrite snapshot—so the rewrite did
+	// not silence the whole turn (12s of zero bytes on 2026-09-18 05:36).
+	resumed := false
+	deadline := time.After(2 * time.Second)
+	for !resumed {
+		if strings.Contains(tr.String(), "第一段内容") {
+			resumed = true
+			break
+		}
+		select {
+		case <-deadline:
+			goto done
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+done:
+	release()
+	<-done
+	if !resumed {
+		t.Fatalf("no post-rewrite content arrived before completion; turn stayed silenced (deltas=%d, text=%q)", tr.count(), tr.String())
+	}
+	if err != nil {
+		t.Fatalf("ChatWithDelta: %v", err)
+	}
+	if res.Text != final {
+		t.Fatalf("result = %q, want %q", res.Text, final)
+	}
+	got := tr.String()
+	if !strings.HasSuffix(got, final) {
+		t.Fatalf("client stream %q does not end with the authoritative final %q", got, final)
+	}
+}
+
+// The rewrite window is bounded: if upstream revises the post-rewrite
+// generation *again* before it converges, the turn must not splice the second
+// revision onto the first (that is the 2026-09-10 hybrid incident). It stays
+// suppressed until a convergent baseline arrives, then resumes from it.
+func TestReplayRewriteOfRewriteStaysSuppressed(t *testing.T) {
+	stale := "旧版答案，将被完全重写，与任何新版都没有公共前缀。"
+	rewriteA := "第一版重写，完全没有旧版的公共前缀，内容甲开头。"
+	gen1 := rewriteA + "第一版继续输出，成为恢复基线。"
+	rewriteB := "全新第二稿，内容乙开头，与第一版和旧版都毫无公共前缀。"
+	gen2 := rewriteB + "第二版继续输出。"
+	final := gen2 + "第二版最终收尾。"
+	if commonPrefixLen(stale, rewriteA) > 0 || commonPrefixLen(gen1, rewriteB) > 0 {
+		t.Fatal("fixtures must genuinely diverge at each rewrite")
+	}
+
+	released := make(chan struct{})
+	diverged := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(released) }) }
+
+	newFakeChathub(t, func(c *websocket.Conn) {
+		if !startStream(c, 3*time.Second) {
+			return
+		}
+		stop := make(chan struct{})
+		go drainReads(c, stop)
+		defer close(stop)
+		sendScript(c, 10*time.Millisecond,
+			snapshotFrame(stale),    // streamed baseline
+			snapshotFrame(rewriteA), // wholesale rewrite: suppress, silent
+		)
+		sendScript(c, 10*time.Millisecond, snapshotFrame(gen1))                    // converges: resume from it
+		_ = c.WriteMessage(websocket.TextMessage, []byte(snapshotFrame(rewriteB))) // rewrite again: suppress
+		close(diverged)
+		select {
+		case <-released:
+		case <-time.After(5 * time.Second):
+		}
+		sendScript(c, 10*time.Millisecond, snapshotFrame(gen2), resultFrame(final), completionFrame())
+	})
+
+	tr := &deltaTrace{}
+	done := make(chan struct{})
+	var res Result
+	var err error
+	go func() {
+		defer close(done)
+		res, err = NewClient().ChatWithDelta(context.Background(), testAccount(), Request{Text: "hi", SessionID: "s", ConversationID: "c"}, tr.emit)
+	}()
+
+	<-diverged
+	// rewriteB has landed and been suppressed. Nothing derived from it may
+	// have reached the client yet; only the gen1 baseline (which resumed the
+	// turn) plus the stale prefix may have.
+	gotBefore := tr.String()
+	if strings.Contains(gotBefore, "内容乙") {
+		t.Fatalf("second rewrite leaked to the client before it converged: %q", gotBefore)
+	}
+	release()
+	<-done
+	if err != nil {
+		t.Fatalf("ChatWithDelta: %v", err)
+	}
+	if res.Text != final {
+		t.Fatalf("result = %q, want the authoritative final %q", res.Text, final)
+	}
+	got := tr.String()
+	if !strings.HasSuffix(got, final) {
+		t.Fatalf("client stream %q does not end with the authoritative final %q", got, final)
+	}
+	// The gen1 baseline and the second revision are delivered as separate
+	// complete generations; the second revision must not be interleaved into
+	// the middle of gen1. Since the two share no common prefix, any splice
+	// would put "内容乙" inside gen1 rather than after it.
+	if i := strings.Index(got, rewriteB); i >= 0 {
+		prefix := got[:i]
+		if strings.Contains(prefix, "第一版继续输出") && !strings.HasSuffix(prefix, "第一版继续输出，成为恢复基线。") {
+			t.Fatalf("second revision was spliced into the first: %q", got)
+		}
+	}
+}
+
 // Bytes already on the wire cannot be retracted, so the caller necessarily sees
 // the stale fragment first. What must hold is that the answer arrives complete
 // and that no *hybrid* is synthesised — the stale text must not be interleaved

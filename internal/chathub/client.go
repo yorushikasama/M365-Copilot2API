@@ -963,6 +963,13 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	rewriteLogged := false
 	resumeLogged := false
 	streamSuppressed := false
+	// rewritten is the newest cumulative snapshot of the post-rewrite
+	// generation. While streamSuppressed, a snapshot is allowed to un-suppress
+	// the turn only if it extends rewritten monotonically — that is the signal
+	// that the rewrite has converged and new content is flowing again. A
+	// further wholesale rewrite (no common prefix) keeps the turn suppressed;
+	// finalizeText reconciles the authoritative final at completion.
+	rewritten := ""
 	emitSnapshot := func(snapshot string) error {
 		if snapshot == "" {
 			return nil
@@ -980,6 +987,38 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			return ErrOffensiveContent
 		}
 		cur := streamed.String()
+		// A suppressed turn does not compare snapshots against the stale
+		// generation — cur holds obsolete text, so every new snapshot would
+		// "diverge" again and stay suppressed forever, which is the 10-12s
+		// client-visible silence seen live (2026-09-18 05:36). Instead,
+		// once the rewrite converges to a stable growing baseline, resume
+		// from it: the stale prefix is already on the wire and cannot be
+		// retracted, but the client now receives the complete new answer as
+		// it arrives rather than one delayed catch-up burst.
+		if streamSuppressed {
+			if rewritten == "" || strings.HasPrefix(snapshot, rewritten) {
+				rewritten = snapshot
+				streamed.Reset()
+				streamSuppressed = false
+				// cur is the pre-reset generation snapshot (the stale text).
+				// The turn resumes from the new baseline, so the stale bytes
+				// must not be classified against the new snapshot — that
+				// would re-suppress the converged stream (live 2026-09-18
+				// 05:36 kept skipping post-rewrite snapshots). Reset to "" so
+				// the snapshot is emitted whole.
+				cur = ""
+			} else {
+				// The stream was rewritten again before the first generation
+				// stabilised. Keep suppressing; the prior stale fragment stays
+				// the only emitted text and finalizeText delivers the rest.
+				rewritten = snapshot
+				skippedSnapshots++
+				if chTrace {
+					log.Printf("[trace:emitSnapshot] skip: cur=%d snapshot=%d (rewrite of rewrite)", len(cur), len(snapshot))
+				}
+				return nil
+			}
+		}
 		if cur == "" {
 			return emitDelta(snapshot)
 		}
