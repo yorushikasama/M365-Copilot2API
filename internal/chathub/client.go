@@ -255,19 +255,69 @@ func commonPrefixLen(a, b string) int {
 	return n
 }
 
-// maxRewriteResumeBytes bounds the rollback a mid-stream rewrite may take
-// while still resuming. Production tail corrections land within ~30 bytes and
-// wholesale regenerations start at ~75 (2026-09-12 log review, 31 rewrites
-// over 564 streaming turns), and 64 splits the two clusters.
+// snapshotAction is how an incoming cumulative snapshot relates to what has
+// already been streamed.
+type snapshotAction int
+
+const (
+	// snapshotAppend: the snapshot extends the stream; emit the unseen suffix.
+	snapshotAppend snapshotAction = iota
+	// snapshotIgnore: the snapshot is already contained in the stream (upstream
+	// re-sent a cumulative snapshot, or replayed a shorter fragment). It carries
+	// no new content and is not a rewrite, so it must not disturb the stream.
+	snapshotIgnore
+	// snapshotResume: a bounded tail correction. Rewind to the common prefix and
+	// emit the snapshot's remainder.
+	snapshotResume
+	// snapshotSuppress: a wholesale regeneration, where splicing would fabricate
+	// a hybrid of two generations. Stop emitting and reconcile at completion.
+	snapshotSuppress
+)
+
+// classifySnapshot decides how to treat an incoming snapshot given what has
+// already been streamed. The returned offset is the emit point for
+// snapshotAppend and snapshotResume.
+//
+// The ordering matters. A snapshot that is a prefix of the stream is checked
+// before the divergence branch: upstream re-sending a cumulative snapshot it
+// had already sent carries no new content, and misreading it as a rewrite is
+// what silenced a whole turn over a snapshot that was shorter than the stream
+// (live 2026-09-17: cur=3123 snapshot=3080, final answer 22966 bytes).
+func classifySnapshot(cur, snapshot string) (snapshotAction, int) {
+	if cur == "" {
+		return snapshotAppend, 0
+	}
+	if strings.HasPrefix(snapshot, cur) {
+		return snapshotAppend, len(cur)
+	}
+	if strings.HasPrefix(cur, snapshot) {
+		return snapshotIgnore, len(snapshot)
+	}
+	lcp := commonPrefixLen(cur, snapshot)
+	if rewriteResumable(len(cur), lcp) {
+		return snapshotResume, lcp
+	}
+	return snapshotSuppress, lcp
+}
+
+// maxRewriteResumeBytes is how many already-sent bytes a mid-stream rewrite
+// may roll back while still resuming. The bound is absolute rather than a
+// fraction of the stream: what costs the client is the number of duplicated
+// bytes it re-sees, and 64 bytes of duplication is negligible whether the
+// stream is 100 bytes or 10 KB. A proportional gate rejected short streams
+// whose rollback was tiny in absolute terms (a 12-byte correction inside a
+// 39-byte Chinese stream measured as a 31% rollback and was suppressed).
+//
+// Production rewrites (2026-09-12 log review plus the 09-13..09-17 window)
+// separate on this axis: corrections land within ~30 bytes, regenerations
+// start around 66 and run to thousands.
 const maxRewriteResumeBytes = 64
 
-// rewriteResumable reports whether a non-prefix snapshot can resume from the
-// common prefix instead of suppressing the rest of the turn: the rollback is
-// bounded and the common prefix still covers most of what was streamed, so
-// the corrected tail the client re-sees stays small.
+// rewriteResumable reports whether a non-prefix snapshot is a bounded tail
+// correction that can resume from the common prefix, rather than a wholesale
+// regeneration that must suppress the rest of the turn.
 func rewriteResumable(streamedLen, lcp int) bool {
-	rollback := streamedLen - lcp
-	return rollback <= maxRewriteResumeBytes && lcp*5 >= streamedLen*4
+	return lcp <= streamedLen && streamedLen-lcp <= maxRewriteResumeBytes
 }
 
 func truncate(s string, n int) string {
@@ -929,48 +979,51 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if cur == "" {
 			return emitDelta(snapshot)
 		}
-		if strings.HasPrefix(snapshot, cur) {
-			return emitDelta(snapshot[len(cur):])
-		}
-		// Non-prefix snapshot: upstream revised content it had already sent.
-		// Production rewrites come in two shapes (2026-09-12 log review): a
-		// tiny tail rollback — the lcp sits within a few dozen bytes of the
-		// stream head — from upstream normalising the in-flight fragment, and
-		// a wholesale regeneration where the lcp collapses.
-		lcp := commonPrefixLen(cur, snapshot)
-		if rewriteResumable(len(cur), lcp) {
-			// Tail rollback: rewind the accounting buffer to the common prefix
-			// and emit the snapshot's remainder. The rolled-back bytes are
-			// already on the wire and cannot be retracted, so the client
+		switch action, off := classifySnapshot(cur, snapshot); action {
+		case snapshotAppend:
+			if off >= len(snapshot) {
+				return nil
+			}
+			return emitDelta(snapshot[off:])
+		case snapshotIgnore:
+			// Upstream re-sent content already streamed. Nothing to deliver,
+			// and crucially not a rewrite — see classifySnapshot.
+			return nil
+		case snapshotResume:
+			// Bounded rollback: rewind the accounting buffer to the common
+			// prefix and emit the snapshot's remainder. The rolled-back bytes
+			// are already on the wire and cannot be retracted, so the client
 			// re-sees a bounded duplicate of the corrected tail — cheap next
 			// to the alternative, which is silence until finalizeText.
 			streamed.Reset()
-			streamed.WriteString(cur[:lcp])
+			streamed.WriteString(cur[:off])
 			if !resumeLogged {
 				resumeLogged = true
-				log.Printf("[chathub] upstream rewrote %d tail bytes; resuming from lcp=%d instead of suppressing (cur=%d snapshot=%d)", len(cur)-lcp, lcp, len(cur), len(snapshot))
+				log.Printf("[chathub] upstream rewrote %d tail bytes; resuming from lcp=%d instead of suppressing (cur=%d snapshot=%d)", len(cur)-off, off, len(cur), len(snapshot))
 			}
-			if lcp < len(snapshot) {
-				return emitDelta(snapshot[lcp:])
+			if off < len(snapshot) {
+				return emitDelta(snapshot[off:])
+			}
+			return nil
+		default:
+			// Wholesale regeneration: splicing the divergent tail onto the
+			// emitted text fabricates a hybrid of two generations — duplicated
+			// sections with words cut at every revision boundary — which
+			// surfaced as an answer mixing three rewritten variants of the same
+			// list (2026-09-10 07:33 incident). The snapshot protocol's newest
+			// full snapshot and the type-2 final message are authoritative; stop
+			// emitting here and let finalizeText reconcile the result from
+			// `final`.
+			skippedSnapshots++
+			streamSuppressed = true
+			if !rewriteLogged {
+				rewriteLogged = true
+				log.Printf("[chathub] upstream rewrote streamed content; suppressing further deltas (cur=%d snapshot=%d)", len(cur), len(snapshot))
+			} else if chTrace {
+				log.Printf("[trace:emitSnapshot] skip: cur=%d snapshot=%d (rewrite)", len(cur), len(snapshot))
 			}
 			return nil
 		}
-		// Wholesale regeneration: splicing the divergent tail onto the emitted
-		// text fabricates a hybrid of two generations — duplicated sections
-		// with words cut at every revision boundary — which surfaced as an
-		// answer mixing three rewritten variants of the same list (2026-09-10
-		// 07:33 incident). The snapshot protocol's newest full snapshot and
-		// the type-2 final message are authoritative; stop emitting here and
-		// let finalizeText reconcile the result from `final`.
-		skippedSnapshots++
-		streamSuppressed = true
-		if !rewriteLogged {
-			rewriteLogged = true
-			log.Printf("[chathub] upstream rewrote streamed content; suppressing further deltas (cur=%d snapshot=%d)", len(cur), len(snapshot))
-		} else if chTrace {
-			log.Printf("[trace:emitSnapshot] skip: cur=%d snapshot=%d (rewrite)", len(cur), len(snapshot))
-		}
-		return nil
 	}
 	var final string
 	var throttling any

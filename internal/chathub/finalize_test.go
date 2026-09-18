@@ -30,38 +30,84 @@ func TestCommonPrefixLenNeverCutsUTF8Rune(t *testing.T) {
 	}
 }
 
-func TestRewriteResumableUsesBoundedMostlySharedPrefix(t *testing.T) {
+func TestClassifySnapshot(t *testing.T) {
 	cases := []struct {
-		name       string
-		streamed   int
-		lcp        int
-		wantResume bool
+		name     string
+		cur      string
+		snapshot string
+		want     snapshotAction
 	}{
-		{"small tail rewrite", 100, 80, true},
-		{"small tail with mostly shared prefix", 1000, 960, true},
-		{"rollback over bound", 100, 35, false},
-		{"prefix too short", 1000, 700, false},
-		{"prefix ratio just below threshold", 100, 79, false},
-		{"rollback over bound at low prefix", 100, 36, false},
+		// Nothing streamed yet: the snapshot is the answer's opening.
+		{"empty stream", "", "开始输出", snapshotAppend},
+
+		// Clean extension.
+		{"extends the stream", "第一段。", "第一段。第二段。", snapshotAppend},
+		{"identical resend", "第一段。", "第一段。", snapshotAppend},
+
+		// Upstream re-sent a cumulative snapshot shorter than the stream.
+		// This must NOT be read as a rewrite: it carries no new content, and
+		// misreading it silenced a whole turn (live 2026-09-17:
+		// cur=3123 snapshot=3080, final answer 22966 bytes).
+		{"snapshot already contained", "第一段已经发送。第二段正在生成", "第一段已经发送。", snapshotIgnore},
+		{"snapshot is one byte of a longer stream", "abcdef", "ab", snapshotIgnore},
+
+		// Bounded tail correction: rollback within the cap. The bound is
+		// absolute, so a short stream with a small rollback also resumes.
+		{"bounded tail correction", "abcdefghij", "abcdefgXYZ", snapshotResume},
+		{"bounded correction deep into a long stream", strings.Repeat("x", 3000) + "tail", strings.Repeat("x", 3000) + "TAIL", snapshotResume},
+		{"short stream with a tiny rollback", "前缀内容已经发送，旧的尾巴", "前缀内容已经发送，新的尾巴", snapshotResume},
+
+		// Wholesale regeneration: the rollback is unbounded, so splicing would
+		// fabricate a hybrid. This is the 2026-09-10 incident class.
+		{"regeneration from the start", strings.Repeat("已发送的正文内容。", 20), "另一个完全不同的答案", snapshotSuppress},
+		{"lcp collapses mid-stream", strings.Repeat("a", 500) + "tail", strings.Repeat("a", 10) + "different", snapshotSuppress},
+
+		// Rollback over the cap, however long the shared prefix is.
+		{"rollback over cap", strings.Repeat("a", 500) + "x", strings.Repeat("a", 500-65) + "y", snapshotSuppress},
+		{"rollback just over cap", strings.Repeat("a", 100) + "x", strings.Repeat("a", 35) + "y", snapshotSuppress},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := rewriteResumable(tc.streamed, tc.lcp); got != tc.wantResume {
-				t.Fatalf("rewriteResumable(%d, %d) = %v, want %v", tc.streamed, tc.lcp, got, tc.wantResume)
+			got, off := classifySnapshot(tc.cur, tc.snapshot)
+			if got != tc.want {
+				t.Fatalf("classifySnapshot(%q, %q) = %v, want %v", tc.cur, tc.snapshot, got, tc.want)
+			}
+			// The emit point must be a valid slice boundary for the branch that
+			// uses it.
+			switch got {
+			case snapshotAppend:
+				if off > len(tc.snapshot) {
+					t.Fatalf("append offset %d past snapshot length %d", off, len(tc.snapshot))
+				}
+				if off > 0 && !utf8.ValidString(tc.snapshot[off:]) {
+					t.Fatalf("append tail %q is not valid UTF-8", tc.snapshot[off:])
+				}
+			case snapshotResume:
+				if off > len(tc.cur) || off > len(tc.snapshot) {
+					t.Fatalf("resume offset %d out of range", off)
+				}
+				if !utf8.ValidString(tc.snapshot[off:]) {
+					t.Fatalf("resume tail %q is not valid UTF-8", tc.snapshot[off:])
+				}
 			}
 		})
 	}
 }
 
-func TestRewriteResumableAllowsRuneAlignedChineseTail(t *testing.T) {
-	streamed := "前缀内容已经发送，旧的尾巴和更多内容"
-	snapshot := "前缀内容已经发送，旧的尾巴和更多文案"
-	lcp := commonPrefixLen(streamed, snapshot)
-	if !rewriteResumable(len(streamed), lcp) {
-		t.Fatalf("expected bounded Chinese tail rewrite to resume: streamed=%d lcp=%d", len(streamed), lcp)
+// A rollback that lands inside a multi-byte rune must round down, so the
+// resume tail never starts mid-character.
+func TestClassifySnapshotResumeKeepsRuneBoundary(t *testing.T) {
+	cur := "前缀内容已经发送，旧的尾巴"
+	snapshot := "前缀内容已经发送，新的尾巴"
+	action, off := classifySnapshot(cur, snapshot)
+	if action != snapshotResume {
+		t.Fatalf("expected a bounded Chinese tail correction to resume, got %v", action)
 	}
-	if !utf8.ValidString(snapshot[lcp:]) {
-		t.Fatalf("snapshot tail %q is not valid UTF-8", snapshot[lcp:])
+	if !utf8.ValidString(snapshot[off:]) {
+		t.Fatalf("resume tail %q is not valid UTF-8", snapshot[off:])
+	}
+	if strings.ContainsRune(snapshot[off:], utf8.RuneError) {
+		t.Fatalf("resume tail %q contains a replacement character", snapshot[off:])
 	}
 }
 
