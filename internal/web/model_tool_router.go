@@ -416,6 +416,62 @@ func classifyAnswerOutputPrefix(s string) (decided, isCall bool) {
 	return true, false
 }
 
+// jsonEscapeNext reports whether c may legally follow a backslash inside a
+// JSON string. The set is the JSON spec's escapes plus u (a \uXXXX unicode
+// escape; the strict decoder validates the four hex digits).
+func jsonEscapeNext(c byte) bool {
+	switch c {
+	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
+		return true
+	}
+	return false
+}
+
+// repairIllegalJSONEscapes rewrites illegal backslash escapes inside a JSON
+// argument object so the object parses. The recurring real-world case is the
+// router model writing a Windows path as a human types it — D:\Word\odoo —
+// where \W is not a legal JSON escape and the whole CALL_TOOL: edit({...})
+// object failed json.Unmarshal, silently swallowing the model's tool call
+// (observed live 2026-09-17/18). The repair is a single pass in the style of
+// sub2api's lenient-JSON normalizer: it tracks string boundaries and only
+// doubles a backslash whose successor is not a legal escape, leaving every
+// legal escape (\n \t \" \\ \uXXXX etc.) byte-for-byte intact. The bool
+// reports whether any repair was made.
+func repairIllegalJSONEscapes(raw []byte) ([]byte, bool) {
+	if len(raw) == 0 {
+		return raw, false
+	}
+	out := make([]byte, 0, len(raw)+8)
+	inString := false
+	escaped := false
+	changed := false
+	for i := 0; i < len(raw); i++ {
+		b := raw[i]
+		if escaped {
+			escaped = false
+			if !jsonEscapeNext(b) {
+				// The backslash already appended in the previous iteration was
+				// a literal path separator (the W in D:\Word): double it so the
+				// strict decoder reads \\W as backslash + W instead of failing.
+				out = append(out, '\\')
+				changed = true
+			}
+			out = append(out, b)
+			continue
+		}
+		if inString && b == '\\' {
+			escaped = true
+			out = append(out, b)
+			continue
+		}
+		if b == '"' {
+			inString = !inString
+		}
+		out = append(out, b)
+	}
+	return out, changed
+}
+
 func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
 	text = strings.TrimSpace(text)
 	// Try the new natural language format first: CALL_TOOL: name({...})
@@ -429,7 +485,23 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 				name := strings.TrimSpace(rest[:start])
 				argsStr := rest[start+1 : end]
 				var args map[string]any
-				if json.Unmarshal([]byte(argsStr), &args) == nil && toolChoiceAllows(choice, name) {
+				rawArgs := []byte(argsStr)
+				if json.Unmarshal(rawArgs, &args) != nil {
+					// The router model writes Windows paths the way a human
+					// types them (D:\Word\odoo), and a single backslash is not a
+					// valid JSON escape: \W, \o are illegal escapes, so the
+					// whole argument object fails to parse and the tool call is
+					// swallowed (observed live 2026-09-17/18: four edit/pwsh
+					// calls dropped to raw_calls=0). Repair only the illegal
+					// escapes — legal ones (\n \t \" \u etc.) keep their
+					// meaning — then re-parse before giving up.
+					if repaired, ok := repairIllegalJSONEscapes(rawArgs); ok {
+						if json.Unmarshal(repaired, &args) != nil {
+							args = nil
+						}
+					}
+				}
+				if args != nil && toolChoiceAllows(choice, name) {
 					fn := toolFunction(name, tools)
 					if fn != nil {
 						coerced, dropped := coerceToolArgs(args, fn)
