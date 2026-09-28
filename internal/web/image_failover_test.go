@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -61,14 +62,32 @@ func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
 	// retry on a fresh conversation clears it (live-checked 2026-09-02).
 	// errImageNoResource is the same miss wearing prose instead of silence, so it
 	// must not be the one case that fails on the first attempt.
-	for _, err := range []error{chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice, errImageQuotaRefused, errImageServiceUnavailable, chathub.ErrEmptyCompletion, errImageNoResource} {
+	//
+	// A WebSocket that faults before any image reached the caller is an
+	// account-local stall, not a verdict on the prompt: a read timeout while still
+	// silent and an upstream close before completion (classified TCP, e.g.
+	// "close 1000 (normal)") both used to surface as a hard 502 on the one
+	// half-open account without ever trying another.
+	for _, err := range []error{
+		chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice,
+		errImageQuotaRefused, errImageServiceUnavailable, chathub.ErrEmptyCompletion, errImageNoResource,
+		&chathub.DialError{Status: 0, Kind: "WS_READ_TIMEOUT"},
+		&chathub.DialError{Status: 0, Kind: "TCP"},
+		fmt.Errorf("chat: %w", &chathub.DialError{Status: 0, Kind: "WS_READ_TIMEOUT"}),
+	} {
 		if !imageFailoverWorthwhile(err) {
 			t.Fatalf("expected failover for %v", err)
 		}
 	}
 	// A refused attachment and a content-policy block fail identically on every
-	// account, so retrying only burns quota.
-	for _, err := range []error{nil, chathub.ErrOffensiveContent, chathub.ErrAttachmentRejected} {
+	// account, so retrying only burns quota. A client cancellation is the caller
+	// giving up, and a fault after content already streamed cannot be re-issued
+	// without duplicating output — neither may rotate.
+	for _, err := range []error{
+		nil, chathub.ErrOffensiveContent, chathub.ErrAttachmentRejected,
+		&chathub.DialError{Status: 0, Kind: "CLIENT_CANCELED"},
+		&chathub.DialError{Status: 0, Kind: "WS_READ_TIMEOUT", Streamed: true},
+	} {
 		if imageFailoverWorthwhile(err) {
 			t.Fatalf("unexpected failover for %v", err)
 		}

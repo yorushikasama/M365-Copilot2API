@@ -96,8 +96,20 @@ type imageDeliveryFailure struct {
 // fail the whole edit on the first stumble without trying anywhere else. A
 // content-policy block, a *refused* attachment or a malformed request would fail
 // the same way everywhere.
+//
+// A WebSocket that faults before the upstream emits any image also qualifies: a
+// read timeout while still silent (WS_READ_TIMEOUT) or an upstream close before
+// completion (classified TCP) is an account-local stall, not a verdict on the
+// prompt, so the request must rotate rather than surface a hard 502 on the one
+// account that happened to go half-open. IsRetryable already excludes a client
+// cancellation and account-local auth/quota faults, and IsSafeToRetry confirms
+// nothing had reached the caller; the rotation loop's own budget guard still
+// decides whether a fresh turn can finish before the request deadline.
 func imageFailoverWorthwhile(err error) bool {
-	return IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit) || errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, errImageNoResource) || errors.Is(err, chathub.ErrAttachmentUploadFailed)
+	if IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit) || errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, errImageNoResource) || errors.Is(err, chathub.ErrAttachmentUploadFailed) {
+		return true
+	}
+	return IsRetryable(err) && chathub.IsSafeToRetry(err)
 }
 
 // isImageCapabilityThrottle reports whether the error is an image-metering
