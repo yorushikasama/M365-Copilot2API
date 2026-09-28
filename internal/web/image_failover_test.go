@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -63,11 +64,12 @@ func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
 	// errImageNoResource is the same miss wearing prose instead of silence, so it
 	// must not be the one case that fails on the first attempt.
 	//
-	// A WebSocket that faults before any image reached the caller is an
-	// account-local stall, not a verdict on the prompt: a read timeout while still
-	// silent and an upstream close before completion (classified TCP, e.g.
+	// A WebSocket fault where the socket itself failed before any image is an
+	// account-local stall, not a verdict on the prompt: a per-frame read timeout
+	// (pings stopped) and an upstream close before completion (classified TCP, e.g.
 	// "close 1000 (normal)") both used to surface as a hard 502 on the one
-	// half-open account without ever trying another.
+	// half-open account without ever trying another. A bare WS_READ_TIMEOUT with no
+	// deadline cause stands in for the pings-stopped socket here.
 	for _, err := range []error{
 		chathub.ErrImageLimit, chathub.ErrMeteringThrottled, chathub.ErrRateLimitNotice,
 		errImageQuotaRefused, errImageServiceUnavailable, chathub.ErrEmptyCompletion, errImageNoResource,
@@ -83,10 +85,18 @@ func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
 	// account, so retrying only burns quota. A client cancellation is the caller
 	// giving up, and a fault after content already streamed cannot be re-issued
 	// without duplicating output — neither may rotate.
+	//
+	// A silent read timeout whose cause is our own image deadline (context
+	// deadline exceeded) must NOT rotate: the socket was still alive on keepalive
+	// pings and the generation was still running, so failing over abandons a
+	// working turn. The live ceiling error is a *chathub.DialError wrapping
+	// context.DeadlineExceeded; the plain wrap here exercises the same
+	// errors.Is branch.
 	for _, err := range []error{
 		nil, chathub.ErrOffensiveContent, chathub.ErrAttachmentRejected,
 		&chathub.DialError{Status: 0, Kind: "CLIENT_CANCELED"},
 		&chathub.DialError{Status: 0, Kind: "WS_READ_TIMEOUT", Streamed: true},
+		fmt.Errorf("ws dial: WS_READ_TIMEOUT upstream 0: %w", context.DeadlineExceeded),
 	} {
 		if imageFailoverWorthwhile(err) {
 			t.Fatalf("unexpected failover for %v", err)

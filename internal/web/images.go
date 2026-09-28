@@ -97,17 +97,27 @@ type imageDeliveryFailure struct {
 // content-policy block, a *refused* attachment or a malformed request would fail
 // the same way everywhere.
 //
-// A WebSocket that faults before the upstream emits any image also qualifies: a
-// read timeout while still silent (WS_READ_TIMEOUT) or an upstream close before
-// completion (classified TCP) is an account-local stall, not a verdict on the
-// prompt, so the request must rotate rather than surface a hard 502 on the one
-// account that happened to go half-open. IsRetryable already excludes a client
-// cancellation and account-local auth/quota faults, and IsSafeToRetry confirms
-// nothing had reached the caller; the rotation loop's own budget guard still
-// decides whether a fresh turn can finish before the request deadline.
+// A WebSocket fault before the upstream emits any image qualifies only when the
+// socket itself failed — pings stopped (a per-frame i/o timeout), an upstream
+// close before completion (classified TCP), or a handshake/DNS/TLS error. Those
+// are account-local stalls that say nothing about the prompt, so the request
+// rotates rather than surface a hard 502 on the one account that went half-open.
+//
+// A silent read timeout whose cause is our *own* image deadline (context
+// deadline exceeded) does NOT qualify: while it generates, the upstream sends
+// only ~15s keepalive pings and no progress, then hands back the whole image at
+// once (verified live 2026-09-28). Hitting the ceiling there means the socket was
+// still alive and the generation was still running, so rotating abandons a
+// working turn and burns another account — and, because the request budget and
+// the frontend's client timeout are both ~5 min, it also pushed the caller to a
+// hard client-side abort. The right response is a longer wait (a larger image
+// timeout), not failover.
 func imageFailoverWorthwhile(err error) bool {
 	if IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit) || errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, errImageNoResource) || errors.Is(err, chathub.ErrAttachmentUploadFailed) {
 		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
 	}
 	return IsRetryable(err) && chathub.IsSafeToRetry(err)
 }
