@@ -210,3 +210,28 @@ func TestImageRequestBudgetCapsBelowCallerDeadline(t *testing.T) {
 		t.Fatalf("60s timeout: budget %v, want %v", got, imageRequestBudgetFactor*60*time.Second)
 	}
 }
+
+func TestImageTimedOutOnlyForReadTimeout(t *testing.T) {
+	// Our own read-timeout (the upstream stayed alive on keepalives but never
+	// delivered) must surface as a retryable gateway timeout, wrapped or not.
+	for _, err := range []error{
+		&chathub.DialError{Kind: "WS_READ_TIMEOUT"},
+		fmt.Errorf("chat: %w", &chathub.DialError{Kind: "WS_READ_TIMEOUT"}),
+		&chathub.DialError{Kind: "WS_READ_TIMEOUT", Streamed: true},
+	} {
+		if !imageTimedOut(err) {
+			t.Fatalf("expected timeout classification for %v", err)
+		}
+	}
+	// Everything else keeps its own shape: an empty completion, a content miss,
+	// a client cancel and an upstream close are not "we waited too long".
+	for _, err := range []error{
+		nil, errImageNoResource, chathub.ErrEmptyCompletion,
+		&chathub.DialError{Kind: "CLIENT_CANCELED"},
+		&chathub.DialError{Kind: "TCP"},
+	} {
+		if imageTimedOut(err) {
+			t.Fatalf("did not expect timeout classification for %v", err)
+		}
+	}
+}

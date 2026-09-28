@@ -84,6 +84,16 @@ func imageRequestBudget(imageTimeout time.Duration) time.Duration {
 	return budget
 }
 
+// imageTimedOut reports whether a failed image turn is our own read-timeout
+// firing: the upstream stayed on the socket via keepalives but never delivered
+// an image within the image timeout. It is retryable and, crucially, not a
+// content refusal — the frontend keys off the upstream_timeout code so it stops
+// telling users to rewrite a perfectly good prompt when we simply gave up
+// waiting. A real content refusal is a 400 content_policy_violation, never this.
+func imageTimedOut(err error) bool {
+	return ClassifyError(err) == CategoryWSReadTimeout
+}
+
 // errImageQuotaRefused marks an upstream 200 whose text is a natural-language
 // refusal about the image quota, so the failover loop can treat it like a
 // throttle without turning it into an upstream error.
@@ -523,6 +533,13 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 			// this prompt" rather than "the first attempt happened to miss".
 			log.Printf("[image-gen] endpoint=%s accounts_tried=%d: no image resource", endpoint, len(tried))
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no image resource")
+		case imageTimedOut(lastErr):
+			// We waited out the whole image timeout and the upstream still had
+			// not delivered. The prompt is fine, so return a retryable gateway
+			// timeout with a distinct code instead of the generic 502 the
+			// frontend used to read as a content-policy refusal ("改写描述").
+			log.Printf("[image-gen] endpoint=%s account=%s timed out: %v", endpoint, acc.ID, lastErr)
+			writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_timeout", "upstream did not finish generating the image within the time limit; the prompt is fine, retry shortly")
 		default:
 			log.Printf("[image-gen] endpoint=%s account=%s failed: %v", endpoint, acc.ID, lastErr)
 			writeUpstreamError(w, lastErr)
