@@ -189,3 +189,24 @@ func TestNextImageAccountSkipsTriedAndThrottled(t *testing.T) {
 		t.Fatal("failover returned an account when none were eligible")
 	}
 }
+
+func TestImageRequestBudgetCapsBelowCallerDeadline(t *testing.T) {
+	// The caller's own wall is 300s (GimageUI CLIENT_TIMEOUT_MS and nginx
+	// proxy_read_timeout), so the whole-request budget must stay under it or a
+	// slow failure races the caller and surfaces as an opaque 499.
+	if maxImageRequestBudget >= 300*time.Second {
+		t.Fatalf("budget cap %v must stay under the 300s caller deadline", maxImageRequestBudget)
+	}
+	// The default 150s timeout would grant exactly 300s and the deployed 220s
+	// would grant 440s; both must be pulled down to the cap.
+	for _, imageTimeout := range []time.Duration{150 * time.Second, 220 * time.Second} {
+		if got := imageRequestBudget(imageTimeout); got != maxImageRequestBudget {
+			t.Fatalf("timeout %v: budget %v, want the cap %v", imageTimeout, got, maxImageRequestBudget)
+		}
+	}
+	// A short timeout stays well under the cap, so it keeps its full factor —
+	// the cap only ever shortens the wait.
+	if got := imageRequestBudget(60 * time.Second); got != imageRequestBudgetFactor*60*time.Second {
+		t.Fatalf("60s timeout: budget %v, want %v", got, imageRequestBudgetFactor*60*time.Second)
+	}
+}

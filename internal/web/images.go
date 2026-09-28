@@ -51,6 +51,16 @@ const (
 	// per-attempt image timeout, leaving room for roughly one failover plus the
 	// download phase instead of granting every phase a fresh full timeout.
 	imageRequestBudgetFactor = 2
+	// maxImageRequestBudget caps the entire request just under the caller's own
+	// patience. The GimageUI frontend aborts at 300s (CLIENT_TIMEOUT_MS) and
+	// nginx's proxy_read_timeout is 300s, so a request allowed the full
+	// imageRequestBudgetFactor*imageTimeout (440s at a 220s timeout) always lost
+	// the race: the caller cancelled first and every slow failure surfaced as an
+	// opaque 499 after a five-minute wait, with no error it could act on. Capping
+	// here lets the gateway hit its own deadline a few seconds early and return a
+	// real 502, and it bounds any failover to the time that can still finish
+	// before the caller gives up.
+	maxImageRequestBudget = 290 * time.Second
 	// imageDownloadBudget bounds the Designer download phase. The overall request
 	// deadline clamps it as well, so it can only ever shorten the wait.
 	imageDownloadBudget = 60 * time.Second
@@ -60,6 +70,19 @@ const (
 	designerDownloadAttempts = 3
 	designerRetryBackoff     = 400 * time.Millisecond
 )
+
+// imageRequestBudget is the deadline for the whole image request — roughly one
+// failover plus the download beyond the per-attempt timeout — clamped so it can
+// never run past the caller's own patience (see maxImageRequestBudget). The cap
+// only ever shortens the wait, so a short per-attempt timeout still gets its
+// full factor.
+func imageRequestBudget(imageTimeout time.Duration) time.Duration {
+	budget := imageRequestBudgetFactor * imageTimeout
+	if budget > maxImageRequestBudget {
+		budget = maxImageRequestBudget
+	}
+	return budget
+}
 
 // errImageQuotaRefused marks an upstream 200 whose text is a natural-language
 // refusal about the image quota, so the failover loop can treat it like a
@@ -395,8 +418,9 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	// timeout — 600s at the default 150s, long after any client had stopped
 	// listening (Claude CLI gives up near 125s). One budget now covers the whole
 	// request and every phase derives from it, so a phase can only shorten the
-	// wait, never extend it.
-	requestCtx, cancelRequest := context.WithTimeout(r.Context(), imageRequestBudgetFactor*imageTimeout)
+	// wait, never extend it. The budget is itself capped under the caller's 300s
+	// deadline so a slow failure returns a real 502 before the caller aborts.
+	requestCtx, cancelRequest := context.WithTimeout(r.Context(), imageRequestBudget(imageTimeout))
 	defer cancelRequest()
 	size := b.Size
 	if size == "" {
