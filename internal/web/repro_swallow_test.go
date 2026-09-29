@@ -17,32 +17,45 @@ func editTool() []map[string]any {
 		{"type": "function", "function": map[string]any{
 			"name": "edit",
 			"parameters": map[string]any{
-				"type": "object",
+				"type":     "object",
 				"required": []any{"file_path", "old_string", "new_string"},
 				"properties": map[string]any{
-					"file_path": map[string]any{"type": "string"},
-					"old_string": map[string]any{"type": "string"},
-					"new_string": map[string]any{"type": "string"},
-					"replace_all": map[string]any{"type": "boolean"},
+					"file_path":           map[string]any{"type": "string"},
+					"old_string":          map[string]any{"type": "string"},
+					"new_string":          map[string]any{"type": "string"},
+					"replace_all":         map[string]any{"type": "boolean"},
 					"sandbox_permissions": map[string]any{"type": "string", "enum": []any{"use_default", "workspace_write", "workspace-write"}},
-					"justification": map[string]any{"type": "string"},
+					"justification":       map[string]any{"type": "string"},
 				},
 			},
 		}},
 		{"type": "function", "function": map[string]any{
 			"name": "pwsh",
 			"parameters": map[string]any{
-				"type": "object",
+				"type":     "object",
 				"required": []any{"command"},
 				"properties": map[string]any{
-					"command": map[string]any{"type": "string"},
-					"workdir": map[string]any{"type": "string"},
-					"timeoutMs": map[string]any{"type": "integer"},
+					"command":             map[string]any{"type": "string"},
+					"workdir":             map[string]any{"type": "string"},
+					"timeoutMs":           map[string]any{"type": "integer"},
 					"sandbox_permissions": map[string]any{"type": "string"},
 				},
 			},
 		}},
 	}
+}
+
+func assertParsedToolCall(t *testing.T, text, wantName string) detectedToolCall {
+	t.Helper()
+
+	calls, parsed := parseModelToolDecision(text, editTool(), "auto")
+	if !parsed || len(calls) != 1 {
+		t.Fatalf("tool call must parse: parsed=%v calls=%d", parsed, len(calls))
+	}
+	if calls[0].Name != wantName {
+		t.Fatalf("expected %s call, got %s", wantName, calls[0].Name)
+	}
+	return calls[0]
 }
 
 // TestRouterModelEmittedWindowsPathSingleBackslash reproduces the 09-18 live
@@ -61,17 +74,11 @@ func TestRouterModelEmittedWindowsPathSingleBackslash(t *testing.T) {
 	// the strict decoder, decode to their standard character — that is the
 	// spec-compliant behaviour, not a repair defect.
 	text := `CALL_TOOL: edit({"file_path":"D:\Word\odoo\third_party_addons\pos_sync_api\services\pos_sync_api.py","old_string":"            'date_order': fields.Datetime.now(),","new_string":"            'date_order': fields.Datetime.now(),  # UTC","replace_all":false,"sandbox_permissions":"workspace_write"})`
-	calls, parsed := parseModelToolDecision(text, editTool(), "auto")
-	if !parsed || len(calls) != 1 {
-		t.Fatalf("model-emitted edit with Windows single-backslash path was swallowed: parsed=%v calls=%d", parsed, len(calls))
-	}
-	if calls[0].Name != "edit" {
-		t.Fatalf("expected edit call, got %s", calls[0].Name)
-	}
+	call := assertParsedToolCall(t, text, "edit")
 	var args struct {
 		FilePath string `json:"file_path"`
 	}
-	if err := json.Unmarshal(calls[0].Arguments, &args); err != nil {
+	if err := json.Unmarshal(call.Arguments, &args); err != nil {
 		t.Fatalf("cannot read arguments back: %v", err)
 	}
 	// The illegal escapes \W \o must survive as literal backslashes.
@@ -144,13 +151,7 @@ func TestRepairIllegalJSONEscapesDoublesIllegalScapes(t *testing.T) {
 // correctly escaped backslashes (D:\\Word\\odoo) must parse.
 func TestRouterModelEmittedWindowsPathEscaped(t *testing.T) {
 	text := `CALL_TOOL: edit({"file_path":"D:\\Word\\odoo\\third_party_addons\\pos_sync_api\\services\\pos_sync_api.py","old_string":"'date_order': fields.Datetime.now(),","new_string":"'date_order': fields.Datetime.now(),  # UTC","replace_all":false,"sandbox_permissions":"workspace_write"})`
-	calls, parsed := parseModelToolDecision(text, editTool(), "auto")
-	if !parsed || len(calls) != 1 {
-		t.Fatalf("escaped Windows path must parse: parsed=%v calls=%d", parsed, len(calls))
-	}
-	if calls[0].Name != "edit" {
-		t.Fatalf("expected edit call, got %s", calls[0].Name)
-	}
+	assertParsedToolCall(t, text, "edit")
 }
 
 // TestRouterModelEmittedPwshWithQuotedCommand reproduces the 09-18 05:35
@@ -158,13 +159,7 @@ func TestRouterModelEmittedWindowsPathEscaped(t *testing.T) {
 // a nested Windows path.
 func TestRouterModelEmittedPwshWithQuotedCommand(t *testing.T) {
 	text := `CALL_TOOL: pwsh({"command":"$ErrorActionPreference = 'Stop'; Write-Output \"PWD=$((Get-Location).Path)\"; git -C D:\Word\odoo status","sandbox_permissions":"use_default","timeoutMs":30000,"workdir":"D:\Word\odoo"})`
-	calls, parsed := parseModelToolDecision(text, editTool(), "auto")
-	if !parsed || len(calls) != 1 {
-		t.Fatalf("model-emitted pwsh was swallowed: parsed=%v calls=%d", parsed, len(calls))
-	}
-	if calls[0].Name != "pwsh" {
-		t.Fatalf("expected pwsh call, got %s", calls[0].Name)
-	}
+	assertParsedToolCall(t, text, "pwsh")
 }
 
 // TestRouterModelEmittedEditOldStringWithUnicode verifies old_string/new_string
@@ -172,14 +167,8 @@ func TestRouterModelEmittedPwshWithQuotedCommand(t *testing.T) {
 // Chinese and a long old_string) still parse.
 func TestRouterModelEmittedEditOldStringWithUnicode(t *testing.T) {
 	text := `CALL_TOOL: edit({"file_path":"third_party_addons/pos_sync_api/services/pos_sync_api.py","old_string":"    def _sync_order(self, order):\n        \"\"\"Sync a single order\"\"\"\n        self._log(\"syncing\", order.id)","new_string":"    def _sync_order(self, order):\n        \"\"\"Sync a single order\"\"\"\n        self._log(\"syncing (api)\", order.id)","sandbox_permissions":"workspace_write","justification":"按用户要求调整两个销售订单同步方法的注释格式。"})`
-	calls, parsed := parseModelToolDecision(text, editTool(), "auto")
-	if !parsed || len(calls) != 1 {
-		t.Fatalf("model-emitted edit with unicode/newlines was swallowed: parsed=%v calls=%d", parsed, len(calls))
-	}
-	if calls[0].Name != "edit" {
-		t.Fatalf("expected edit, got %s", calls[0].Name)
-	}
-	if !strings.Contains(string(calls[0].Arguments), "按用户要求") {
-		t.Fatalf("justification was lost: %s", calls[0].Arguments)
+	call := assertParsedToolCall(t, text, "edit")
+	if !strings.Contains(string(call.Arguments), "按用户要求") {
+		t.Fatalf("justification was lost: %s", call.Arguments)
 	}
 }
