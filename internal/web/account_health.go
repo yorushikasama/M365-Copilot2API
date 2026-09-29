@@ -651,6 +651,31 @@ func (h *accountHealth) MarkImageGenSystemThrottled(accountID string) {
 	h.imageGenSystemCooldown[accountID] = time.Now().Add(30 * time.Minute)
 }
 
+// imageGenSlowCooldown is how long an account is passed over after it burned a
+// whole image timeout without producing anything.
+const imageGenSlowCooldown = 10 * time.Minute
+
+// MarkImageGenSlow sidelines an account for image generation briefly after it
+// hit our deadline. Such an account is not broken — upstream capacity varies per
+// request and per region — but making the next request start on it costs another
+// full timeout before the rotation even begins, and the live logs showed one
+// account taking the first slot and timing out six times in a row. A short,
+// image-only cooldown lets selection start on a different account while leaving
+// chat untouched and the account usable again within minutes.
+func (h *accountHealth) MarkImageGenSlow(accountID string) {
+	if h == nil || accountID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Never shorten a longer cooldown that is already in place: a quota or
+	// capacity throttle outranks a slow-turn nudge.
+	if until, ok := h.imageGenSystemCooldown[accountID]; ok && time.Until(until) > imageGenSlowCooldown {
+		return
+	}
+	h.imageGenSystemCooldown[accountID] = time.Now().Add(imageGenSlowCooldown)
+}
+
 // cleanupExpiredImageGenLocked drops elapsed image-generation cooldowns.
 // cleanupExpiredCooldownLocked cannot be relied on for this because it returns
 // early unless a general cooldown entry exists, and an image-only cooldown has

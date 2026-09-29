@@ -212,7 +212,10 @@ func isImageCapabilityThrottle(err error) bool {
 
 // markImageThrottle applies an image-only cooldown so rotation skips this
 // account for image generation while leaving its chat capacity alone. The daily
-// token quota lasts until tomorrow; a system-capacity throttle is transient.
+// token quota lasts until tomorrow; a system-capacity throttle is transient; and
+// hitting our own deadline earns a short cooldown so the next request does not
+// spend another full timeout on the same account before rotating (live logs
+// showed one account taking the first slot and timing out six times in a row).
 func (s *Server) markImageThrottle(accountID string, err error) {
 	if s == nil || s.accountPool == nil || accountID == "" {
 		return
@@ -222,6 +225,8 @@ func (s *Server) markImageThrottle(accountID string, err error) {
 		s.accountPool.MarkImageGenTokensThrottled(accountID)
 	case errors.Is(err, chathub.ErrMeteringThrottled):
 		s.accountPool.MarkImageGenSystemThrottled(accountID)
+	case errors.Is(err, context.DeadlineExceeded):
+		s.accountPool.MarkImageGenSlow(accountID)
 	}
 }
 

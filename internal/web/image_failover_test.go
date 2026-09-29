@@ -235,6 +235,54 @@ func TestNextImageAccountSkipsTriedAndThrottled(t *testing.T) {
 	}
 }
 
+func TestImageTimeoutCoolsTheAccountDownBriefly(t *testing.T) {
+	store := testAccountFiles(t)
+	h := newAccountHealth()
+	s := &Server{tokens: store, accountPool: h, accountConcurrency: newAccountConcurrency(), settings: &settingsStore{v: defaultRuntimeSettings()}}
+	accounts := store.List()
+	slow := accounts[0]
+
+	// A deadline hit must sideline the account for image generation so the next
+	// request does not spend another full timeout on it before rotating, while
+	// leaving its chat capacity untouched.
+	s.markImageThrottle(slow.ID, fmt.Errorf("ws dial: WS_READ_TIMEOUT upstream 0: %w", context.DeadlineExceeded))
+	if h.ImageGenAvailable(slow.ID) {
+		t.Fatal("a timed-out account is still selected for image generation")
+	}
+	if !h.Available(slow.ID) {
+		t.Fatal("a timed-out account lost its chat capacity")
+	}
+	if until, ok := h.ImageGenCooldownUntil(slow.ID); !ok || time.Until(until) > imageGenSlowCooldown+time.Minute {
+		t.Fatalf("slow cooldown is not the short transient one: %v", until)
+	}
+
+	// It must not be a long quota-style cooldown: the next image request should
+	// start on a different account, but the pool still has candidates.
+	next, err := s.nextImageAccount(map[string]bool{slow.ID: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.ID == slow.ID {
+		t.Fatal("rotated back onto the account that just timed out")
+	}
+}
+
+func TestImageSlowCooldownDoesNotShortenARealThrottle(t *testing.T) {
+	h := newAccountHealth()
+	const id = "account-a"
+	// A capacity throttle is a 30-minute verdict; a later slow-turn nudge must
+	// not cut it down to 10 minutes and re-admit the account early.
+	h.MarkImageGenSystemThrottled(id)
+	before, _ := h.ImageGenCooldownUntil(id)
+
+	h.MarkImageGenSlow(id)
+
+	after, _ := h.ImageGenCooldownUntil(id)
+	if after.Before(before.Add(-time.Second)) {
+		t.Fatalf("slow cooldown shortened the real throttle: %v -> %v", before, after)
+	}
+}
+
 func TestImageRequestBudgetCapsBelowCallerDeadline(t *testing.T) {
 	// The caller's own wall is 300s (GimageUI CLIENT_TIMEOUT_MS and nginx
 	// proxy_read_timeout), so the whole-request budget must stay under it or a
