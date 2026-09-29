@@ -69,6 +69,11 @@ const (
 	// connection is worth another look, but a long loop would outlive the URL.
 	designerDownloadAttempts = 3
 	designerRetryBackoff     = 400 * time.Millisecond
+	// imageFastFailWindow separates an upstream stumble from a generation that
+	// genuinely ran and produced nothing. A miss inside it is worth one client
+	// retry (and is reported as upstream_retryable); past it the upstream had
+	// ample time and re-running only repeats the wait.
+	imageFastFailWindow = 20 * time.Second
 )
 
 // imageRequestBudget is the deadline for the whole image request — roughly one
@@ -137,14 +142,14 @@ type imageDeliveryFailure struct {
 // rotates rather than surface a hard 502 on the one account that went half-open.
 //
 // A silent read timeout whose cause is our *own* image deadline (context
-// deadline exceeded) does NOT qualify: while it generates, the upstream sends
-// only ~15s keepalive pings and no progress, then hands back the whole image at
-// once (verified live 2026-09-28). Hitting the ceiling there means the socket was
-// still alive and the generation was still running, so rotating abandons a
-// working turn and burns another account — and, because the request budget and
-// the frontend's client timeout are both ~5 min, it also pushed the caller to a
-// hard client-side abort. The right response is a longer wait (a larger image
-// timeout), not failover.
+// deadline exceeded) is not automatically excluded any more: the caller-side
+// gate `imageTimeoutFailoverWorthwhile` admits it only while a full fresh
+// attempt still fits in the remaining request budget. Hits of our ceiling and
+// hits of the socket are both "this attempt produced nothing"; the difference is
+// whether a second attempt can finish before the caller gives up, which only the
+// deadline can answer. A retry that cannot complete is what turns a slow failure
+// into an opaque client-side 499, so the budget check — not the error kind —
+// decides.
 func imageFailoverWorthwhile(err error) bool {
 	if IsRateLimited(err) || errors.Is(err, errImageQuotaRefused) || errors.Is(err, errImageServiceUnavailable) || errors.Is(err, chathub.ErrImageLimit) || errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, errImageNoResource) || errors.Is(err, chathub.ErrAttachmentUploadFailed) {
 		return true
@@ -153,6 +158,42 @@ func imageFailoverWorthwhile(err error) bool {
 		return false
 	}
 	return IsRetryable(err) && chathub.IsSafeToRetry(err)
+}
+
+// imageTimeoutFailoverWorthwhile is the budget-aware second gate for the one
+// error kind imageFailoverWorthwhile refuses outright: hitting our own image
+// deadline. Rotating there abandons a generation that may still have been
+// running, so it is only worth it when a fresh attempt can run to completion
+// inside what is left of the request budget. The check is `remaining >=
+// imageTimeout`, which is deliberately stricter than the transport gate's 20s
+// floor: a half-length second attempt would just burn another account's quota
+// and miss the same deadline, whereas a full-length one is exactly the second
+// lottery ticket the per-request variance calls for (verified live 2026-09-29:
+// the same prompt failed at 270s on one account and succeeded in 88s on the
+// next, with usage rank uncorrelated to either outcome).
+func imageTimeoutFailoverWorthwhile(ctx context.Context, imageTimeout time.Duration) bool {
+	remaining, enough := transportRetryBudget(ctx)
+	if !enough {
+		return false
+	}
+	// transportRetryBudget reports (0, true) for a context with no deadline: it
+	// cannot measure the budget, and a bounded 20s floor does not apply, so the
+	// only sound reading is "unbounded, always worth another attempt" — not
+	// "0s remaining, never retry".
+	if _, bounded := ctx.Deadline(); !bounded {
+		return true
+	}
+	return remaining >= imageTimeout
+}
+
+// imageRotatable is the loop's single rotation decision: the ordinary gate, plus
+// the budget-aware admission of a deadline hit described above. Keeping both
+// here means the loop reads as one condition and the two policies stay in step.
+func imageRotatable(err error, ctx context.Context, imageTimeout time.Duration) bool {
+	if imageFailoverWorthwhile(err) {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) && imageTimeoutFailoverWorthwhile(ctx, imageTimeout)
 }
 
 // isImageCapabilityThrottle reports whether the error is an image-metering
@@ -493,7 +534,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		} else {
 			s.markImageThrottle(acc.ID, lastErr)
 		}
-		if pinned || attempt >= imageAccountAttempts || !imageFailoverWorthwhile(lastErr) {
+		if pinned || attempt >= imageAccountAttempts || !imageRotatable(lastErr, requestCtx, imageTimeout) {
 			break
 		}
 		// Rotating is only worth it while enough of the overall budget remains for
@@ -541,6 +582,19 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[image-gen] endpoint=%s account=%s timed out: %v", endpoint, acc.ID, lastErr)
 			writeOpenAIError(w, http.StatusGatewayTimeout, "upstream_timeout", "upstream did not finish generating the image within the time limit; the prompt is fine, retry shortly")
 		default:
+			// An empty completion is worth another look, but only when it arrived
+			// quickly. A failure inside a few seconds is the upstream's transient
+			// stumble (19 of 46 live 502s landed under 20s in the 7 days to
+			// 2026-09-29) and almost always clears on a fresh turn; one that took
+			// tens of seconds was a real generation that produced nothing, and
+			// re-running it just makes the caller wait again. The distinct code
+			// lets the frontend retry the first kind once and skip the second.
+			if elapsed := time.Since(startedAt); errors.Is(lastErr, chathub.ErrEmptyCompletion) && elapsed < imageFastFailWindow {
+				log.Printf("[image-gen] endpoint=%s account=%s fast empty completion after %v; retryable", endpoint, acc.ID, elapsed.Round(time.Second))
+				w.Header().Set("Retry-After", "2")
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_retryable", "upstream returned nothing on a quick turn; retry shortly")
+				return
+			}
 			log.Printf("[image-gen] endpoint=%s account=%s failed: %v", endpoint, acc.ID, lastErr)
 			writeUpstreamError(w, lastErr)
 		}

@@ -87,9 +87,10 @@ func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
 	// without duplicating output — neither may rotate.
 	//
 	// A silent read timeout whose cause is our own image deadline (context
-	// deadline exceeded) must NOT rotate: the socket was still alive on keepalive
-	// pings and the generation was still running, so failing over abandons a
-	// working turn. The live ceiling error is a *chathub.DialError wrapping
+	// deadline exceeded) is refused by THIS gate; whether it may rotate is
+	// decided separately by the budget (see
+	// TestImageRotatableForDeadlineOnlyWithABudget), so the base gate stays
+	// false here. The live ceiling error is a *chathub.DialError wrapping
 	// context.DeadlineExceeded; the plain wrap here exercises the same
 	// errors.Is branch.
 	for _, err := range []error{
@@ -101,6 +102,39 @@ func TestImageFailoverWorthwhileOnlyForThrottles(t *testing.T) {
 		if imageFailoverWorthwhile(err) {
 			t.Fatalf("unexpected failover for %v", err)
 		}
+	}
+}
+
+func TestImageRotatableForDeadlineOnlyWithABudget(t *testing.T) {
+	deadlineErr := fmt.Errorf("ws dial: WS_READ_TIMEOUT upstream 0: %w", context.DeadlineExceeded)
+	const timeout = 140 * time.Second
+
+	// A deadline hit rotates only while a FULL fresh attempt still fits: a
+	// half-length retry would burn another account and miss the same deadline.
+	roomy, cancel := context.WithTimeout(context.Background(), 280*time.Second)
+	defer cancel()
+	if !imageRotatable(deadlineErr, roomy, timeout) {
+		t.Fatal("expected rotation when a full attempt still fits")
+	}
+
+	// Not enough left for a whole attempt -> do not rotate; the caller gets a
+	// clean 504 instead of a retry that cannot finish.
+	tight, cancelTight := context.WithTimeout(context.Background(), 100*time.Second)
+	defer cancelTight()
+	if imageRotatable(deadlineErr, tight, timeout) {
+		t.Fatal("rotated with less than one attempt of budget left")
+	}
+
+	// An unbounded context is always worth retrying (matches transportRetryBudget).
+	if !imageRotatable(deadlineErr, context.Background(), timeout) {
+		t.Fatal("expected rotation on a context without a deadline")
+	}
+
+	// Non-deadline errors keep the ordinary gate's answer regardless of budget.
+	noRoom, cancelNo := context.WithTimeout(context.Background(), time.Second)
+	defer cancelNo()
+	if imageRotatable(nil, noRoom, timeout) {
+		t.Fatal("rotated on a nil error")
 	}
 }
 
