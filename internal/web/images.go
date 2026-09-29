@@ -74,6 +74,12 @@ const (
 	// retry (and is reported as upstream_retryable); past it the upstream had
 	// ample time and re-running only repeats the wait.
 	imageFastFailWindow = 20 * time.Second
+	// imageFailoverTolerance is the slack allowed when deciding whether a second
+	// image attempt still fits the budget. It only has to cover the milliseconds
+	// of scheduling overhead between arming a deadline and observing it; without
+	// it the "remaining >= imageTimeout" test can never pass after a full
+	// timeout was consumed.
+	imageFailoverTolerance = 5 * time.Second
 )
 
 // imageRequestBudget is the deadline for the whole image request — roughly one
@@ -164,13 +170,15 @@ func imageFailoverWorthwhile(err error) bool {
 // error kind imageFailoverWorthwhile refuses outright: hitting our own image
 // deadline. Rotating there abandons a generation that may still have been
 // running, so it is only worth it when a fresh attempt can run to completion
-// inside what is left of the request budget. The check is `remaining >=
-// imageTimeout`, which is deliberately stricter than the transport gate's 20s
-// floor: a half-length second attempt would just burn another account's quota
-// and miss the same deadline, whereas a full-length one is exactly the second
-// lottery ticket the per-request variance calls for (verified live 2026-09-29:
-// the same prompt failed at 270s on one account and succeeded in 88s on the
-// next, with usage rank uncorrelated to either outcome).
+// inside what is left of the request budget.
+//
+// The comparison allows imageFailoverTolerance of slack. Without it the gate is
+// unreachable in practice: the budget is exactly 2*imageTimeout (280s at 140s),
+// so once the first attempt has burned its full imageTimeout the remainder is
+// always a few milliseconds short of a whole one — every real deadline hit
+// measured on 2026-09-29 landed at 140.001-140.192s and was refused, which is
+// why no 140s timeout ever rotated. The slack covers that scheduling overhead
+// while still refusing when less than a near-full attempt remains.
 func imageTimeoutFailoverWorthwhile(ctx context.Context, imageTimeout time.Duration) bool {
 	remaining, enough := transportRetryBudget(ctx)
 	if !enough {
@@ -183,7 +191,7 @@ func imageTimeoutFailoverWorthwhile(ctx context.Context, imageTimeout time.Durat
 	if _, bounded := ctx.Deadline(); !bounded {
 		return true
 	}
-	return remaining >= imageTimeout
+	return remaining >= imageTimeout-imageFailoverTolerance
 }
 
 // imageRotatable is the loop's single rotation decision: the ordinary gate, plus

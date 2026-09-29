@@ -109,12 +109,23 @@ func TestImageRotatableForDeadlineOnlyWithABudget(t *testing.T) {
 	deadlineErr := fmt.Errorf("ws dial: WS_READ_TIMEOUT upstream 0: %w", context.DeadlineExceeded)
 	const timeout = 140 * time.Second
 
-	// A deadline hit rotates only while a FULL fresh attempt still fits: a
+	// A deadline hit rotates only while a full fresh attempt still fits: a
 	// half-length retry would burn another account and miss the same deadline.
 	roomy, cancel := context.WithTimeout(context.Background(), 280*time.Second)
 	defer cancel()
 	if !imageRotatable(deadlineErr, roomy, timeout) {
 		t.Fatal("expected rotation when a full attempt still fits")
+	}
+
+	// The regression this tolerance exists for: the budget is exactly
+	// 2*imageTimeout, so after a full timeout the remainder is always a few
+	// milliseconds short of a whole one (live hits measured 140.001-140.192s
+	// against a 140s timeout). Without slack this returned false and no 140s
+	// timeout ever rotated.
+	justUnder, cancelUnder := context.WithTimeout(context.Background(), 139*time.Second+900*time.Millisecond)
+	defer cancelUnder()
+	if !imageRotatable(deadlineErr, justUnder, timeout) {
+		t.Fatal("expected rotation when the remainder is a full attempt minus scheduling overhead")
 	}
 
 	// Not enough left for a whole attempt -> do not rotate; the caller gets a
