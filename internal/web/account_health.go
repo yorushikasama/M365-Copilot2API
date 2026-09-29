@@ -467,6 +467,7 @@ type accountHealth struct {
 	imageLimitUntil        map[string]time.Time
 	imageGenCooldownUntil  map[string]time.Time
 	imageGenSystemCooldown map[string]time.Time
+	imageGenSlowUntil      map[string]time.Time
 	lastThrottling         map[string]any
 	lastMeterError         map[string]string
 	lastMeterAccess        map[string]bool
@@ -489,6 +490,7 @@ func newAccountHealth() *accountHealth {
 		imageLimitUntil:        map[string]time.Time{},
 		imageGenCooldownUntil:  map[string]time.Time{},
 		imageGenSystemCooldown: map[string]time.Time{},
+		imageGenSlowUntil:      map[string]time.Time{},
 		lastThrottling:         map[string]any{},
 		lastMeterError:         map[string]string{},
 		lastMeterAccess:        map[string]bool{},
@@ -651,29 +653,46 @@ func (h *accountHealth) MarkImageGenSystemThrottled(accountID string) {
 	h.imageGenSystemCooldown[accountID] = time.Now().Add(30 * time.Minute)
 }
 
-// imageGenSlowCooldown is how long an account is passed over after it burned a
+// imageGenSlowCooldown is how long an account is deprioritized after it burned a
 // whole image timeout without producing anything.
 const imageGenSlowCooldown = 10 * time.Minute
 
-// MarkImageGenSlow sidelines an account for image generation briefly after it
-// hit our deadline. Such an account is not broken — upstream capacity varies per
-// request and per region — but making the next request start on it costs another
-// full timeout before the rotation even begins, and the live logs showed one
-// account taking the first slot and timing out six times in a row. A short,
-// image-only cooldown lets selection start on a different account while leaving
-// chat untouched and the account usable again within minutes.
+// MarkImageGenSlow deprioritizes an account for image generation after it hit our
+// deadline. It is a SOFT signal on purpose, kept in its own map and never fed
+// into ImageGenAvailable: such an account is not broken — upstream capacity
+// varies per request and per region — so it must never be hard-excluded. During
+// a sustained slow window every account times out, and a hard cooldown would
+// sideline the whole pool and return a misleading 429 while forfeiting the
+// per-request lottery that still lands the occasional fast success. Selection
+// only *prefers* non-slow accounts and falls back to a slow one when nothing
+// fresher is left (see resolveImageAccount / nextImageAccount).
 func (h *accountHealth) MarkImageGenSlow(accountID string) {
 	if h == nil || accountID == "" {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// Never shorten a longer cooldown that is already in place: a quota or
-	// capacity throttle outranks a slow-turn nudge.
-	if until, ok := h.imageGenSystemCooldown[accountID]; ok && time.Until(until) > imageGenSlowCooldown {
-		return
+	h.imageGenSlowUntil[accountID] = time.Now().Add(imageGenSlowCooldown)
+}
+
+// ImageGenSlow reports whether the account recently burned an image timeout and
+// should be passed over while a fresher account is available. Expired entries
+// are dropped lazily. This is advisory only — ImageGenAvailable is unaffected.
+func (h *accountHealth) ImageGenSlow(accountID string) bool {
+	if h == nil {
+		return false
 	}
-	h.imageGenSystemCooldown[accountID] = time.Now().Add(imageGenSlowCooldown)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	until, ok := h.imageGenSlowUntil[accountID]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(h.imageGenSlowUntil, accountID)
+		return false
+	}
+	return true
 }
 
 // cleanupExpiredImageGenLocked drops elapsed image-generation cooldowns.
@@ -1283,6 +1302,7 @@ func (h *accountHealth) ClearAllCooldowns() {
 	h.imageLimitUntil = map[string]time.Time{}
 	h.imageGenCooldownUntil = map[string]time.Time{}
 	h.imageGenSystemCooldown = map[string]time.Time{}
+	h.imageGenSlowUntil = map[string]time.Time{}
 	h.lastThrottling = map[string]any{}
 	h.lastMeterError = map[string]string{}
 	h.lastMeterAccess = map[string]bool{}

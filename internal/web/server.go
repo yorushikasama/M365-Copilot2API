@@ -1202,27 +1202,43 @@ func (s *Server) resolveImageAccount(accountID string) (auth.AccountToken, error
 		return s.resolveAccount(accountID)
 	}
 	var throttled error
+	// A recently-timed-out ("slow") account is a soft skip: prefer a fresher one,
+	// but remember the first slow-yet-available candidate so a sustained slow
+	// window — where every account has timed out — still gets an attempt instead
+	// of a misleading "quota exhausted" 429.
+	var slowFallback auth.AccountToken
+	haveSlowFallback := false
 	for i := 0; i <= maxAccountProbe; i++ {
 		acc, err := s.resolveAccount("")
 		if err != nil {
+			if haveSlowFallback {
+				return slowFallback, nil
+			}
 			if throttled != nil {
 				return auth.AccountToken{}, throttled
 			}
 			return auth.AccountToken{}, err
 		}
 		if s.accountPool.ImageGenAvailable(acc.ID) {
-			return acc, nil
-		}
-		if throttled == nil {
+			if !s.accountPool.ImageGenSlow(acc.ID) {
+				return acc, nil
+			}
+			if !haveSlowFallback {
+				slowFallback, haveSlowFallback = acc, true
+			}
+		} else if throttled == nil {
 			throttled = &UpstreamHTTPError{Status: 429, RetryAfter: s.imageRetryAfter(acc.ID), Body: "image generation quota is exhausted on all accounts; try again later"}
 		}
 		// Drop the sticky preference so the next probe rotates instead of
-		// handing back this same image-throttled account.
+		// handing back this same account.
 		s.mu.Lock()
 		if s.lastHealthyAccount == acc.ID {
 			s.lastHealthyAccount = ""
 		}
 		s.mu.Unlock()
+	}
+	if haveSlowFallback {
+		return slowFallback, nil
 	}
 	return auth.AccountToken{}, throttled
 }
@@ -1282,10 +1298,14 @@ func (s *Server) nextHealthyAccountExcluding(tried map[string]bool) (auth.Accoun
 // image-throttled, skipping accounts this request already tried. Used by the
 // image failover path.
 func (s *Server) nextImageAccount(tried map[string]bool) (auth.AccountToken, error) {
+	// Prefer an untried, healthy, non-slow account; fall back to a slow-yet-
+	// healthy one only if nothing fresher turns up, so a slow window cannot make
+	// the failover give up while eligible accounts remain (see MarkImageGenSlow).
+	slowFallback := ""
 	for i := 0; i < maxAccountProbe; i++ {
 		acc, ok := s.tokens.Next()
 		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("%w: none is signed in", errNoAccounts)
+			break
 		}
 		if tried[acc.ID] {
 			continue
@@ -1296,7 +1316,16 @@ func (s *Server) nextImageAccount(tried map[string]bool) (auth.AccountToken, err
 		if !s.accountPool.ImageGenAvailable(acc.ID) {
 			continue
 		}
+		if s.accountPool.ImageGenSlow(acc.ID) {
+			if slowFallback == "" {
+				slowFallback = acc.ID
+			}
+			continue
+		}
 		return s.tokens.EnsureValid(acc.ID)
+	}
+	if slowFallback != "" {
+		return s.tokens.EnsureValid(slowFallback)
 	}
 	return auth.AccountToken{}, fmt.Errorf("%w: none is healthy for image failover", errNoAccounts)
 }

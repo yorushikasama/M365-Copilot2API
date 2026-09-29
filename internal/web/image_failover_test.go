@@ -235,51 +235,59 @@ func TestNextImageAccountSkipsTriedAndThrottled(t *testing.T) {
 	}
 }
 
-func TestImageTimeoutCoolsTheAccountDownBriefly(t *testing.T) {
+func TestImageTimeoutSoftSkipsButKeepsAccountUsable(t *testing.T) {
 	store := testAccountFiles(t)
 	h := newAccountHealth()
 	s := &Server{tokens: store, accountPool: h, accountConcurrency: newAccountConcurrency(), settings: &settingsStore{v: defaultRuntimeSettings()}}
 	accounts := store.List()
 	slow := accounts[0]
 
-	// A deadline hit must sideline the account for image generation so the next
-	// request does not spend another full timeout on it before rotating, while
-	// leaving its chat capacity untouched.
+	// A deadline hit deprioritizes the account for image generation, but must be
+	// a SOFT signal only: the account stays available for both image and chat,
+	// so a sustained slow window can never hard-drain the pool.
 	s.markImageThrottle(slow.ID, fmt.Errorf("ws dial: WS_READ_TIMEOUT upstream 0: %w", context.DeadlineExceeded))
-	if h.ImageGenAvailable(slow.ID) {
-		t.Fatal("a timed-out account is still selected for image generation")
+	if !h.ImageGenSlow(slow.ID) {
+		t.Fatal("a timed-out account was not marked slow")
+	}
+	if !h.ImageGenAvailable(slow.ID) {
+		t.Fatal("the slow signal hard-excluded the account from image generation")
 	}
 	if !h.Available(slow.ID) {
-		t.Fatal("a timed-out account lost its chat capacity")
+		t.Fatal("the slow signal touched the account's chat capacity")
 	}
-	if until, ok := h.ImageGenCooldownUntil(slow.ID); !ok || time.Until(until) > imageGenSlowCooldown+time.Minute {
-		t.Fatalf("slow cooldown is not the short transient one: %v", until)
+	if _, ok := h.ImageGenCooldownUntil(slow.ID); ok {
+		t.Fatal("the soft slow signal leaked into the hard image cooldown")
 	}
 
-	// It must not be a long quota-style cooldown: the next image request should
-	// start on a different account, but the pool still has candidates.
-	next, err := s.nextImageAccount(map[string]bool{slow.ID: true})
+	// With a fresher account available, selection prefers it over the slow one.
+	next, err := s.nextImageAccount(map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if next.ID == slow.ID {
-		t.Fatal("rotated back onto the account that just timed out")
+		t.Fatal("selected the slow account while a fresher one was available")
 	}
 }
 
-func TestImageSlowCooldownDoesNotShortenARealThrottle(t *testing.T) {
+func TestImageSlowFallbackWhenEveryAccountTimedOut(t *testing.T) {
+	store := testAccountFiles(t)
 	h := newAccountHealth()
-	const id = "account-a"
-	// A capacity throttle is a 30-minute verdict; a later slow-turn nudge must
-	// not cut it down to 10 minutes and re-admit the account early.
-	h.MarkImageGenSystemThrottled(id)
-	before, _ := h.ImageGenCooldownUntil(id)
+	s := &Server{tokens: store, accountPool: h, accountConcurrency: newAccountConcurrency(), settings: &settingsStore{v: defaultRuntimeSettings()}}
+	accounts := store.List()
 
-	h.MarkImageGenSlow(id)
-
-	after, _ := h.ImageGenCooldownUntil(id)
-	if after.Before(before.Add(-time.Second)) {
-		t.Fatalf("slow cooldown shortened the real throttle: %v -> %v", before, after)
+	// Every account has just timed out. A hard cooldown would leave the failover
+	// with nothing to pick and surface a misleading error; the soft signal must
+	// still hand back an account so the request gets its per-request lottery.
+	deadline := fmt.Errorf("ws dial: WS_READ_TIMEOUT upstream 0: %w", context.DeadlineExceeded)
+	for _, a := range accounts {
+		s.markImageThrottle(a.ID, deadline)
+	}
+	next, err := s.nextImageAccount(map[string]bool{})
+	if err != nil {
+		t.Fatalf("failover gave up while every account was only soft-slow: %v", err)
+	}
+	if next.ID == "" {
+		t.Fatal("fallback returned an empty account")
 	}
 }
 
